@@ -1,0 +1,35 @@
+services:
+  api:
+    build: .
+    ports:
+      - '8000:8000'
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/reporium
+      - REDIS_URL=redis://redis:6379
+      - INGESTION_API_KEY=local-dev-key
+      - GH_USERNAME=perditioinc
+      - ENVIRONMENT=development
+    depends_on:
+      - db
+      - redis
+    volumes:
+      - .:/app
+      - ../reporium/public/data:/data:ro
+
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: reporium
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+
+volumes:
+  postgres_data:

@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(docker-compose down:*)",
+      "Bash(docker-compose up:*)",
+      "Bash(docker-compose exec:*)",
+      "Bash(MSYS_NO_PATHCONV=1 docker-compose exec api python scripts/migrate_from_json.py --json-path /data/library.json 2>&1)",
+      "Bash(curl:*)"
+    ]
+  }
+}
