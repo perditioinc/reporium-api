@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -40,6 +41,12 @@ app.include_router(search.router)
 app.include_router(trends.router)
 app.include_router(wiki.router)
 app.include_router(ingest.router)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8080))
+    uvicorn.run("app.main:app", host="0.0.0.0", port=port)
 
 
 @app.get("/health")
