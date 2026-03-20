@@ -4,7 +4,6 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.openapi.docs import get_redoc_html
 from fastapi.responses import HTMLResponse
 
 from app.cache import cache
@@ -27,228 +26,115 @@ app = FastAPI(
     title="Reporium API",
     description="The central API for the Reporium platform — tracks 826+ AI development tools on GitHub",
     version="1.0.0",
-    docs_url=None,      # disable default — we serve custom dark theme
-    redoc_url=None,     # disable default — we serve custom route
+    docs_url=None,      # disable default — we serve Scalar
+    redoc_url=None,     # disable default — Scalar replaces both
     lifespan=lifespan,
 )
 
 
 @app.get("/docs", include_in_schema=False)
-async def custom_swagger_ui() -> HTMLResponse:
+async def scalar_docs() -> HTMLResponse:
     html = """
     <!DOCTYPE html>
     <html>
     <head>
         <title>Reporium API</title>
-        <meta charset="utf-8"/>
-        <meta name="viewport" content="width=device-width, initial-scale=1">
-        <link rel="stylesheet" type="text/css" href="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.11.0/swagger-ui.css" >
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
         <style>
-            /* Base dark theme */
-            html { box-sizing: border-box; overflow: -moz-scrollbars-vertical; overflow-y: scroll; }
-            body { margin: 0; background: #1a1a2e; }
-
-            /* Topbar */
-            .swagger-ui .topbar {
-                background: #16213e;
-                border-bottom: 2px solid #7c3aed;
-                padding: 8px 0;
-            }
-            .swagger-ui .topbar .download-url-wrapper { display: none; }
-            .swagger-ui .topbar-wrapper {
-                display: flex;
-                align-items: center;
-                padding: 0 20px;
-            }
-            .swagger-ui .topbar-wrapper img { display: none; }
-            .swagger-ui .topbar-wrapper::before {
-                content: 'Reporium API';
-                color: #7c3aed;
-                font-size: 1.4em;
-                font-weight: 700;
-                font-family: sans-serif;
-                letter-spacing: 0.5px;
-            }
-
-            /* Main wrapper */
-            .swagger-ui { background: #1a1a2e; color: #e2e8f0; font-family: sans-serif; }
-            .swagger-ui .wrapper { max-width: 1460px; width: 100%; padding: 0 20px; }
-
-            /* Info block */
-            .swagger-ui .info {
-                background: #16213e;
-                border: 1px solid #7c3aed;
-                border-radius: 8px;
-                padding: 20px 30px;
-                margin: 20px 0;
-            }
-            .swagger-ui .info .title {
-                color: #7c3aed;
-                font-size: 2em;
-            }
-            .swagger-ui .info p { color: #94a3b8; }
-            .swagger-ui .info a { color: #7c3aed; }
-            .swagger-ui .info .base-url { color: #64748b; }
-
-            /* Scheme container */
-            .swagger-ui .scheme-container {
-                background: #16213e;
-                border-bottom: 1px solid #2d3748;
-                box-shadow: none;
-                padding: 15px 0;
-            }
-
-            /* Operation tags */
-            .swagger-ui .opblock-tag {
-                color: #e2e8f0 !important;
-                border-bottom: 1px solid #2d3748 !important;
-                font-size: 1.1em;
-            }
-            .swagger-ui .opblock-tag:hover { background: rgba(124, 58, 237, 0.1) !important; }
-
-            /* Operation blocks */
-            .swagger-ui .opblock {
-                border-radius: 6px;
-                margin: 6px 0;
-                box-shadow: none;
-                border: 1px solid;
-            }
-            .swagger-ui .opblock.opblock-get {
-                background: rgba(37, 99, 235, 0.15);
-                border-color: #2563eb;
-            }
-            .swagger-ui .opblock.opblock-post {
-                background: rgba(5, 150, 105, 0.15);
-                border-color: #059669;
-            }
-            .swagger-ui .opblock.opblock-put {
-                background: rgba(217, 119, 6, 0.15);
-                border-color: #d97706;
-            }
-            .swagger-ui .opblock.opblock-delete {
-                background: rgba(220, 38, 38, 0.15);
-                border-color: #dc2626;
-            }
-            .swagger-ui .opblock-summary {
-                padding: 8px 20px;
-            }
-            .swagger-ui .opblock-summary-method {
-                border-radius: 4px;
-                font-weight: 700;
-                min-width: 70px;
-                text-align: center;
-            }
-            .swagger-ui .opblock-summary-path {
-                color: #e2e8f0 !important;
-                font-weight: 500;
-            }
-            .swagger-ui .opblock-summary-description {
-                color: #94a3b8 !important;
-            }
-            .swagger-ui .opblock-body {
-                background: #0f172a;
-                border-top: 1px solid #2d3748;
-            }
-
-            /* Authorize button */
-            .swagger-ui .btn.authorize {
-                background: transparent;
-                border: 2px solid #7c3aed;
-                color: #7c3aed;
-                border-radius: 6px;
-            }
-            .swagger-ui .btn.authorize:hover {
-                background: rgba(124, 58, 237, 0.1);
-            }
-            .swagger-ui .btn.authorize svg { fill: #7c3aed; }
-
-            /* Execute button */
-            .swagger-ui .btn.execute {
-                background: #7c3aed;
-                border-color: #7c3aed;
-                border-radius: 6px;
-                color: white;
-            }
-            .swagger-ui .btn.execute:hover { background: #6d28d9; }
-
-            /* Inputs */
-            .swagger-ui input[type=text],
-            .swagger-ui input[type=password],
-            .swagger-ui textarea,
-            .swagger-ui select {
-                background: #0f172a !important;
-                color: #e2e8f0 !important;
-                border: 1px solid #2d3748 !important;
-                border-radius: 4px;
-            }
-
-            /* Parameters */
-            .swagger-ui .parameters-col_description p { color: #94a3b8; }
-            .swagger-ui .parameter__name { color: #7c3aed; font-weight: 600; }
-            .swagger-ui .parameter__type { color: #38bdf8; }
-            .swagger-ui .parameter__in { color: #64748b; font-style: italic; }
-            .swagger-ui table thead tr td,
-            .swagger-ui table thead tr th {
-                color: #94a3b8;
-                border-bottom: 1px solid #2d3748;
-            }
-            .swagger-ui .response-col_status { color: #e2e8f0; }
-            .swagger-ui .response-col_description p { color: #94a3b8; }
-
-            /* Models */
-            .swagger-ui section.models {
-                background: #16213e;
-                border: 1px solid #2d3748;
-                border-radius: 6px;
-            }
-            .swagger-ui section.models h4 { color: #e2e8f0; }
-            .swagger-ui .model-box { background: #0f172a; }
-            .swagger-ui .model { color: #e2e8f0; }
-            .swagger-ui .model-title { color: #7c3aed; }
-            .swagger-ui span.prop-type { color: #38bdf8; }
-            .swagger-ui span.prop-format { color: #64748b; }
-
-            /* Code / response */
-            .swagger-ui .highlight-code { background: #0f172a; }
-            .swagger-ui .microlight { background: #0f172a !important; color: #e2e8f0 !important; }
-            .swagger-ui .responses-inner { background: #0f172a; }
-            .swagger-ui .response-control-media-type__accept-message { color: #94a3b8; }
-
-            /* Scrollbar */
-            ::-webkit-scrollbar { width: 8px; height: 8px; }
-            ::-webkit-scrollbar-track { background: #1a1a2e; }
-            ::-webkit-scrollbar-thumb { background: #2d3748; border-radius: 4px; }
-            ::-webkit-scrollbar-thumb:hover { background: #4a5568; }
-
-            /* Copy button icons */
-            .swagger-ui .copy-to-clipboard { background: #2d3748; border-radius: 4px; }
-            .swagger-ui .copy-to-clipboard button { background: transparent; }
+            body { margin: 0; background: #0a0a0f; }
         </style>
     </head>
     <body>
-        <div id="swagger-ui"></div>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.11.0/swagger-ui-bundle.js"> </script>
-        <script src="https://cdnjs.cloudflare.com/ajax/libs/swagger-ui/5.11.0/swagger-ui-standalone-preset.js"> </script>
-        <script>
-        window.onload = function() {
-            window.ui = SwaggerUIBundle({
-                url: "/openapi.json",
-                dom_id: '#swagger-ui',
-                deepLinking: true,
-                displayRequestDuration: true,
-                defaultModelsExpandDepth: 1,
-                defaultModelExpandDepth: 1,
-                presets: [
-                    SwaggerUIBundle.presets.apis,
-                    SwaggerUIStandalonePreset
-                ],
-                plugins: [
-                    SwaggerUIBundle.plugins.DownloadUrl
-                ],
-                layout: "StandaloneLayout"
-            })
-        }
+        <script
+            id="api-reference"
+            data-url="/openapi.json"
+            data-configuration='{
+                "theme": "purple",
+                "darkMode": true,
+                "layout": "modern",
+                "showSidebar": true,
+                "searchHotKey": "k",
+                "customCss": "
+                    :root {
+                        --scalar-background-1: #0a0a0f;
+                        --scalar-background-2: #0d1117;
+                        --scalar-background-3: #161b22;
+                        --scalar-background-4: #1c2128;
+                        --scalar-border-color: #21262d;
+
+                        --scalar-color-1: #ffffff;
+                        --scalar-color-2: #cdd9e5;
+                        --scalar-color-3: #8b949e;
+                        --scalar-color-accent: #a78bfa;
+
+                        --scalar-sidebar-background-1: #0a0a0f;
+                        --scalar-sidebar-background-2: #0d1117;
+                        --scalar-sidebar-color-1: #ffffff;
+                        --scalar-sidebar-color-2: #8b949e;
+                        --scalar-sidebar-border-color: #21262d;
+                        --scalar-sidebar-item-hover-background: #161b22;
+                        --scalar-sidebar-item-active-background: #1c2128;
+
+                        --scalar-button-1: #a78bfa;
+                        --scalar-button-1-color: #ffffff;
+                        --scalar-button-1-hover: #8b5cf6;
+
+                        --scalar-color-green: #3fb950;
+                        --scalar-color-red: #f85149;
+                        --scalar-color-yellow: #d29922;
+                        --scalar-color-blue: #58a6ff;
+                        --scalar-color-orange: #db6d28;
+                        --scalar-color-purple: #a78bfa;
+
+                        --scalar-code-language-color-supersede: #cdd9e5;
+                        --scalar-scrollbar-color: #21262d;
+                        --scalar-scrollbar-color-hover: #30363d;
+                    }
+
+                    .light-mode, .dark-mode {
+                        color-scheme: dark;
+                    }
+
+                    .scalar-app, .scalar-api-reference {
+                        background: #0a0a0f !important;
+                    }
+
+                    .section-header {
+                        background: #0a0a0f !important;
+                        border-bottom: 1px solid #21262d !important;
+                    }
+
+                    .sidebar {
+                        border-right: 1px solid #21262d !important;
+                    }
+
+                    .endpoint-path {
+                        color: #ffffff !important;
+                        font-weight: 600 !important;
+                    }
+
+                    .method-get { background: rgba(56, 189, 248, 0.15) !important; color: #38bdf8 !important; border: 1px solid #38bdf8 !important; border-radius: 4px; }
+                    .method-post { background: rgba(63, 185, 80, 0.15) !important; color: #3fb950 !important; border: 1px solid #3fb950 !important; border-radius: 4px; }
+                    .method-put { background: rgba(210, 153, 34, 0.15) !important; color: #d29922 !important; border: 1px solid #d29922 !important; border-radius: 4px; }
+                    .method-delete { background: rgba(248, 81, 73, 0.15) !important; color: #f85149 !important; border: 1px solid #f85149 !important; border-radius: 4px; }
+                    .method-patch { background: rgba(167, 139, 250, 0.15) !important; color: #a78bfa !important; border: 1px solid #a78bfa !important; border-radius: 4px; }
+
+                    code, .code-block, pre {
+                        background: #0d1117 !important;
+                        border: 1px solid #21262d !important;
+                        color: #cdd9e5 !important;
+                        border-radius: 6px !important;
+                    }
+
+                    ::-webkit-scrollbar { width: 6px; height: 6px; }
+                    ::-webkit-scrollbar-track { background: #0a0a0f; }
+                    ::-webkit-scrollbar-thumb { background: #21262d; border-radius: 3px; }
+                    ::-webkit-scrollbar-thumb:hover { background: #30363d; }
+                "
+            }'>
         </script>
+        <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
     </body>
     </html>
     """
@@ -256,11 +142,10 @@ async def custom_swagger_ui() -> HTMLResponse:
 
 
 @app.get("/redoc", include_in_schema=False)
-async def custom_redoc() -> HTMLResponse:
-    return get_redoc_html(
-        openapi_url="/openapi.json",
-        title="Reporium API — ReDoc",
-        with_google_fonts=False,
+async def redoc_redirect() -> HTMLResponse:
+    """Redirect /redoc to /docs — Scalar replaces both."""
+    return HTMLResponse(
+        '<html><head><meta http-equiv="refresh" content="0;url=/docs"></head></html>'
     )
 
 
