@@ -19,7 +19,7 @@ AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
 TEST_DB_URL = os.environ["DATABASE_URL"]
 
 
-@pytest_asyncio.fixture(scope="session", loop_scope="session")
+@pytest_asyncio.fixture(scope="session")
 async def _setup_db():
     # Dispose the engine created at import time (wrong loop) and create a fresh one
     await db_module.engine.dispose()
