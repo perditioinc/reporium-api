@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-PROJECT_ID=perditio-website
+PROJECT_ID=perditio-platform
 REGION=us-central1
 SERVICE_NAME=reporium-api
 IMAGE=gcr.io/$PROJECT_ID/$SERVICE_NAME
