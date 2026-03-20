@@ -1,4 +1,14 @@
 # reporium-api
+<!-- perditio-badges-start -->
+[![Tests](https://github.com/perditioinc/reporium-api/actions/workflows/test.yml/badge.svg)](https://github.com/perditioinc/reporium-api/actions/workflows/test.yml)
+![Last Commit](https://img.shields.io/github/last-commit/perditioinc/reporium-api)
+![License](https://img.shields.io/github/license/perditioinc/reporium-api)
+![python](https://img.shields.io/badge/python-3.11%2B-3776ab)
+![suite](https://img.shields.io/badge/suite-Reporium-6e40c9)
+![repos](https://img.shields.io/badge/repos-826-blue)
+![deployed](https://img.shields.io/badge/deployed-Cloud%20Run-blue)
+![docs](https://img.shields.io/badge/docs-%2Fdocs-blue)
+<!-- perditio-badges-end -->
 
 Backend API for Reporium. Handles all data reads and writes.
 Public reads, authorized writes only.
