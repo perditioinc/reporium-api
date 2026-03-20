@@ -1,0 +1,27 @@
+name: Nightly Sync from reporium-db
+on:
+  schedule:
+    - cron: '0 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      REPORIUM_API_URL: ${{ secrets.REPORIUM_API_URL }}
+      INGESTION_API_KEY: ${{ secrets.INGESTION_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - run: pip install httpx
+
+      - name: Sync repos from reporium-db to API
+        run: python scripts/populate_from_reporium_db.py
