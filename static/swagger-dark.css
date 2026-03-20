@@ -1,0 +1,204 @@
+/* Reporium API — Dark Theme for Swagger UI */
+
+body {
+  background-color: #0d1117 !important;
+}
+
+.swagger-ui {
+  background-color: #0d1117 !important;
+  color: #e6edf3 !important;
+}
+
+/* Top bar */
+.swagger-ui .topbar {
+  background-color: #161b22 !important;
+  border-bottom: 1px solid #30363d;
+}
+
+.swagger-ui .topbar-wrapper img {
+  content: url('');
+}
+
+.swagger-ui .topbar-wrapper::after {
+  content: 'Reporium API';
+  color: #7c3aed;
+  font-size: 1.2em;
+  font-weight: bold;
+}
+
+/* Info section */
+.swagger-ui .info {
+  background: #161b22 !important;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.swagger-ui .info .title {
+  color: #7c3aed !important;
+}
+
+.swagger-ui .info p,
+.swagger-ui .info li {
+  color: #8b949e !important;
+}
+
+.swagger-ui .info a {
+  color: #58a6ff !important;
+}
+
+/* Scheme container */
+.swagger-ui .scheme-container {
+  background: #161b22 !important;
+  border: 1px solid #30363d;
+}
+
+/* Tags */
+.swagger-ui .opblock-tag {
+  color: #e6edf3 !important;
+  border-bottom: 1px solid #30363d !important;
+}
+
+/* Operation blocks */
+.swagger-ui .opblock.opblock-get {
+  background: rgba(29, 78, 216, 0.1) !important;
+  border-color: #1d4ed8 !important;
+}
+
+.swagger-ui .opblock.opblock-post {
+  background: rgba(21, 128, 61, 0.1) !important;
+  border-color: #15803d !important;
+}
+
+.swagger-ui .opblock.opblock-put {
+  background: rgba(161, 98, 7, 0.1) !important;
+  border-color: #a16207 !important;
+}
+
+.swagger-ui .opblock.opblock-delete {
+  background: rgba(185, 28, 28, 0.1) !important;
+  border-color: #b91c1c !important;
+}
+
+.swagger-ui .opblock-summary-method {
+  border-radius: 4px !important;
+  font-weight: bold !important;
+}
+
+.swagger-ui .opblock-summary-path {
+  color: #e6edf3 !important;
+}
+
+.swagger-ui .opblock-summary-description {
+  color: #8b949e !important;
+}
+
+.swagger-ui .opblock-body {
+  background: #0d1117 !important;
+}
+
+/* Models section */
+.swagger-ui .model-box {
+  background: #161b22 !important;
+}
+
+.swagger-ui .model {
+  color: #e6edf3 !important;
+}
+
+.swagger-ui section.models {
+  background: #161b22 !important;
+  border: 1px solid #30363d !important;
+}
+
+.swagger-ui section.models h4 {
+  color: #e6edf3 !important;
+}
+
+/* Response section */
+.swagger-ui .responses-wrapper {
+  background: #0d1117 !important;
+}
+
+.swagger-ui table thead tr td,
+.swagger-ui table thead tr th {
+  color: #8b949e !important;
+  border-bottom: 1px solid #30363d !important;
+}
+
+/* Parameters */
+.swagger-ui .parameter__name {
+  color: #7c3aed !important;
+}
+
+.swagger-ui .parameter__type {
+  color: #58a6ff !important;
+}
+
+/* Inputs */
+.swagger-ui input[type=text],
+.swagger-ui textarea {
+  background: #0d1117 !important;
+  color: #e6edf3 !important;
+  border: 1px solid #30363d !important;
+}
+
+/* Buttons */
+.swagger-ui .btn {
+  border-radius: 6px !important;
+}
+
+.swagger-ui .btn.execute {
+  background: #7c3aed !important;
+  border-color: #7c3aed !important;
+}
+
+.swagger-ui .btn.execute:hover {
+  background: #6d28d9 !important;
+}
+
+/* Selects */
+.swagger-ui select {
+  background: #161b22 !important;
+  color: #e6edf3 !important;
+  border: 1px solid #30363d !important;
+}
+
+/* Code blocks */
+.swagger-ui .highlight-code {
+  background: #161b22 !important;
+}
+
+.swagger-ui .microlight {
+  background: #161b22 !important;
+  color: #e6edf3 !important;
+}
+
+/* Response code */
+.swagger-ui .response-col_status {
+  color: #e6edf3 !important;
+}
+
+.swagger-ui .response-col_description {
+  color: #8b949e !important;
+}
+
+/* Tab headers */
+.swagger-ui .tab li {
+  color: #8b949e !important;
+}
+
+.swagger-ui .tab li.active {
+  color: #e6edf3 !important;
+}
+
+/* Markdown rendered content */
+.swagger-ui .markdown p,
+.swagger-ui .markdown li {
+  color: #8b949e !important;
+}
+
+.swagger-ui .markdown code {
+  background: #161b22 !important;
+  color: #e6edf3 !important;
+}
