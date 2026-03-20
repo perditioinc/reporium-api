@@ -1,16 +1,19 @@
+import asyncio
 import os
 from collections.abc import AsyncGenerator
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test")
 os.environ.setdefault("INGESTION_API_KEY", "test-api-key")
 os.environ.setdefault("GH_USERNAME", "testuser")
+os.environ.setdefault("REDIS_URL", "")  # disable Redis in tests
 
 import app.database as db_module
-from app.database import Base
+from app.database import Base, get_db
 from app.main import app
 
 TEST_API_KEY = "test-api-key"
@@ -19,9 +22,17 @@ AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
 TEST_DB_URL = os.environ["DATABASE_URL"]
 
 
+@pytest.fixture(scope="session")
+def event_loop():
+    """Single event loop for all tests."""
+    loop = asyncio.new_event_loop()
+    yield loop
+    loop.close()
+
+
 @pytest_asyncio.fixture(scope="session")
-async def _setup_db():
-    # Dispose the engine created at import time (wrong loop) and create a fresh one
+async def _setup_db(event_loop):
+    # Replace the app engine with one on this event loop
     await db_module.engine.dispose()
     db_module.engine = create_async_engine(TEST_DB_URL, echo=False, pool_pre_ping=True)
     db_module.async_session_factory.configure(bind=db_module.engine)

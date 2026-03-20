@@ -26,19 +26,9 @@ jobs:
           --health-timeout 5s
           --health-retries 5
 
-      redis:
-        image: redis:7-alpine
-        ports:
-          - 6379:6379
-        options: >-
-          --health-cmd "redis-cli ping"
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-
     env:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test
-      REDIS_URL: redis://localhost:6379
+      REDIS_URL: ""
       INGESTION_API_KEY: test-api-key
       GH_USERNAME: testuser
 
@@ -51,6 +41,6 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - run: pip install pytest pytest-asyncio httpx
+      - run: pip install pytest pytest-asyncio==0.24.0 httpx
 
       - run: pytest tests/ -v
