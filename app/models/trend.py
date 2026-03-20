@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Integer, Text, TIMESTAMP
+from sqlalchemy import Integer, Text, TIMESTAMP, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -50,5 +50,5 @@ class IngestionLog(Base):
     repos_fetched: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     repos_updated: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     api_calls_made: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
-    errors: Mapped[list | None] = mapped_column(JSONB, default=list, server_default="'[]'")
+    errors: Mapped[list | None] = mapped_column(JSONB, default=list, server_default=text("'[]'"))
     status: Mapped[str] = mapped_column(Text, nullable=False, default="running")  # running, success, failed

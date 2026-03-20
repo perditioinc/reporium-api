@@ -22,9 +22,11 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(
-    title="reporium-api",
-    description="Backend API for Reporium. Public reads, authorized writes.",
+    title="Reporium API",
+    description="The central API for the Reporium platform — tracks 818+ AI development tools on GitHub",
     version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc",
     lifespan=lifespan,
 )
 
