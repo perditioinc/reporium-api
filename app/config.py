@@ -30,8 +30,20 @@ def _resolve_database_url() -> str:
     return "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium"
 
 
-# Inject resolved URL into env before Settings reads it
-os.environ.setdefault("DATABASE_URL", _resolve_database_url())
+def _resolve_secrets():
+    """Resolve secrets from env or Secret Manager in production."""
+    if os.getenv("ENVIRONMENT") == "production":
+        project = os.getenv("GCP_PROJECT", "perditio-platform")
+        if not os.getenv("DATABASE_URL"):
+            logger.info("Loading DATABASE_URL from Secret Manager")
+            os.environ["DATABASE_URL"] = _get_secret("reporium-db-url-async", project)
+        if not os.getenv("INGESTION_API_KEY"):
+            logger.info("Loading INGESTION_API_KEY from Secret Manager")
+            os.environ["INGESTION_API_KEY"] = _get_secret("reporium-ingestion-api-key", project)
+    os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium")
+
+
+_resolve_secrets()
 
 
 class Settings(BaseSettings):
