@@ -9,6 +9,7 @@ os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@lo
 os.environ.setdefault("INGESTION_API_KEY", "test-api-key")
 os.environ.setdefault("GH_USERNAME", "testuser")
 
+import app.database as db_module
 from app.database import Base
 from app.main import app
 
@@ -17,17 +18,20 @@ AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
 
 TEST_DB_URL = os.environ["DATABASE_URL"]
 
-_engine = create_async_engine(TEST_DB_URL, echo=False)
-
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def _setup_db():
-    async with _engine.begin() as conn:
+    # Dispose the engine created at import time (wrong loop) and create a fresh one
+    await db_module.engine.dispose()
+    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, pool_pre_ping=True)
+    db_module.async_session_factory.configure(bind=db_module.engine)
+
+    async with db_module.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
-    async with _engine.begin() as conn:
+    async with db_module.engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
-    await _engine.dispose()
+    await db_module.engine.dispose()
 
 
 @pytest_asyncio.fixture
