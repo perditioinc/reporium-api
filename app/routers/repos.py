@@ -2,7 +2,7 @@ import hashlib
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -49,9 +49,11 @@ async def list_repos(
     limit: int = Query(default=50, ge=1, le=200),
     category: str | None = None,
     tag: str | None = None,
+    topic: str | None = None,
     builder: str | None = None,
     ai_dev_skill: str | None = None,
     language: str | None = None,
+    min_stars: int | None = None,
     sync_status: str | None = None,
     sort: str = Query(default="updated"),
     q: str | None = None,
@@ -60,7 +62,8 @@ async def list_repos(
     # Build cache key from params
     params = {
         "page": page, "limit": limit, "category": category, "tag": tag,
-        "builder": builder, "ai_dev_skill": ai_dev_skill, "language": language,
+        "topic": topic, "builder": builder, "ai_dev_skill": ai_dev_skill,
+        "language": language, "min_stars": min_stars,
         "sync_status": sync_status, "sort": sort, "q": q,
     }
     param_hash = hashlib.md5(json.dumps(params, sort_keys=True).encode()).hexdigest()
@@ -95,8 +98,12 @@ async def list_repos(
         stmt = stmt.join(RepoAIDevSkill, RepoAIDevSkill.repo_id == Repo.id).where(
             RepoAIDevSkill.skill == ai_dev_skill
         )
+    if topic:
+        stmt = stmt.join(RepoTag, RepoTag.repo_id == Repo.id).where(RepoTag.tag == topic)
     if language:
         stmt = stmt.where(Repo.primary_language == language)
+    if min_stars:
+        stmt = stmt.where(Repo.parent_stars >= min_stars)
     if sync_status:
         if sync_status == "up-to-date":
             stmt = stmt.where(Repo.fork_sync_state == "up-to-date")
@@ -115,6 +122,8 @@ async def list_repos(
     # Sorting
     if sort == "stars":
         stmt = stmt.order_by(Repo.parent_stars.desc().nulls_last())
+    elif sort == "pushed_at":
+        stmt = stmt.order_by(Repo.github_updated_at.desc().nulls_last())
     elif sort == "behind":
         stmt = stmt.order_by(Repo.behind_by.desc())
     elif sort == "name":
@@ -122,8 +131,11 @@ async def list_repos(
     else:
         stmt = stmt.order_by(Repo.updated_at.desc())
 
-    # Total count (without pagination)
-    count_stmt = select(stmt.subquery().c.id)
+    # Total count (before pagination)
+    count_result = await db.execute(
+        select(func.count()).select_from(stmt.distinct().subquery())
+    )
+    total = count_result.scalar_one()
 
     offset = (page - 1) * limit
     stmt = stmt.distinct().offset(offset).limit(limit)
@@ -133,6 +145,7 @@ async def list_repos(
 
     response = {
         "repos": [_repo_to_summary(r).model_dump() for r in repos],
+        "total": total,
         "page": page,
         "limit": limit,
     }
@@ -168,3 +181,26 @@ async def get_repo(name: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
     detail = _repo_to_detail(repo)
     await cache.set(cache_key, detail.model_dump(), ttl=CACHE_TTL_REPO_DETAIL)
     return detail
+
+
+@router.get("/repos/{owner}/{repo}", response_model=RepoDetail)
+async def get_repo_by_owner(owner: str, repo: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
+    """Get a single repo by owner/name."""
+    stmt = (
+        select(Repo)
+        .where(Repo.owner == owner, Repo.name == repo)
+        .options(
+            selectinload(Repo.tags),
+            selectinload(Repo.categories),
+            selectinload(Repo.builders),
+            selectinload(Repo.ai_dev_skills),
+            selectinload(Repo.pm_skills),
+            selectinload(Repo.languages),
+            selectinload(Repo.commits),
+        )
+    )
+    result = await db.execute(stmt)
+    found = result.scalar_one_or_none()
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Repo '{owner}/{repo}' not found")
+    return _repo_to_detail(found)
