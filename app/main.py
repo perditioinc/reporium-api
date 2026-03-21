@@ -2,9 +2,13 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
+from slowapi.util import get_remote_address
 
 from app.cache import cache
 from app.database import engine
@@ -22,14 +26,34 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
+limiter = Limiter(
+    key_func=get_remote_address,
+    default_limits=["200 per hour", "30 per minute"],
+    storage_uri="memory://",
+)
+
 app = FastAPI(
     title="Reporium API",
-    description="The central API for the Reporium platform — tracks 826+ AI development tools on GitHub",
+    description=(
+        "The central API for the Reporium platform — tracks 826+ AI development tools on GitHub.\n\n"
+        "## Rate Limits\n"
+        "| Endpoint | Limit |\n"
+        "|----------|-------|\n"
+        "| `GET /repos`, `/stats`, `/library` | 100 requests/minute |\n"
+        "| `GET /search` | 30 requests/minute |\n"
+        "| `POST /ingest/*` | 10 requests/minute |\n"
+        "| `GET /health` | No limit |\n\n"
+        "Rate limit headers are included in every response."
+    ),
     version="1.0.0",
     docs_url=None,      # disable default — we serve Scalar
     redoc_url=None,     # disable default — Scalar replaces both
     lifespan=lifespan,
 )
+
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 
 @app.get("/docs", include_in_schema=False)
@@ -116,6 +140,13 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def add_rate_limit_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-RateLimit-Policy"] = "200/hour;30/minute"
+    return response
 
 app.include_router(library.router)
 app.include_router(repos.router)

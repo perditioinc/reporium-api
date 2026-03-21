@@ -2,7 +2,9 @@ import logging
 from datetime import datetime, timezone
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +29,7 @@ from app.schemas.trend import GapAnalysisIn, GapAnalysisOut, IngestionLogIn, Ing
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ingest", dependencies=[Depends(verify_api_key)])
+limiter = Limiter(key_func=get_remote_address)
 
 MAX_BATCH = 100
 
@@ -82,7 +85,9 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
 
 
 @router.post("/repos", response_model=IngestResponse)
+@limiter.limit("10/minute")
 async def ingest_repos(
+    request: Request,
     items: list[RepoIngestItem],
     db: AsyncSession = Depends(get_db),
 ) -> IngestResponse:
