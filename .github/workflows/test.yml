@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
   test:
@@ -44,3 +45,15 @@ jobs:
       - run: pip install pytest pytest-asyncio==0.24.0 httpx
 
       - run: pytest tests/ -v
+
+  notify-on-failure:
+    needs: test
+    if: failure()
+    uses: perditioinc/perditio-devkit/.github/workflows/on-test-failure.yml@main
+    with:
+      branch: ${{ github.ref_name }}
+      sha: ${{ github.sha }}
+      run_id: ${{ github.run_id }}
+      repo: ${{ github.repository }}
+    permissions:
+      issues: write
