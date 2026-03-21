@@ -40,6 +40,12 @@ def _resolve_secrets():
         if not os.getenv("INGESTION_API_KEY"):
             logger.info("Loading INGESTION_API_KEY from Secret Manager")
             os.environ["INGESTION_API_KEY"] = _get_secret("reporium-ingestion-api-key", project)
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            try:
+                logger.info("Loading ANTHROPIC_API_KEY from Secret Manager")
+                os.environ["ANTHROPIC_API_KEY"] = _get_secret("anthropic-api-key", project).strip()
+            except Exception:
+                logger.warning("ANTHROPIC_API_KEY not found in Secret Manager")
     os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium")
 
 
