@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.2.0] - 2026-03-21
+
+### Changed
+- Redis Memorystore cache enabled via VPC connector — /library/full cached 5 min, 2.4x faster responses
+- /health now reports `"cache":"ok"` when Redis is connected
+- Cloud Run revision 00011 with `--vpc-connector=forksync-connector` and `REDIS_URL` env var
+
 ## [1.1.0] - 2026-03-21
 
 ### Added
