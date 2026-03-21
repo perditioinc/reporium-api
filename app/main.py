@@ -12,7 +12,7 @@ from slowapi.util import get_remote_address
 
 from app.cache import cache
 from app.database import engine
-from app.routers import ingest, library, platform, repos, search, trends, wiki
+from app.routers import ingest, intelligence, library, platform, repos, search, trends, wiki
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -155,6 +155,7 @@ app.include_router(trends.router)
 app.include_router(wiki.router)
 app.include_router(platform.router)
 app.include_router(ingest.router)
+app.include_router(intelligence.router)
 
 
 if __name__ == "__main__":
