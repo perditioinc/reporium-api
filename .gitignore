@@ -44,3 +44,8 @@ node_modules/
 
 # Alembic
 migrations/versions/*.pyc
+
+# Certificates and keys
+*.pem
+*.key
+*.cert
