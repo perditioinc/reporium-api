@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -9,12 +11,15 @@ from app.routers.library import _repo_to_summary
 from app.schemas.repo import RepoSummary
 
 router = APIRouter()
+limiter = Limiter(key_func=get_remote_address)
 
 MAX_RESULTS = 20
 
 
 @router.get("/search", response_model=list[RepoSummary])
+@limiter.limit("30/minute")
 async def search_repos(
+    request: Request,
     q: str = Query(..., min_length=1),
     db: AsyncSession = Depends(get_db),
 ) -> list[RepoSummary]:
