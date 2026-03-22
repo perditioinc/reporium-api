@@ -362,13 +362,7 @@ async def library_full(db: AsyncSession = Depends(get_db)):
     t0 = time.monotonic()
     logger.info("Building /library/full response...")
 
-    # SECURITY: Only return verified public repos — never expose private repos
-    PUBLIC_OWNED_REPOS = [
-        'forksync', 'perditio-devkit', 'portfolio', 'repo-intelligence',
-        'reporium', 'reporium-api', 'reporium-audit', 'reporium-dataset',
-        'reporium-db', 'reporium-events', 'reporium-ingestion', 'reporium-metrics',
-        'reporium-roadmap', 'reporium-scoring', 'reporium-security', 'reporium-system-design',
-    ]
+    # SECURITY: Only return public non-fork repos — never expose private repos
     result = await db.execute(text("""
         SELECT id, name, owner, description, is_fork, forked_from, primary_language,
                github_url, fork_sync_state, behind_by, ahead_by,
@@ -379,9 +373,9 @@ async def library_full(db: AsyncSession = Depends(get_db)):
                problem_solved, integration_tags, dependencies
         FROM repos
         WHERE is_fork = false
-          AND name = ANY(:whitelist)
+          AND is_private = false
         ORDER BY parent_stars DESC NULLS LAST;
-    """), {"whitelist": PUBLIC_OWNED_REPOS})
+    """))
     rows = result.fetchall()
     columns = result.keys()
 
