@@ -15,20 +15,20 @@ async def _seed_owned_and_fork(client, _setup_db):
     async with db_mod.async_session_factory() as session:
         # Insert an owned (non-fork) repo
         await session.execute(text("""
-            INSERT INTO repos (name, owner, description, is_fork, forked_from, primary_language,
+            INSERT INTO repos (id, name, owner, description, is_fork, forked_from, primary_language,
                              github_url, parent_stars, parent_forks, readme_summary,
                              commits_last_7_days, commits_last_30_days, commits_last_90_days)
-            VALUES ('reporium', 'perditioinc', 'AI tool discovery', false, NULL, 'TypeScript',
+            VALUES ('aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', 'reporium', 'perditioinc', 'AI tool discovery', false, NULL, 'TypeScript',
                     'https://github.com/perditioinc/reporium', 0, 0, 'Reporium is an AI tool discovery platform.',
                     5, 20, 60)
             ON CONFLICT DO NOTHING;
         """))
         # Insert a fork repo
         await session.execute(text("""
-            INSERT INTO repos (name, owner, description, is_fork, forked_from, primary_language,
+            INSERT INTO repos (id, name, owner, description, is_fork, forked_from, primary_language,
                              github_url, parent_stars, parent_forks, readme_summary,
                              commits_last_7_days, commits_last_30_days, commits_last_90_days)
-            VALUES ('tensorflow', 'perditioinc', 'ML framework', true, 'tensorflow/tensorflow', 'Python',
+            VALUES ('bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb', 'tensorflow', 'perditioinc', 'ML framework', true, 'tensorflow/tensorflow', 'Python',
                     'https://github.com/perditioinc/tensorflow', 194000, 40000, 'TensorFlow is an ML framework.',
                     0, 0, 0)
             ON CONFLICT DO NOTHING;
