@@ -19,6 +19,30 @@ from app.database import get_db
 
 logger = logging.getLogger(__name__)
 
+# Map ingestion category names → frontend canonical category names
+# Frontend CATEGORIES constant uses these exact names with colors/icons
+CATEGORY_MAP = {
+    "Agents": "AI Agents",
+    "Tooling": "Dev Tools & Automation",
+    "Security": "Security & Safety",
+    "Observability": "Observability & Monitoring",
+    "Research": "Learning Resources",
+    "Ocr": "Computer Vision",
+    "Vision": "Computer Vision",
+    "Llm Serving": "Inference & Serving",
+    "Orchestration": "AI Agents",
+    "Rag": "RAG & Retrieval",
+    "Vector Databases": "MLOps & Infrastructure",
+    "Other": "Dev Tools & Automation",
+    "Data Processing": "MLOps & Infrastructure",
+    "Embeddings": "RAG & Retrieval",
+}
+
+
+def _normalize_category(name: str) -> str:
+    """Map raw DB category name to the frontend's canonical name."""
+    return CATEGORY_MAP.get(name, name)
+
 router = APIRouter(tags=["Library"])
 
 # In-memory cache
@@ -93,8 +117,8 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
     c30 = repo.get("commits_last_30_days") or 0
     c90 = repo.get("commits_last_90_days") or 0
 
-    all_cats = [c["category_name"] for c in categories]
-    primary_cat = all_cats[0] if all_cats else "Other"
+    all_cats = list(dict.fromkeys(_normalize_category(c["category_name"]) for c in categories))
+    primary_cat = all_cats[0] if all_cats else "Dev Tools & Automation"
 
     return {
         "id": hash(str(repo.get("id"))) & 0x7FFFFFFF,  # Convert UUID to positive int
