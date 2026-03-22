@@ -60,7 +60,8 @@ def _iso(val) -> str:
 
 
 def _build_enriched_repo(repo: dict, languages: list, categories: list,
-                         ai_skills: list, tags: list, pm_skills: list) -> dict:
+                         ai_skills: list, tags: list, pm_skills: list,
+                         builders: list = None, industries: list = None) -> dict:
     """Transform a DB repo row + junction data into the frontend EnrichedRepo shape."""
     forked_from = repo.get("forked_from")
     owner = repo.get("owner", "perditioinc")
@@ -163,9 +164,19 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         "latestRelease": None,
         "aiDevSkills": [s["skill"] for s in ai_skills],
         "pmSkills": [s["skill"] for s in pm_skills],
-        "industries": [],
+        "industries": [ind["industry"] for ind in (industries or [])],
         "programmingLanguages": list(lang_breakdown.keys()),
-        "builders": [],
+        "builders": [
+            {
+                "login": b["login"],
+                "name": b.get("display_name") or b["login"],
+                "type": "organization" if b.get("is_known_org") else "user",
+                "avatarUrl": f"https://avatars.githubusercontent.com/{b['login']}",
+                "isKnownOrg": b.get("is_known_org", False),
+                "orgCategory": b.get("org_category"),
+            }
+            for b in (builders or [])
+        ],
     }
 
 
@@ -308,6 +319,35 @@ def _build_skill_stats(repos: list, skill_field: str) -> list:
     return stats
 
 
+def _build_builder_stats(repos: list) -> list:
+    """Build BuilderStats from enriched repos."""
+    builder_data = defaultdict(lambda: {
+        "repoCount": 0, "totalParentStars": 0, "topRepos": [],
+        "category": "individual", "avatarUrl": ""
+    })
+    for r in repos:
+        for b in r.get("builders", []):
+            login = b["login"]
+            bd = builder_data[login]
+            bd["repoCount"] += 1
+            bd["totalParentStars"] += r.get("stars", 0)
+            bd["topRepos"].append(r["name"])
+            bd["category"] = b.get("orgCategory") or "individual"
+            bd["avatarUrl"] = b.get("avatarUrl", "")
+    stats = []
+    for login, bd in sorted(builder_data.items(), key=lambda x: x[1]["totalParentStars"], reverse=True):
+        stats.append({
+            "login": login,
+            "displayName": login,
+            "category": bd["category"],
+            "repoCount": bd["repoCount"],
+            "totalParentStars": bd["totalParentStars"],
+            "topRepos": bd["topRepos"][:5],
+            "avatarUrl": bd["avatarUrl"],
+        })
+    return stats[:50]  # Top 50 builders
+
+
 @router.get("/library/full")
 async def library_full(db: AsyncSession = Depends(get_db)):
     """
@@ -377,6 +417,23 @@ async def library_full(db: AsyncSession = Depends(get_db)):
     for r in pm_result.fetchall():
         all_pm_skills[str(r.repo_id)].append({"skill": r.skill})
 
+    builder_result = await db.execute(text(
+        "SELECT repo_id, login, display_name, org_category, is_known_org FROM repo_builders;"
+    ))
+    all_builders = defaultdict(list)
+    for r in builder_result.fetchall():
+        all_builders[str(r.repo_id)].append({
+            "login": r.login, "display_name": r.display_name,
+            "org_category": r.org_category, "is_known_org": r.is_known_org
+        })
+
+    industry_result = await db.execute(text(
+        "SELECT repo_id, industry FROM repo_industries;"
+    ))
+    all_industries = defaultdict(list)
+    for r in industry_result.fetchall():
+        all_industries[str(r.repo_id)].append({"industry": r.industry})
+
     # Build enriched repos
     enriched_repos = []
     for row in rows:
@@ -389,6 +446,8 @@ async def library_full(db: AsyncSession = Depends(get_db)):
             ai_skills=all_ai_skills.get(rid, []),
             tags=all_tags.get(rid, []),
             pm_skills=all_pm_skills.get(rid, []),
+            builders=all_builders.get(rid, []),
+            industries=all_industries.get(rid, []),
         )
         enriched_repos.append(enriched)
 
@@ -407,7 +466,7 @@ async def library_full(db: AsyncSession = Depends(get_db)):
         "tagMetrics": tag_metrics,
         "categories": categories,
         "gapAnalysis": {"generatedAt": datetime.now(timezone.utc).isoformat(), "gaps": []},
-        "builderStats": [],
+        "builderStats": _build_builder_stats(enriched_repos),
         "aiDevSkillStats": ai_skill_stats,
         "pmSkillStats": pm_skill_stats,
     }
