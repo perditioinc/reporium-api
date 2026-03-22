@@ -362,7 +362,7 @@ async def library_full(db: AsyncSession = Depends(get_db)):
     t0 = time.monotonic()
     logger.info("Building /library/full response...")
 
-    # Fetch all repos
+    # Fetch owned repos only — forks are for intelligence, not public display
     result = await db.execute(text("""
         SELECT id, name, owner, description, is_fork, forked_from, primary_language,
                github_url, fork_sync_state, behind_by, ahead_by,
@@ -372,6 +372,7 @@ async def library_full(db: AsyncSession = Depends(get_db)):
                readme_summary, activity_score, ingested_at, updated_at, github_updated_at,
                problem_solved, integration_tags, dependencies
         FROM repos
+        WHERE is_fork = false
         ORDER BY parent_stars DESC NULLS LAST;
     """))
     rows = result.fetchall()
@@ -479,3 +480,32 @@ async def library_full(db: AsyncSession = Depends(get_db)):
     _cache["expires_at"] = now + CACHE_TTL
 
     return response
+
+
+@router.get("/forks")
+async def list_forks(
+    db: AsyncSession = Depends(get_db),
+    limit: int = 100,
+    offset: int = 0,
+):
+    """Returns fork repos for internal/intelligence use. Not displayed on reporium.com."""
+    result = await db.execute(text("""
+        SELECT id, name, owner, forked_from, primary_language, parent_stars, parent_forks,
+               readme_summary, problem_solved, behind_by, ahead_by
+        FROM repos
+        WHERE is_fork = true
+        ORDER BY parent_stars DESC NULLS LAST
+        LIMIT :limit OFFSET :offset;
+    """), {"limit": limit, "offset": offset})
+    rows = result.fetchall()
+    columns = result.keys()
+
+    count_result = await db.execute(text("SELECT COUNT(*) FROM repos WHERE is_fork = true;"))
+    total = count_result.scalar()
+
+    return {
+        "forks": [dict(zip(columns, row)) for row in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
