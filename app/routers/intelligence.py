@@ -203,7 +203,8 @@ async def _run_query(req: QueryRequest, db: AsyncSession) -> QueryResponse:
     # Also check knowledge graph edges for related repos
     if top_for_answer:
         top_ids = [str(r["id"]) for r in top_for_answer[:5]]
-        # Use ANY(:ids) with a proper UUID array — never interpolate IDs into SQL.
+        # Cast uuid cols to text so asyncpg can match against a Python list of strings.
+        # Never interpolate IDs directly — pass as a bound parameter list.
         edge_result = await db.execute(
             text("""
                 SELECT e.edge_type, e.weight, e.evidence,
@@ -212,11 +213,11 @@ async def _run_query(req: QueryRequest, db: AsyncSession) -> QueryResponse:
                 FROM repo_edges e
                 JOIN repos r1 ON r1.id = e.source_repo_id
                 JOIN repos r2 ON r2.id = e.target_repo_id
-                WHERE e.source_repo_id = ANY(CAST(:ids AS uuid[]))
-                   OR e.target_repo_id = ANY(CAST(:ids AS uuid[]))
+                WHERE e.source_repo_id::text = ANY(:ids)
+                   OR e.target_repo_id::text = ANY(:ids)
                 LIMIT 20;
             """),
-            {"ids": "{" + ",".join(top_ids) + "}"},
+            {"ids": top_ids},
         )
         edge_rows = edge_result.fetchall()
         if edge_rows:
