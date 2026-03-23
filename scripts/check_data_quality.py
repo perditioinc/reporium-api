@@ -14,7 +14,7 @@ import sys
 
 import httpx
 
-API_URL = os.getenv("REPORIUM_API_URL", "https://reporium-api-573778300586.us-central1.run.app")
+API_URL = os.getenv("REPORIUM_API_URL") or "https://reporium-api-573778300586.us-central1.run.app"
 API_KEY = os.getenv("INGESTION_API_KEY", "")
 GH_TOKEN = os.getenv("GH_TOKEN", "")
 
