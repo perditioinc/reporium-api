@@ -43,6 +43,123 @@ def _normalize_category(name: str) -> str:
     """Map raw DB category name to the frontend's canonical name."""
     return CATEGORY_MAP.get(name, name)
 
+
+# System tags — represent repo metadata, not content. Filtered from tag cloud.
+SYSTEM_TAGS = {'Active', 'Forked', 'Built by Me', 'Inactive', 'Archived', 'Popular'}
+
+# Known org overrides — (category, displayName) matching frontend buildTaxonomy.ts KNOWN_ORGS.
+# Takes priority over the org_category value stored in the DB.
+KNOWN_ORG_CATEGORIES: dict = {
+    'google':          ('big-tech',  'Google'),
+    'google-deepmind': ('ai-lab',    'Google DeepMind'),
+    'google-gemini':   ('big-tech',  'Google Gemini'),
+    'microsoft':       ('big-tech',  'Microsoft'),
+    'meta-llama':      ('big-tech',  'Meta'),
+    'facebookresearch':('ai-lab',    'Meta Research'),
+    'openai':          ('ai-lab',    'OpenAI'),
+    'anthropics':      ('ai-lab',    'Anthropic'),
+    'huggingface':     ('ai-lab',    'HuggingFace'),
+    'mistralai':       ('ai-lab',    'Mistral AI'),
+    'deepseek-ai':     ('ai-lab',    'DeepSeek'),
+    'qwenlm':          ('ai-lab',    'Qwen / Alibaba'),
+    'nvidia':          ('big-tech',  'NVIDIA'),
+    'aws':             ('big-tech',  'Amazon AWS'),
+    'apple':           ('big-tech',  'Apple'),
+    'langchain-ai':    ('startup',   'LangChain'),
+    'vllm-project':    ('startup',   'vLLM'),
+    'unslothai':       ('startup',   'Unsloth'),
+    'langfuse':        ('startup',   'Langfuse'),
+    'chroma-core':     ('startup',   'Chroma'),
+    'qdrant':          ('startup',   'Qdrant'),
+    'weaviate':        ('startup',   'Weaviate'),
+    'infiniflow':      ('startup',   'Infiniflow'),
+    'arize-ai':        ('startup',   'Arize AI'),
+    'confident-ai':    ('startup',   'Confident AI'),
+    'run-llama':       ('startup',   'LlamaIndex'),
+    'letta-ai':        ('startup',   'Letta'),
+    'mem0ai':          ('startup',   'Mem0'),
+    'crewaiinc':       ('startup',   'CrewAI'),
+    'agno-agi':        ('startup',   'Agno'),
+    'all-hands-ai':    ('startup',   'All Hands AI'),
+    'cline':           ('startup',   'Cline'),
+    'continuedev':     ('startup',   'Continue'),
+    'browser-use':     ('startup',   'Browser Use'),
+    'eleutherai':      ('ai-lab',    'EleutherAI'),
+    'allenai':         ('ai-lab',    'Allen AI'),
+    'stanford-crfm':   ('research',  'Stanford'),
+    'mit-han-lab':     ('research',  'MIT Han Lab'),
+    'deepset-ai':      ('startup',   'deepset'),
+}
+
+# AI Dev Skill taxonomy — mirrors frontend buildTaxonomy.ts AI_DEV_SKILLS exactly.
+# Used to aggregate repo counts per skill group for the AI Dev Coverage section.
+_AI_DEV_SKILL_GROUPS: dict = {
+    'Observability & Monitoring': [
+        'Langfuse', 'Phoenix', 'OpenLIT', 'OpenLLMetry', 'Helicone',
+        'Traceloop', 'Weights & Biases', 'MLflow', 'OpenTelemetry',
+        'Monitoring', 'Tracing', 'LLM Monitoring',
+    ],
+    'Evals & Benchmarking': [
+        'DeepEval', 'RAGAS', 'PromptFoo', 'LM Eval Harness', 'Evals',
+        'Benchmarking', 'Red Teaming', 'Garak', 'PyRIT', 'MMLU', 'HumanEval',
+    ],
+    'Inference & Serving': [
+        'vLLM', 'SGLang', 'TGI', 'Triton', 'TensorRT', 'ONNX',
+        'llama.cpp', 'Llamafile', 'LLM Serving', 'Quantization',
+        'Speculative Decoding', 'KV Cache', 'GPU / CUDA', 'Inference',
+    ],
+    'Model Training & Fine-tuning': [
+        'Unsloth', 'Axolotl', 'TRL', 'TorchTune', 'LoRA / PEFT',
+        'RLHF', 'DPO', 'GRPO', 'DeepSpeed', 'FSDP',
+        'Synthetic Data', 'Distillation', 'Fine-Tuning', 'MergeKit',
+    ],
+    'Structured Output & Reliability': [
+        'Instructor', 'Outlines', 'Guidance', 'Guardrails',
+        'NeMo Guardrails', 'Structured Output', 'Tool Use', 'Pydantic',
+    ],
+    'AI Agents & Orchestration': [
+        'AI Agents', 'LangChain', 'LangGraph', 'DSPy', 'Semantic Kernel',
+        'Haystack', 'Agno', 'CrewAI', 'AutoGen', 'Swarm',
+        'OpenAI Agents SDK', 'Multi-Agent', 'MCP', 'Autonomous Systems',
+    ],
+    'RAG & Knowledge': [
+        'RAG', 'Vector Database', 'Embeddings', 'Knowledge Graph',
+        'Chroma', 'Qdrant', 'Milvus', 'Weaviate', 'Pinecone', 'pgvector',
+        'Reranking', 'Hybrid Search', 'GraphRAG', 'Document Processing',
+        'LlamaIndex', 'LightRAG',
+    ],
+    'Context Engineering': [
+        'Context Engineering', 'Agent Memory', 'Letta / MemGPT', 'Mem0',
+        'Long Context', 'Planning / CoT', 'Prompt Engineering',
+    ],
+    'Security & Safety': [
+        'AI Safety', 'Red Teaming', 'Garak', 'PyRIT', 'Prompt Injection',
+        'Guardrails', 'Watermarking', 'Privacy-Preserving AI', 'Alignment',
+    ],
+    'Coding Assistants & Dev Tools': [
+        'OpenHands', 'Cline', 'Continue.dev', 'Aider', 'SWE-Agent',
+        'Claude Code', 'Gemini CLI', 'Kilocode', 'CLI Tool', 'Automation',
+    ],
+    'MLOps & Data': [
+        'MLOps', 'DVC', 'ZenML', 'Prefect', 'Airflow', 'Ray',
+        'Kubeflow', 'Feature Store', 'MLflow', 'Docker', 'Kubernetes',
+        'CI/CD', 'Model Registry',
+    ],
+    'Multimodal & Vision': [
+        'Computer Vision', 'Image Generation', 'Video Generation',
+        'Multimodal AI', 'Point Cloud / 3D Vision', 'Object Detection',
+        'Segmentation', 'Depth Estimation', '3D Reconstruction',
+        'Text to Speech', 'Speech to Text', 'Music / Audio AI',
+    ],
+}
+
+# Reverse lookup: tag (case-insensitive) → skill group name
+_SKILL_TAG_TO_GROUP: dict = {}
+for _group, _tags in _AI_DEV_SKILL_GROUPS.items():
+    for _tag in _tags:
+        _SKILL_TAG_TO_GROUP[_tag.lower()] = _group
+
+
 router = APIRouter(tags=["Library"])
 
 # In-memory cache
@@ -302,11 +419,12 @@ def _build_stats(repos: list) -> dict:
 
 
 def _build_tag_metrics(repos: list) -> list:
-    """Build TagMetrics[] from enriched repos."""
+    """Build TagMetrics[] from enriched repos. System tags are excluded."""
     tag_repos = defaultdict(list)
     for r in repos:
         for t in r["enrichedTags"]:
-            tag_repos[t].append(r)
+            if t not in SYSTEM_TAGS:
+                tag_repos[t].append(r)
 
     metrics = []
     total = len(repos) if repos else 1
@@ -446,33 +564,91 @@ def _build_skill_stats(repos: list, skill_field: str) -> list:
     return stats
 
 
+def _build_ai_dev_skill_stats(repos: list) -> list:
+    """Build AI Dev Skill group stats using taxonomy group names the frontend expects.
+
+    Scans enrichedTags and aiDevSkills on each repo and maps individual tool/skill
+    names to their parent group (e.g. 'vLLM' → 'Inference & Serving') using
+    _SKILL_TAG_TO_GROUP. Returns one entry per group in taxonomy order.
+    """
+    group_repo_names: dict = defaultdict(set)
+    group_top_repos: dict = defaultdict(list)
+
+    for r in repos:
+        all_tags = set(r.get("enrichedTags", []) + r.get("aiDevSkills", []))
+        matched: set = set()
+        for tag in all_tags:
+            group = _SKILL_TAG_TO_GROUP.get(tag.lower())
+            if group and group not in matched:
+                matched.add(group)
+                group_repo_names[group].add(r["name"])
+                group_top_repos[group].append((r.get("stars", 0), r["name"]))
+
+    total = len(repos) if repos else 1
+    stats = []
+    for group in _AI_DEV_SKILL_GROUPS:
+        names = group_repo_names.get(group, set())
+        count = len(names)
+        pct = count / total
+        if pct >= 0.1:
+            coverage = "strong"
+        elif pct >= 0.05:
+            coverage = "moderate"
+        elif pct >= 0.01:
+            coverage = "weak"
+        else:
+            coverage = "none"
+        top = sorted(group_top_repos.get(group, []), reverse=True)[:5]
+        stats.append({
+            "skill": group,
+            "repoCount": count,
+            "coverage": coverage,
+            "topRepos": [name for _, name in top],
+        })
+    return stats
+
+
 def _build_builder_stats(repos: list) -> list:
-    """Build BuilderStats from enriched repos."""
-    builder_data = defaultdict(lambda: {
+    """Build BuilderStats from enriched repos, sorted by repoCount descending.
+
+    KNOWN_ORG_CATEGORIES overrides the DB org_category so that orgs like
+    anthropics / huggingface / facebookresearch are not classified as 'individual'
+    and are visible in the frontend's Builders section.
+    """
+    builder_data: dict = defaultdict(lambda: {
         "repoCount": 0, "totalParentStars": 0, "topRepos": [],
-        "category": "individual", "avatarUrl": ""
+        "category": "individual", "displayName": "", "avatarUrl": "",
     })
     for r in repos:
         for b in r.get("builders", []):
             login = b["login"]
+            login_lower = login.lower()
             bd = builder_data[login]
             bd["repoCount"] += 1
             bd["totalParentStars"] += r.get("stars", 0)
             bd["topRepos"].append(r["name"])
-            bd["category"] = b.get("orgCategory") or "individual"
             bd["avatarUrl"] = b.get("avatarUrl", "")
+            if login_lower in KNOWN_ORG_CATEGORIES:
+                cat, display = KNOWN_ORG_CATEGORIES[login_lower]
+                bd["category"] = cat
+                bd["displayName"] = display
+            else:
+                bd["category"] = b.get("orgCategory") or "individual"
+                if not bd["displayName"]:
+                    bd["displayName"] = login
+
     stats = []
-    for login, bd in sorted(builder_data.items(), key=lambda x: x[1]["totalParentStars"], reverse=True):
+    for login, bd in sorted(builder_data.items(), key=lambda x: x[1]["repoCount"], reverse=True):
         stats.append({
             "login": login,
-            "displayName": login,
+            "displayName": bd["displayName"] or login,
             "category": bd["category"],
             "repoCount": bd["repoCount"],
             "totalParentStars": bd["totalParentStars"],
             "topRepos": bd["topRepos"][:5],
             "avatarUrl": bd["avatarUrl"],
         })
-    return stats[:50]  # Top 50 builders
+    return stats[:50]  # Top 50 builders by repo count
 
 
 @router.get("/library/full")
@@ -584,7 +760,7 @@ async def library_full(db: AsyncSession = Depends(get_db)):
     stats = _build_stats(enriched_repos)
     tag_metrics = _build_tag_metrics(enriched_repos)
     categories = _build_categories(enriched_repos)
-    ai_skill_stats = _build_skill_stats(enriched_repos, "aiDevSkills")
+    ai_skill_stats = _build_ai_dev_skill_stats(enriched_repos)
     pm_skill_stats = _build_skill_stats(enriched_repos, "pmSkills")
 
     response = {
