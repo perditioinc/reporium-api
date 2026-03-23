@@ -48,7 +48,7 @@ No field may ever be `null` or `undefined` in the API response.
 
 ## Validation Rules
 
-1. `/library/full` MUST only return repos where `is_fork = false AND is_private = false`
+1. `/library/full` MUST only return repos where `is_private = false`. Public forks (`is_fork=true, is_private=false`) ARE included — the frontend has a built/forked toggle. Private repos (`is_private=true`) are NEVER included regardless of fork status.
 2. Every repo MUST have a non-empty `description` (apply fallback before response)
 3. Every repo MUST have at least one category (fallback: "Uncategorized")
 4. No field listed above may be `null` in the response (arrays default to [], objects to {})

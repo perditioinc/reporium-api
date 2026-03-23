@@ -435,7 +435,8 @@ async def library_full(db: AsyncSession = Depends(get_db)):
     t0 = time.monotonic()
     logger.info("Building /library/full response...")
 
-    # SECURITY: Only return public non-fork repos — never expose private repos
+    # SECURITY: Only return public repos — never expose private repos
+    # Public forks ARE included (frontend has built/forked toggle)
     result = await db.execute(text("""
         SELECT id, name, owner, description, is_fork, forked_from, primary_language,
                github_url, fork_sync_state, behind_by, ahead_by,
@@ -445,8 +446,7 @@ async def library_full(db: AsyncSession = Depends(get_db)):
                readme_summary, activity_score, ingested_at, updated_at, github_updated_at,
                problem_solved, integration_tags, dependencies
         FROM repos
-        WHERE is_fork = false
-          AND is_private = false
+        WHERE is_private = false
         ORDER BY parent_stars DESC NULLS LAST;
     """))
     rows = result.fetchall()
