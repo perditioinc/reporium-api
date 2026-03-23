@@ -1,0 +1,26 @@
+name: Data Quality Check
+
+on:
+  schedule:
+    - cron: "0 9 * * *"  # 9am UTC — after all nightly jobs
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install httpx
+      - name: Run data quality check
+        env:
+          REPORIUM_API_URL: ${{ secrets.REPORIUM_API_URL }}
+          INGESTION_API_KEY: ${{ secrets.INGESTION_API_KEY }}
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+        run: python scripts/check_data_quality.py
