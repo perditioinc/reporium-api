@@ -1,20 +1,18 @@
-import os
-
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import verify_api_key
 from app.database import get_db
 
 router = APIRouter()
 
 
 @router.get("/admin/data-quality")
-async def data_quality(request: Request, db: AsyncSession = Depends(get_db)):
-    # Require API key
-    api_key = request.headers.get("X-API-Key")
-    if api_key != os.getenv("INGESTION_API_KEY"):
-        raise HTTPException(status_code=403, detail="Invalid API key")
+async def data_quality(
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+):
 
     # Query counts
     total = (await db.execute(text("SELECT COUNT(*) FROM repos;"))).scalar()
