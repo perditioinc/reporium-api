@@ -50,6 +50,12 @@ _cache: dict = {"data": None, "expires_at": 0}
 CACHE_TTL = 300  # 5 minutes
 
 
+def invalidate_library_cache() -> None:
+    """Bust the in-memory /library/full cache. Called by ingest router after writes."""
+    _cache["data"] = None
+    _cache["expires_at"] = 0
+
+
 def sanitize_repo(repo: dict) -> dict:
     """
     Enforce CONTRACT.md — every field gets a valid value, never null.
@@ -78,7 +84,12 @@ def sanitize_repo(repo: dict) -> dict:
         repo["enrichedTags"] = []
 
     if not repo.get("builders"):
-        owner = repo.get("fullName", "").split("/")[0] if repo.get("fullName") else "perditioinc"
+        # For forks, use upstream owner as builder; for owned repos, use the repo owner
+        forked_from = repo.get("forkedFrom") or ""
+        if forked_from and "/" in forked_from:
+            owner = forked_from.split("/")[0]
+        else:
+            owner = repo.get("fullName", "").split("/")[0] if repo.get("fullName") else "perditioinc"
         repo["builders"] = [{"login": owner, "name": None, "type": "user",
                              "avatarUrl": f"https://avatars.githubusercontent.com/{owner}",
                              "isKnownOrg": False, "orgCategory": "individual"}]
@@ -325,18 +336,50 @@ def _build_categories(repos: list) -> list:
             cat_repos[c].append(r)
 
     COLORS = {
-        "Agents": "#7c3aed", "Audio": "#ec4899", "Code Generation": "#3b82f6",
-        "Datasets": "#10b981", "Deployment": "#f59e0b", "Evaluation": "#6366f1",
-        "Fine Tuning": "#ef4444", "Llm Serving": "#8b5cf6", "Observability": "#14b8a6",
-        "Ocr": "#f97316", "Research": "#06b6d4", "Security": "#64748b",
-        "Tooling": "#84cc16", "Vector Databases": "#a855f7", "Other": "#94a3b8",
+        "Foundation Models": "#6d28d9",
+        "AI Agents": "#7c3aed",
+        "RAG & Retrieval": "#2563eb",
+        "Model Training": "#0891b2",
+        "Evals & Benchmarking": "#6366f1",
+        "Observability & Monitoring": "#14b8a6",
+        "Inference & Serving": "#8b5cf6",
+        "Generative Media": "#ec4899",
+        "Computer Vision": "#f97316",
+        "Robotics": "#84cc16",
+        "Spatial & XR": "#06b6d4",
+        "MLOps & Infrastructure": "#f59e0b",
+        "Dev Tools & Automation": "#10b981",
+        "Cloud & Platforms": "#3b82f6",
+        "Learning Resources": "#06b6d4",
+        "Industry: Healthcare": "#ef4444",
+        "Industry: FinTech": "#10b981",
+        "Industry: Audio & Music": "#ec4899",
+        "Industry: Gaming": "#8b5cf6",
+        "Security & Safety": "#64748b",
+        "Data Science & Analytics": "#a855f7",
     }
     ICONS = {
-        "Agents": "🤖", "Audio": "🎵", "Code Generation": "💻",
-        "Datasets": "📊", "Deployment": "🚀", "Evaluation": "📏",
-        "Fine Tuning": "🔧", "Llm Serving": "⚡", "Observability": "👁",
-        "Ocr": "📝", "Research": "🔬", "Security": "🔒",
-        "Tooling": "🛠", "Vector Databases": "🗄", "Other": "📦",
+        "Foundation Models": "🧠",
+        "AI Agents": "🤖",
+        "RAG & Retrieval": "🔍",
+        "Model Training": "🔧",
+        "Evals & Benchmarking": "📏",
+        "Observability & Monitoring": "👁",
+        "Inference & Serving": "⚡",
+        "Generative Media": "🎨",
+        "Computer Vision": "📷",
+        "Robotics": "🦾",
+        "Spatial & XR": "🥽",
+        "MLOps & Infrastructure": "🚀",
+        "Dev Tools & Automation": "🛠",
+        "Cloud & Platforms": "☁️",
+        "Learning Resources": "📚",
+        "Industry: Healthcare": "🏥",
+        "Industry: FinTech": "💰",
+        "Industry: Audio & Music": "🎵",
+        "Industry: Gaming": "🎮",
+        "Security & Safety": "🔒",
+        "Data Science & Analytics": "📊",
     }
 
     categories = []
