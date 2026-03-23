@@ -5,7 +5,7 @@
 ![License](https://img.shields.io/github/license/perditioinc/reporium-api)
 ![python](https://img.shields.io/badge/python-3.11%2B-3776ab)
 ![suite](https://img.shields.io/badge/suite-Reporium-6e40c9)
-![repos](https://img.shields.io/badge/repos-826-blue)
+![repos](https://img.shields.io/badge/repos-858-blue)
 ![deployed](https://img.shields.io/badge/deployed-Cloud%20Run-blue)
 ![docs](https://img.shields.io/badge/docs-%2Fdocs-blue)
 <!-- perditio-badges-end -->
@@ -83,20 +83,35 @@ Authorization: Bearer {INGESTION_API_KEY}
 ## Endpoints
 
 ### Public
-- `GET /health` — health check
-- `GET /library` — full library data (cached 5 min)
-- `GET /repos` — filterable repo list
+- `GET /health` — health check (DB + Redis status, last ingestion time)
+- `GET /library/full` — complete LibraryData matching frontend TypeScript interface (858 repos, cached 5 min)
+- `GET /library` — paginated library
+- `GET /repos` — filterable repo list with search
 - `GET /repos/{name}` — repo detail (cached 1 hr)
-- `GET /search?q=` — text/semantic search
+- `GET /search?q=` — full-text + semantic search
 - `GET /trends` — latest trend signals
 - `GET /gaps` — gap analysis
 - `GET /stats` — library statistics
 - `GET /wiki/skills/{skill}` — skill wiki page
 - `GET /wiki/categories/{category}` — category wiki page
+- `GET /metrics/latest` — platform metrics for reporium-metrics
+- `GET /audit/status` — health status for reporium-roadmap
+- `GET /docs` — Scalar API docs (dark theme)
 
 ### Authorized (Bearer token required)
-- `POST /ingest/repos` — batch upsert repos
-- `POST /ingest/repos/{name}/enrich` — update enriched fields
+- `POST /ingest/repos` — batch upsert repos (100 max)
+- `POST /ingest/repos/{name}/enrich` — update enriched fields (summary, activity score)
 - `POST /ingest/trends/snapshot` — commit trend snapshot
 - `POST /ingest/gaps` — update gap analysis
 - `POST /ingest/log` — update ingestion log
+- `POST /intelligence/query` — semantic search + Claude-powered answer over knowledge base
+- `GET /admin/data-quality` — data quality metrics
+
+## Knowledge Graph
+
+The API maintains a knowledge graph of 6,209 edges across 858 repos:
+- `COMPATIBLE_WITH` — repos that work well together
+- `ALTERNATIVE_TO` — repos solving the same problem
+- `DEPENDS_ON` — repos with a dependency relationship
+
+Used by `/intelligence/query` for context-aware answers.

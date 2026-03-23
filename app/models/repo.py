@@ -18,6 +18,7 @@ class Repo(Base):
     owner: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     is_fork: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    is_private: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     forked_from: Mapped[str | None] = mapped_column(Text)
     primary_language: Mapped[str | None] = mapped_column(Text)
     github_url: Mapped[str] = mapped_column(Text, nullable=False)
