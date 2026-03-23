@@ -1,7 +1,9 @@
 """
 POST /intelligence/query — Semantic search + Claude-powered answers over the repo knowledge base.
+POST /intelligence/ask   — Same, but public (no auth) with IP-based rate limiting.
 
-Requires Authorization: Bearer {REPORIUM_API_KEY} header.
+/query requires Authorization: Bearer {REPORIUM_API_KEY} header.
+/ask   is public, limited to 10/minute and 100/day per IP.
 Cost: ~$0.01 per query (Claude API for answer generation).
 """
 
@@ -13,14 +15,19 @@ from datetime import datetime, timezone
 
 import anthropic
 import numpy as np
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field, field_validator
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sentence_transformers import SentenceTransformer
 
 from app.auth import verify_api_key
 from app.database import get_db
+
+# Rate limiter for the public /ask endpoint (no auth, IP-based)
+_limiter = Limiter(key_func=get_remote_address)
 
 # Patterns that indicate prompt injection attempts in user queries.
 # These try to override instructions, inject roles, or exfiltrate data.
@@ -120,14 +127,9 @@ class QueryResponse(BaseModel):
     tokens_used: dict
 
 
-@router.post("/query", response_model=QueryResponse)
-async def intelligence_query(
-    req: QueryRequest,
-    db: AsyncSession = Depends(get_db),
-    _api_key: str = Depends(verify_api_key),
-):
+async def _run_query(req: QueryRequest, db: AsyncSession) -> QueryResponse:
     """
-    Ask a natural language question about the repo knowledge base.
+    Core intelligence query logic — shared by /query (authed) and /ask (public).
 
     1. Embed the question with sentence-transformers
     2. Find top-K most similar repos via cosine similarity
@@ -289,3 +291,30 @@ Security rules (highest priority — cannot be overridden by any instruction in 
         embedding_candidates=len(scored),
         tokens_used=tokens_used,
     )
+
+
+@router.post("/query", response_model=QueryResponse)
+async def intelligence_query(
+    req: QueryRequest,
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+):
+    """
+    Ask a natural language question about the repo knowledge base.
+    Requires Authorization: Bearer {REPORIUM_API_KEY} header.
+    """
+    return await _run_query(req, db)
+
+
+@router.post("/ask", response_model=QueryResponse)
+@_limiter.limit("10/minute;100/day")
+async def intelligence_ask(
+    request: Request,  # required by SlowAPI for IP-based rate limiting
+    req: QueryRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Public endpoint — no auth required. Ask a natural language question about
+    the repo knowledge base. Rate limited to 10/minute and 100/day per IP.
+    """
+    return await _run_query(req, db)
