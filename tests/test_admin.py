@@ -14,7 +14,7 @@ async def test_data_quality_requires_api_key(client: AsyncClient):
 async def test_data_quality_returns_correct_shape(client: AsyncClient):
     response = await client.get(
         "/admin/data-quality",
-        headers={"X-API-Key": TEST_API_KEY},
+        headers={"Authorization": f"Bearer {TEST_API_KEY}"},
     )
     assert response.status_code == 200
     data = response.json()

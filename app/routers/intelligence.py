@@ -1,7 +1,7 @@
 """
 POST /intelligence/query — Semantic search + Claude-powered answers over the repo knowledge base.
 
-Requires X-API-Key header matching INGESTION_API_KEY.
+Requires Authorization: Bearer {REPORIUM_API_KEY} header.
 Cost: ~$0.01 per query (Claude API for answer generation).
 """
 
