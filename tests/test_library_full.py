@@ -15,6 +15,7 @@ from app.routers.library_full import (
     _SKILL_TAG_TO_GROUP,
     _build_ai_dev_skill_stats,
     _build_builder_stats,
+    _build_enriched_repo,
     _build_tag_metrics,
     sanitize_repo,
 )
@@ -299,3 +300,104 @@ class TestSanitizeRepoDateFallback:
         }
         result = sanitize_repo(repo)
         assert result["upstreamLastPushAt"] == "2024-06-01T00:00:00"
+
+
+# ---------------------------------------------------------------------------
+# _build_enriched_repo — stars/forks for fork vs built repos  (issue #13)
+# ---------------------------------------------------------------------------
+
+def _make_db_repo(**kwargs) -> dict:
+    """Minimal DB row dict for _build_enriched_repo."""
+    defaults = {
+        "id": "00000000-0000-0000-0000-000000000001",
+        "name": "test-repo",
+        "owner": "perditioinc",
+        "description": "A test repo",
+        "is_fork": False,
+        "forked_from": None,
+        "primary_language": "Python",
+        "github_url": "https://github.com/perditioinc/test-repo",
+        "fork_sync_state": None,
+        "behind_by": 0,
+        "ahead_by": 0,
+        "upstream_created_at": None,
+        "forked_at": None,
+        "your_last_push_at": None,
+        "upstream_last_push_at": None,
+        "parent_stars": None,
+        "parent_forks": None,
+        "parent_is_archived": False,
+        "stargazers_count": None,
+        "commits_last_7_days": 0,
+        "commits_last_30_days": 0,
+        "commits_last_90_days": 0,
+        "readme_summary": None,
+        "activity_score": 0,
+        "ingested_at": None,
+        "updated_at": None,
+        "github_updated_at": None,
+    }
+    defaults.update(kwargs)
+    return defaults
+
+
+class TestBuildEnrichedRepoStars:
+
+    def test_fork_uses_parent_stars(self):
+        """Fork repos must show the upstream repo's star count."""
+        repo = _make_db_repo(
+            is_fork=True,
+            forked_from="openai/openai-cookbook",
+            parent_stars=45000,
+            parent_forks=7000,
+            stargazers_count=3,
+        )
+        enriched = _build_enriched_repo(repo, [], [], [], [], [])
+        assert enriched["stars"] == 45000
+        assert enriched["forks"] == 7000
+
+    def test_built_repo_uses_own_stargazers_count(self):
+        """Non-fork (built) repos must show their own star count, not parent_stars."""
+        repo = _make_db_repo(
+            is_fork=False,
+            forked_from=None,
+            parent_stars=None,
+            parent_forks=None,
+            stargazers_count=42,
+        )
+        enriched = _build_enriched_repo(repo, [], [], [], [], [])
+        assert enriched["stars"] == 42
+
+    def test_built_repo_with_null_stargazers_count_shows_zero(self):
+        """Built repo with no star data must show 0, not None."""
+        repo = _make_db_repo(
+            is_fork=False,
+            forked_from=None,
+            parent_stars=None,
+            parent_forks=None,
+            stargazers_count=None,
+        )
+        enriched = _build_enriched_repo(repo, [], [], [], [], [])
+        assert enriched["stars"] == 0
+
+    def test_fork_with_null_parent_stars_uses_none_not_own_stars(self):
+        """Fork repos should not fall back to their own stargazers_count."""
+        repo = _make_db_repo(
+            is_fork=True,
+            forked_from="some-org/some-repo",
+            parent_stars=None,
+            stargazers_count=99,
+        )
+        enriched = _build_enriched_repo(repo, [], [], [], [], [])
+        # parent_stars is None — stays None (frontend renders parentStats.stars)
+        assert enriched["stars"] is None
+
+    def test_built_repo_forks_always_zero(self):
+        """Built repos show 0 for forks (we don't track how many times our own repos are forked)."""
+        repo = _make_db_repo(
+            is_fork=False,
+            parent_forks=None,
+            stargazers_count=10,
+        )
+        enriched = _build_enriched_repo(repo, [], [], [], [], [])
+        assert enriched["forks"] == 0
