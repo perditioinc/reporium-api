@@ -1,5 +1,14 @@
 # Changelog
 
+## [1.3.0] - 2026-03-22
+
+### Security
+- Fixed private repo exposure: 39 private repos were being returned by /library/full
+- Added `is_private` column to repos table, backfilled from GitHub API
+- Replaced hardcoded whitelist with proper `WHERE is_private = false` filter
+- Added security unit tests to prevent regression
+- Deleted all private repo data from database permanently
+
 ## [1.2.0] - 2026-03-21
 
 ### Changed
