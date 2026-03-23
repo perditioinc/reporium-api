@@ -45,6 +45,7 @@ def map_repo(raw: dict) -> dict:
         "github_url": f"https://github.com/{name_with_owner}",
         "parent_stars": raw.get("parentStars"),
         "parent_forks": raw.get("parentForks"),
+        "stargazers_count": raw.get("stargazersCount"),
         "parent_is_archived": bool(raw.get("isArchived", False)),
         "tags": raw.get("topics", []),
         "github_updated_at": raw.get("pushedAt"),

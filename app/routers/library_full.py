@@ -345,8 +345,8 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         "language": repo.get("primary_language"),
         "topics": [t["tag"] for t in tags],
         "enrichedTags": list(dict.fromkeys([s["skill"] for s in ai_skills] + [t["tag"] for t in tags])),
-        "stars": repo.get("parent_stars") or 0,
-        "forks": repo.get("parent_forks") or 0,
+        "stars": repo.get("parent_stars") if repo.get("is_fork") else (repo.get("stargazers_count") or 0),
+        "forks": repo.get("parent_forks") if repo.get("is_fork") else 0,
         "lastUpdated": _iso(repo.get("github_updated_at") or repo.get("updated_at")),
         "url": repo.get("github_url") or f"https://github.com/{owner}/{name}",
         "isArchived": repo.get("parent_is_archived") or False,
@@ -673,13 +673,13 @@ async def library_full(db: AsyncSession = Depends(get_db)):
         SELECT id, name, owner, description, is_fork, forked_from, primary_language,
                github_url, fork_sync_state, behind_by, ahead_by,
                upstream_created_at, forked_at, your_last_push_at, upstream_last_push_at,
-               parent_stars, parent_forks, parent_is_archived,
+               parent_stars, parent_forks, parent_is_archived, stargazers_count,
                commits_last_7_days, commits_last_30_days, commits_last_90_days,
                readme_summary, activity_score, ingested_at, updated_at, github_updated_at,
                problem_solved, integration_tags, dependencies
         FROM repos
         WHERE is_private = false
-        ORDER BY parent_stars DESC NULLS LAST;
+        ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC;
     """))
     rows = result.fetchall()
     columns = result.keys()

@@ -59,6 +59,7 @@ class RepoSummary(BaseModel):
     parent_stars: int | None = None
     parent_forks: int | None = None
     parent_is_archived: bool = False
+    stargazers_count: int | None = None
 
     commits_last_7_days: int = 0
     commits_last_30_days: int = 0
@@ -135,6 +136,7 @@ class RepoIngestItem(BaseModel):
     parent_stars: int | None = None
     parent_forks: int | None = None
     parent_is_archived: bool = False
+    stargazers_count: int | None = None
 
     commits_last_7_days: int = 0
     commits_last_30_days: int = 0
