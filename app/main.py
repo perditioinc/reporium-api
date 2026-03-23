@@ -134,9 +134,15 @@ async def redoc_redirect() -> HTMLResponse:
     )
 
 
+_ALLOWED_ORIGINS = [
+    "https://reporium.com",
+    "https://www.reporium.com",
+    "https://perditioinc.github.io",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
