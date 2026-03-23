@@ -1,10 +1,10 @@
-"""Security tests — ensure private repos are never exposed."""
+"""Security tests — ensure private repos are never exposed, public forks are included."""
 import pytest
 from httpx import AsyncClient
 
 
 @pytest.mark.asyncio
-async def test_library_full_no_private_repo_names(client: AsyncClient):
+async def test_library_full_never_exposes_private_repos(client: AsyncClient):
     """No known private repo names should appear in /library/full."""
     PRIVATE_NAMES = {
         'didymo-ai-agent', 'didymo-ai-api', 'didymo-ai-auth', 'didymo-ai-gcp-tts',
@@ -26,8 +26,8 @@ async def test_library_full_no_private_repo_names(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_library_full_all_repos_not_fork(client: AsyncClient):
-    """Every repo in /library/full must be a non-fork."""
+async def test_library_full_includes_public_forks(client: AsyncClient):
+    """Public forks must be included in /library/full — they are the core content."""
     try:
         resp = await client.get("/library/full")
     except Exception:
@@ -35,8 +35,12 @@ async def test_library_full_all_repos_not_fork(client: AsyncClient):
         return
     if resp.status_code != 200:
         pytest.skip("library/full requires full schema with migration columns")
-    for repo in resp.json().get("repos", []):
-        assert repo.get("isFork") is False, f"{repo['name']} is a fork"
+    repos = resp.json().get("repos", [])
+    forks = [r for r in repos if r.get("isFork")]
+    # In production there are 1000+ public forks. In test env there may be fewer.
+    # Just verify forks are not being filtered out if data exists.
+    if len(repos) > 20:
+        assert len(forks) > 0, "Public forks are missing from /library/full"
 
 
 @pytest.mark.asyncio
@@ -48,4 +52,3 @@ async def test_health_does_not_leak_secrets(client: AsyncClient):
     assert "redis://" not in body.lower()
     assert "ghp_" not in body
     assert "sk-ant-" not in body
-
