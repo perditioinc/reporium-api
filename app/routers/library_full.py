@@ -105,6 +105,17 @@ def sanitize_repo(repo: dict) -> dict:
     if not repo.get("topics"):
         repo["topics"] = []
 
+    # Date fields — use lastUpdated as fallback for empty date fields
+    last_updated = repo.get("lastUpdated") or ""
+    if last_updated:
+        ps = repo.get("parentStats")
+        if ps and not ps.get("lastCommitDate"):
+            ps["lastCommitDate"] = last_updated
+        if not repo.get("upstreamLastPushAt"):
+            repo["upstreamLastPushAt"] = last_updated if repo.get("isFork") else ""
+        if not repo.get("upstreamCreatedAt") and repo.get("isFork"):
+            repo["upstreamCreatedAt"] = repo.get("createdAt") or ""
+
     # Commit stats — never null
     if not repo.get("commitStats"):
         repo["commitStats"] = {"today": 0, "last7Days": 0, "last30Days": 0,
