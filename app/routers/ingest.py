@@ -23,6 +23,7 @@ from app.models.repo import (
     RepoTag,
 )
 from app.models.trend import GapAnalysis, IngestionLog, TrendSnapshot
+from app.routers.library_full import invalidate_library_cache
 from app.schemas.repo import IngestResponse, RepoEnrichItem, RepoIngestItem
 from app.schemas.trend import GapAnalysisIn, GapAnalysisOut, IngestionLogIn, IngestionLogOut, TrendSnapshotIn, TrendSnapshotOut
 
@@ -107,10 +108,11 @@ async def ingest_repos(
 
     await db.commit()
 
-    # Invalidate relevant cache keys
+    # Invalidate both Redis cache keys and the in-memory /library/full cache
     await cache.invalidate("library:full*")
     await cache.invalidate("repos:list:*")
     await cache.invalidate("stats:overview")
+    invalidate_library_cache()
 
     return IngestResponse(upserted=upserted, errors=errors)
 

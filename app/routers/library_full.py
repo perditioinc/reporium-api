@@ -222,7 +222,8 @@ def sanitize_repo(repo: dict) -> dict:
     if not repo.get("topics"):
         repo["topics"] = []
 
-    # Date fields — use lastUpdated as fallback for empty date fields
+    # Date fields — conservative fallbacks only for fields that have safe proxies.
+    # Never substitute ingested_at for upstream_created_at — that shows the wrong date.
     last_updated = repo.get("lastUpdated") or ""
     if last_updated:
         ps = repo.get("parentStats")
@@ -230,8 +231,9 @@ def sanitize_repo(repo: dict) -> dict:
             ps["lastCommitDate"] = last_updated
         if not repo.get("upstreamLastPushAt"):
             repo["upstreamLastPushAt"] = last_updated if repo.get("isFork") else ""
-        if not repo.get("upstreamCreatedAt") and repo.get("isFork"):
-            repo["upstreamCreatedAt"] = repo.get("createdAt") or ""
+        # Do NOT fall back upstreamCreatedAt to createdAt/ingested_at — that produces a
+        # misleading "Project created: Mar 2026" for repos that were created years ago.
+        # Leave it empty until a proper GitHub API backfill populates upstream_created_at.
 
     # Commit stats — never null
     if not repo.get("commitStats"):

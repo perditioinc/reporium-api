@@ -118,6 +118,7 @@ class RepoIngestItem(BaseModel):
     owner: str
     description: str | None = None
     is_fork: bool = False
+    is_private: bool = False
     forked_from: str | None = None
     primary_language: str | None = None
     github_url: str
