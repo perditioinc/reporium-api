@@ -143,9 +143,13 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def add_rate_limit_headers(request: Request, call_next):
+async def add_security_headers(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-RateLimit-Policy"] = "200/hour;30/minute"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+    response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
     return response
 
 app.include_router(library.router)
