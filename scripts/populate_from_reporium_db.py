@@ -123,8 +123,14 @@ async def main():
         raw_repos = resp.json()
         print(f"Loaded {len(raw_repos)} repos from partition")
 
+    # SECURITY: Filter out private repos before ingestion
+    public_repos = [r for r in raw_repos if not r.get("isPrivate", False)]
+    skipped_private = len(raw_repos) - len(public_repos)
+    if skipped_private:
+        print(f"SECURITY: Skipped {skipped_private} private repos")
+
     # Map to API schema
-    mapped = [map_repo(r) for r in raw_repos]
+    mapped = [map_repo(r) for r in public_repos]
 
     # Split into batches
     batches = [mapped[i : i + BATCH_SIZE] for i in range(0, len(mapped), BATCH_SIZE)]
