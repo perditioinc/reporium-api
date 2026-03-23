@@ -50,6 +50,79 @@ _cache: dict = {"data": None, "expires_at": 0}
 CACHE_TTL = 300  # 5 minutes
 
 
+def sanitize_repo(repo: dict) -> dict:
+    """
+    Enforce CONTRACT.md — every field gets a valid value, never null.
+    Logs a warning for each fallback applied so enrichment gaps are visible.
+    """
+    name = repo.get("name", "unknown")
+
+    # Required fields — apply fallbacks
+    if not repo.get("description"):
+        summary = repo.get("readmeSummary") or ""
+        repo["description"] = summary[:150] if summary else name
+        logger.warning("Contract fallback: %s missing description", name)
+
+    if not repo.get("readmeSummary"):
+        repo["readmeSummary"] = repo["description"]
+        logger.warning("Contract fallback: %s missing readmeSummary", name)
+
+    if not repo.get("primaryCategory") or repo["primaryCategory"] == "Other":
+        repo["primaryCategory"] = "Uncategorized"
+
+    if not repo.get("allCategories"):
+        repo["allCategories"] = [repo["primaryCategory"]]
+        logger.warning("Contract fallback: %s missing categories", name)
+
+    if not repo.get("enrichedTags"):
+        repo["enrichedTags"] = []
+
+    if not repo.get("builders"):
+        owner = repo.get("fullName", "").split("/")[0] if repo.get("fullName") else "perditioinc"
+        repo["builders"] = [{"login": owner, "name": None, "type": "user",
+                             "avatarUrl": f"https://avatars.githubusercontent.com/{owner}",
+                             "isKnownOrg": False, "orgCategory": "individual"}]
+
+    if not repo.get("pmSkills"):
+        repo["pmSkills"] = []
+    if not repo.get("industries"):
+        repo["industries"] = []
+    if not repo.get("aiDevSkills"):
+        repo["aiDevSkills"] = []
+    if not repo.get("programmingLanguages"):
+        repo["programmingLanguages"] = []
+    if not repo.get("topics"):
+        repo["topics"] = []
+
+    # Commit stats — never null
+    if not repo.get("commitStats"):
+        repo["commitStats"] = {"today": 0, "last7Days": 0, "last30Days": 0,
+                               "last90Days": 0, "recentCommits": []}
+
+    # Arrays that must never be null
+    for arr_field in ("recentCommits", "commitsLast7Days", "commitsLast30Days", "commitsLast90Days"):
+        if not repo.get(arr_field):
+            repo[arr_field] = []
+
+    # Objects that must never be null
+    if not repo.get("languageBreakdown"):
+        repo["languageBreakdown"] = {}
+    if not repo.get("languagePercentages"):
+        repo["languagePercentages"] = {}
+
+    # Scalars with safe defaults
+    if repo.get("stars") is None:
+        repo["stars"] = 0
+    if repo.get("forks") is None:
+        repo["forks"] = 0
+    if repo.get("weeklyCommitCount") is None:
+        repo["weeklyCommitCount"] = 0
+    if repo.get("totalCommitsFetched") is None:
+        repo["totalCommitsFetched"] = 0
+
+    return repo
+
+
 def _iso(val) -> str:
     """Convert a datetime or string to ISO format string."""
     if val is None:
@@ -451,7 +524,7 @@ async def library_full(db: AsyncSession = Depends(get_db)):
             builders=all_builders.get(rid, []),
             industries=all_industries.get(rid, []),
         )
-        enriched_repos.append(enriched)
+        enriched_repos.append(sanitize_repo(enriched))
 
     # Build aggregated data
     stats = _build_stats(enriched_repos)
