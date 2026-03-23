@@ -34,10 +34,13 @@ class Repo(Base):
     your_last_push_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     upstream_last_push_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
-    # Parent stats
+    # Parent stats (for forks — points to upstream repo)
     parent_stars: Mapped[int | None] = mapped_column(Integer)
     parent_forks: Mapped[int | None] = mapped_column(Integer)
     parent_is_archived: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+
+    # Own star count (for non-fork / built repos)
+    stargazers_count: Mapped[int | None] = mapped_column(Integer)
 
     # Activity
     commits_last_7_days: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
