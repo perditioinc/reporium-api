@@ -1,5 +1,7 @@
 name: Deploy to Cloud Run
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -38,7 +40,7 @@ jobs:
                   source="reporium-api",
                   payload={
                       "service": "reporium-api",
-                      "version": "v1.5.1",
+                      "version": os.getenv("GITHUB_SHA", "unknown")[:7],
                       "url": "https://reporium-api-573778300586.us-central1.run.app",
                   },
               )
