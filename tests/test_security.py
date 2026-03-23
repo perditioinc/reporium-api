@@ -13,20 +13,22 @@ async def test_library_full_no_private_repo_names(client: AsyncClient):
         '18degrees-ecom', 'perditio-infra', 'perditio-web', 'perditio-services',
     }
     resp = await client.get("/library/full")
-    if resp.status_code == 200:
-        data = resp.json()
-        repo_names = {r["name"] for r in data.get("repos", [])}
-        exposed = repo_names & PRIVATE_NAMES
-        assert len(exposed) == 0, f"PRIVATE REPOS EXPOSED: {exposed}"
+    if resp.status_code != 200:
+        pytest.skip("library/full requires full schema with migration columns")
+    data = resp.json()
+    repo_names = {r["name"] for r in data.get("repos", [])}
+    exposed = repo_names & PRIVATE_NAMES
+    assert len(exposed) == 0, f"PRIVATE REPOS EXPOSED: {exposed}"
 
 
 @pytest.mark.asyncio
 async def test_library_full_all_repos_not_fork(client: AsyncClient):
     """Every repo in /library/full must be a non-fork."""
     resp = await client.get("/library/full")
-    if resp.status_code == 200:
-        for repo in resp.json().get("repos", []):
-            assert repo.get("isFork") is False, f"{repo['name']} is a fork"
+    if resp.status_code != 200:
+        pytest.skip("library/full requires full schema with migration columns")
+    for repo in resp.json().get("repos", []):
+        assert repo.get("isFork") is False, f"{repo['name']} is a fork"
 
 
 @pytest.mark.asyncio
