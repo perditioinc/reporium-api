@@ -16,7 +16,33 @@ jobs:
           credentials_json: ${{ secrets.GCP_SA_KEY }}
 
       - uses: google-github-actions/deploy-cloudrun@v2
+        id: deploy
         with:
           service: reporium-api
           region: us-central1
           source: .
+
+      - name: Publish api.deployed event
+        if: success()
+        run: |
+          pip install -q google-cloud-pubsub google-cloud-firestore
+          python - <<'EOF'
+          import asyncio, os, sys
+          sys.path.insert(0, '.')
+          from reporium_events.models import EventType
+          from reporium_events.publisher import publish_event
+
+          async def main():
+              await publish_event(
+                  event_type=EventType.API_DEPLOYED,
+                  source="reporium-api",
+                  payload={
+                      "service": "reporium-api",
+                      "version": "v1.5.1",
+                      "url": "https://reporium-api-573778300586.us-central1.run.app",
+                  },
+              )
+              print("Published api.deployed event")
+
+          asyncio.run(main())
+          EOF
