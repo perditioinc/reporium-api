@@ -253,3 +253,17 @@ class RepoTaxonomy(Base):
     __table_args__ = (
         UniqueConstraint("repo_id", "dimension", "raw_value", name="uq_repo_taxonomy_repo_dim_val"),
     )
+
+
+class IngestRun(Base):
+    """Stores a record for each ingestion pipeline run."""
+    __tablename__ = "ingest_runs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_mode: Mapped[str] = mapped_column(Text, nullable=False)          # quick / weekly / full / fix
+    status: Mapped[str] = mapped_column(Text, nullable=False, default="running")  # running / success / error
+    repos_upserted: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    repos_processed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    errors: Mapped[dict | None] = mapped_column(JSONB, nullable=True)     # list of error strings
+    started_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+    finished_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
