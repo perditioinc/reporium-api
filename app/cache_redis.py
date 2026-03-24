@@ -26,11 +26,12 @@ class RedisCache:
     """Async Redis wrapper with graceful degradation when REDIS_URL is unset."""
 
     def __init__(self) -> None:
-        self._url: str | None = os.environ.get("REDIS_URL")
+        url = os.environ.get("REDIS_URL", "")
+        self._url: str | None = url if url.strip() else None
         self._client = None  # lazy-initialised on first use
 
     async def _get_client(self):
-        """Return a connected async Redis client, or None if REDIS_URL is unset."""
+        """Return a connected async Redis client, or None if REDIS_URL is unset/empty."""
         if self._url is None:
             return None
         if self._client is None:
