@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import CACHE_TTL_GAPS, CACHE_TTL_STATS, CACHE_TTL_TRENDS, cache
@@ -122,6 +122,34 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
     ).all()
     top_tags = [row.tag for row in tag_rows]
 
+    # Taxonomy dimension counts (distinct values per dimension)
+    tax_dim_rows = (await db.execute(text(
+        "SELECT dimension, COUNT(DISTINCT raw_value) AS cnt "
+        "FROM repo_taxonomy GROUP BY dimension"
+    ))).fetchall()
+    taxonomy_dimension_counts = {row.dimension: row.cnt for row in tax_dim_rows}
+
+    # has_tests / has_ci counts
+    has_tests_count = (await db.execute(
+        select(func.count(Repo.id)).where(Repo.has_tests == True)  # noqa: E712
+    )).scalar_one()
+    has_ci_count = (await db.execute(
+        select(func.count(Repo.id)).where(Repo.has_ci == True)  # noqa: E712
+    )).scalar_one()
+
+    # Average overall_score from quality_signals JSONB
+    quality_score_avg_row = (await db.execute(text(
+        "SELECT AVG((quality_signals->>'overall_score')::float) "
+        "FROM repos WHERE quality_signals IS NOT NULL "
+        "AND quality_signals->>'overall_score' IS NOT NULL"
+    ))).scalar_one()
+    quality_score_avg = round(float(quality_score_avg_row), 2) if quality_score_avg_row is not None else None
+
+    # Enriched repo count (readme_summary is not null)
+    enriched_repo_count = (await db.execute(
+        select(func.count(Repo.id)).where(Repo.readme_summary.is_not(None))
+    )).scalar_one()
+
     response = StatsResponse(
         total_repos=total,
         total_forks=total_forks,
@@ -131,6 +159,11 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
         top_tags=top_tags,
         sync_states=sync_states,
         last_ingestion=last_ingestion,
+        taxonomy_dimension_counts=taxonomy_dimension_counts,
+        has_tests_count=has_tests_count,
+        has_ci_count=has_ci_count,
+        quality_score_avg=quality_score_avg,
+        enriched_repo_count=enriched_repo_count,
     )
     await cache.set("stats:overview", response.model_dump(), ttl=CACHE_TTL_STATS)
     return response
