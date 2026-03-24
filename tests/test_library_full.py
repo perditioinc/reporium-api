@@ -10,8 +10,9 @@ Covers:
 
 from app.routers.library_full import (
     KNOWN_ORG_CATEGORIES,
+    LIFECYCLE_GROUPS,
     SYSTEM_TAGS,
-    _AI_DEV_SKILL_GROUPS,
+    _AI_DEV_SKILLS_ORDERED,
     _SKILL_TAG_TO_GROUP,
     _build_ai_dev_skill_stats,
     _build_builder_stats,
@@ -55,10 +56,10 @@ class TestBuildAiDevSkillStats:
         assert "Inference & Serving" in stats
         assert stats["Inference & Serving"]["repoCount"] == 1
 
-    def test_langchain_maps_to_ai_agents(self):
+    def test_langchain_maps_to_agents_orchestration(self):
         repos = [_make_repo("r1", ["LangChain"])]
         stats = {s["skill"]: s for s in _build_ai_dev_skill_stats(repos)}
-        assert stats["AI Agents & Orchestration"]["repoCount"] == 1
+        assert stats["Agents & Orchestration"]["repoCount"] == 1
 
     def test_multiple_tags_same_group_counted_once_per_repo(self):
         # A repo with both vLLM and SGLang should count as 1 for Inference & Serving
@@ -70,19 +71,19 @@ class TestBuildAiDevSkillStats:
         repos = [_make_repo("r1", ["vLLM", "RAG"])]
         stats = {s["skill"]: s for s in _build_ai_dev_skill_stats(repos)}
         assert stats["Inference & Serving"]["repoCount"] == 1
-        assert stats["RAG & Knowledge"]["repoCount"] == 1
+        assert stats["RAG & Retrieval"]["repoCount"] == 1
 
     def test_unknown_tags_produce_zero_counts(self):
         repos = [_make_repo("r1", ["unknown-tag-xyz"])]
         stats = {s["skill"]: s for s in _build_ai_dev_skill_stats(repos)}
-        # Every group exists in output (one per taxonomy group)
-        assert len(stats) == len(_AI_DEV_SKILL_GROUPS)
+        # Every skill exists in output (one per taxonomy skill — 28 total)
+        assert len(stats) == len(_AI_DEV_SKILLS_ORDERED)
         for s in stats.values():
             assert s["repoCount"] == 0
 
-    def test_empty_repos_returns_all_groups_with_zero(self):
+    def test_empty_repos_returns_all_skills_with_zero(self):
         stats = _build_ai_dev_skill_stats([])
-        assert len(stats) == len(_AI_DEV_SKILL_GROUPS)
+        assert len(stats) == len(_AI_DEV_SKILLS_ORDERED)
         assert all(s["repoCount"] == 0 for s in stats)
 
     def test_coverage_field_strong_when_over_10_percent(self):
@@ -96,11 +97,19 @@ class TestBuildAiDevSkillStats:
         stats = {s["skill"]: s for s in _build_ai_dev_skill_stats(repos)}
         assert stats["Inference & Serving"]["coverage"] == "none"
 
-    def test_skill_tags_in_ai_dev_skills_field_also_counted(self):
-        # Tags in aiDevSkills (not enrichedTags) should also map to groups
-        repos = [_make_repo("r1", [], ai_skills=["vLLM"])]
+    def test_canonical_skill_in_ai_dev_skills_field_counted(self):
+        # Canonical 28-skill names in aiDevSkills should be counted directly
+        repos = [_make_repo("r1", [], ai_skills=["Inference & Serving"])]
         stats = {s["skill"]: s for s in _build_ai_dev_skill_stats(repos)}
         assert stats["Inference & Serving"]["repoCount"] == 1
+
+    def test_legacy_tag_in_ai_dev_skills_field_not_counted_directly(self):
+        # Legacy tool names (e.g. "vLLM") in aiDevSkills are not canonical skill names;
+        # they only match via enrichedTags fallback path.
+        repos = [_make_repo("r1", [], ai_skills=["vLLM"])]
+        stats = {s["skill"]: s for s in _build_ai_dev_skill_stats(repos)}
+        # "vLLM" is not a canonical skill name, so it won't directly match
+        assert stats["Inference & Serving"]["repoCount"] == 0
 
     def test_case_insensitive_tag_lookup(self):
         repos = [_make_repo("r1", ["VLLM"])]
@@ -113,7 +122,15 @@ class TestBuildAiDevSkillStats:
     def test_output_order_matches_taxonomy_order(self):
         stats = _build_ai_dev_skill_stats([])
         skill_names = [s["skill"] for s in stats]
-        assert skill_names == list(_AI_DEV_SKILL_GROUPS.keys())
+        assert skill_names == _AI_DEV_SKILLS_ORDERED
+
+    def test_lifecycle_group_present_in_each_stat(self):
+        stats = _build_ai_dev_skill_stats([])
+        for s in stats:
+            assert "lifecycleGroup" in s
+            assert s["lifecycleGroup"] in LIFECYCLE_GROUPS.values(), (
+                f"skill '{s['skill']}' has unknown lifecycleGroup '{s['lifecycleGroup']}'"
+            )
 
     def test_top_repos_sorted_by_stars(self):
         repos = [
