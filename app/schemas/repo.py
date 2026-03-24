@@ -76,6 +76,7 @@ class RepoSummary(BaseModel):
 
     readme_summary: str | None = None
     activity_score: int = 0
+    quality_signals: dict | None = None
     problem_solved: str | None = None
     license_spdx: str | None = None
 
