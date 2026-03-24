@@ -1,13 +1,13 @@
 """add skill_areas table with seed data
 
-Revision ID: 010
-Revises: 009
+Revision ID: 011
+Revises: 010
 Create Date: 2026-03-24
 """
 from alembic import op
 
-revision = '010'
-down_revision = '009'
+revision = '011'
+down_revision = '010'
 branch_labels = None
 depends_on = None
 
