@@ -412,7 +412,8 @@ def _iso(val) -> str:
 def _build_enriched_repo(repo: dict, languages: list, categories: list,
                          ai_skills: list, tags: list, pm_skills: list,
                          builders: list = None, industries: list = None,
-                         lifecycle_groups: dict = None) -> dict:
+                         lifecycle_groups: dict = None,
+                         taxonomy: list = None) -> dict:
     """Transform a DB repo row + junction data into the frontend EnrichedRepo shape."""
     forked_from = repo.get("forked_from")
     owner = repo.get("owner", "perditioinc")
@@ -525,6 +526,16 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         "pmSkills": [s["skill"] for s in pm_skills],
         "industries": [ind["industry"] for ind in (industries or [])],
         "programmingLanguages": list(lang_breakdown.keys()),
+        "taxonomy": [
+            {
+                "dimension": t["dimension"],
+                "value": t["raw_value"],
+                "similarityScore": t["similarity_score"],
+                "assignedBy": t["assigned_by"],
+            }
+            for t in (taxonomy or [])
+        ],
+        "problemSolved": repo.get("problem_solved"),
         "builders": [
             {
                 "login": b["login"],
@@ -856,7 +867,7 @@ async def _fetch_page_repos(
         r = await db.execute(text(q), {"ids": page_ids})
         return r.fetchall()
 
-    lang_rows, cat_rows, skill_rows, tag_rows, pm_rows, builder_rows, industry_rows = (
+    lang_rows, cat_rows, skill_rows, tag_rows, pm_rows, builder_rows, industry_rows, taxonomy_rows = (
         await asyncio.gather(
             _fetch_junction("SELECT repo_id, language, bytes, percentage FROM repo_languages WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, category_name, is_primary FROM repo_categories WHERE repo_id::text = ANY(:ids)"),
@@ -865,6 +876,7 @@ async def _fetch_page_repos(
             _fetch_junction("SELECT repo_id, skill FROM repo_pm_skills WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, login, display_name, org_category, is_known_org FROM repo_builders WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, industry FROM repo_industries WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction("SELECT repo_id, dimension, raw_value, similarity_score, assigned_by FROM repo_taxonomy WHERE repo_id::text = ANY(:ids)"),
         )
     )
 
@@ -899,6 +911,15 @@ async def _fetch_page_repos(
     for r in industry_rows:
         all_industries[str(r.repo_id)].append({"industry": r.industry})
 
+    all_taxonomy: dict = defaultdict(list)
+    for r in taxonomy_rows:
+        all_taxonomy[str(r.repo_id)].append({
+            "dimension": r.dimension,
+            "raw_value": r.raw_value,
+            "similarity_score": r.similarity_score,
+            "assigned_by": r.assigned_by,
+        })
+
     lifecycle_groups = await _get_lifecycle_groups(db)
 
     enriched = []
@@ -914,6 +935,7 @@ async def _fetch_page_repos(
             builders=all_builders.get(rid, []),
             industries=all_industries.get(rid, []),
             lifecycle_groups=lifecycle_groups,
+            taxonomy=all_taxonomy.get(rid, []),
         )))
 
     return enriched, total
