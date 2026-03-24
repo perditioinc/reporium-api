@@ -1,5 +1,7 @@
 name: Deploy to Cloud Run
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -21,9 +23,17 @@ jobs:
           service: reporium-api
           region: us-central1
           source: .
+          flags: >-
+            --memory=1Gi
+            --cpu=1
+            --min-instances=1
+            --max-instances=10
+            --concurrency=20
+            --timeout=60
 
       - name: Publish api.deployed event
         if: success()
+        continue-on-error: true
         run: |
           pip install -q google-cloud-pubsub google-cloud-firestore
           python - <<'EOF'
@@ -38,7 +48,7 @@ jobs:
                   source="reporium-api",
                   payload={
                       "service": "reporium-api",
-                      "version": "v1.5.1",
+                      "version": os.getenv("GITHUB_SHA", "unknown")[:7],
                       "url": "https://reporium-api-573778300586.us-central1.run.app",
                   },
               )
