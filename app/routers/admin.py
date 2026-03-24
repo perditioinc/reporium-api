@@ -267,3 +267,110 @@ async def backfill_embeddings(
 
     await db.commit()
     return {"backfilled": backfilled, "errors": errors}
+
+
+@router.post("/admin/taxonomy/bootstrap")
+async def bootstrap_taxonomy(
+    limit: int = Query(default=100, ge=1, le=500),
+    dimension: str | None = Query(default=None),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """
+    For each repo with no taxonomy entries (optionally filtered to a single dimension),
+    run the pgvector similarity-assign pipeline to populate repo_taxonomy.
+
+    Steps:
+    1. Find repos with no taxonomy entries for the given dimension (or any dimension).
+    2. For each such repo, run assign_taxonomy scoped to that repo's embedding.
+    3. Return {processed, assigned, errors}.
+    """
+    # Find repos that have no taxonomy for the target dimension
+    if dimension:
+        untagged_result = await db.execute(text(
+            """
+            SELECT r.id, r.name
+            FROM repos r
+            WHERE r.id NOT IN (
+                SELECT DISTINCT repo_id FROM repo_taxonomy WHERE dimension = :dim
+            )
+            ORDER BY r.updated_at DESC
+            LIMIT :lim
+            """
+        ), {"dim": dimension, "lim": limit})
+    else:
+        untagged_result = await db.execute(text(
+            """
+            SELECT r.id, r.name
+            FROM repos r
+            WHERE r.id NOT IN (
+                SELECT DISTINCT repo_id FROM repo_taxonomy
+            )
+            ORDER BY r.updated_at DESC
+            LIMIT :lim
+            """
+        ), {"lim": limit})
+
+    untagged_repos = untagged_result.fetchall()
+    processed = 0
+    assigned = 0
+    errors: list[str] = []
+
+    if not untagged_repos:
+        return {"processed": 0, "assigned": 0, "errors": []}
+
+    # Fetch taxonomy values that have embeddings (optionally filtered by dimension)
+    if dimension:
+        tv_result = await db.execute(text(
+            "SELECT id, dimension, name FROM taxonomy_values "
+            "WHERE embedding_vec IS NOT NULL AND dimension = :dim"
+        ), {"dim": dimension})
+    else:
+        tv_result = await db.execute(text(
+            "SELECT id, dimension, name FROM taxonomy_values WHERE embedding_vec IS NOT NULL"
+        ))
+    taxonomy_values = tv_result.fetchall()
+
+    if not taxonomy_values:
+        return {"processed": len(untagged_repos), "assigned": 0, "errors": ["No taxonomy_values with embeddings found"]}
+
+    threshold = 0.65
+    repo_ids = [str(row.id) for row in untagged_repos]
+
+    for tv in taxonomy_values:
+        try:
+            repo_result = await db.execute(text(
+                """
+                SELECT re.repo_id,
+                       1 - (re.embedding_vec <=> tv.embedding_vec) AS similarity
+                FROM repo_embeddings re
+                JOIN taxonomy_values tv ON tv.id = :tv_id
+                WHERE re.embedding_vec IS NOT NULL
+                  AND re.repo_id::text = ANY(:repo_ids)
+                  AND 1 - (re.embedding_vec <=> tv.embedding_vec) >= :threshold
+                """
+            ), {"tv_id": tv.id, "threshold": threshold, "repo_ids": repo_ids})
+            repo_rows = repo_result.fetchall()
+
+            for rrow in repo_rows:
+                await db.execute(text(
+                    "INSERT INTO repo_taxonomy "
+                    "  (repo_id, dimension, raw_value, taxonomy_value_id, similarity_score, assigned_by) "
+                    "VALUES (:repo_id, :dimension, :raw_value, :tv_id, :sim, 'similarity') "
+                    "ON CONFLICT (repo_id, dimension, raw_value) DO NOTHING"
+                ), {
+                    "repo_id": str(rrow.repo_id),
+                    "dimension": tv.dimension,
+                    "raw_value": tv.name,
+                    "tv_id": tv.id,
+                    "sim": float(rrow.similarity),
+                })
+                assigned += 1
+        except Exception as exc:
+            errors.append(f"tv {tv.name}: {exc}")
+            logger.warning("Taxonomy bootstrap failed for value %s: %s", tv.name, exc)
+
+    processed = len(untagged_repos)
+    await db.commit()
+    return {"processed": processed, "assigned": assigned, "errors": errors}
