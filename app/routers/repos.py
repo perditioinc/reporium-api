@@ -53,6 +53,7 @@ async def list_repos(
     builder: str | None = None,
     ai_dev_skill: str | None = None,
     language: str | None = None,
+    license: str | None = None,
     min_stars: int | None = None,
     sync_status: str | None = None,
     sort: str = Query(default="updated"),
@@ -63,7 +64,7 @@ async def list_repos(
     params = {
         "page": page, "limit": limit, "category": category, "tag": tag,
         "topic": topic, "builder": builder, "ai_dev_skill": ai_dev_skill,
-        "language": language, "min_stars": min_stars,
+        "language": language, "license": license, "min_stars": min_stars,
         "sync_status": sync_status, "sort": sort, "q": q,
     }
     param_hash = hashlib.md5(json.dumps(params, sort_keys=True).encode()).hexdigest()
@@ -102,6 +103,8 @@ async def list_repos(
         stmt = stmt.join(RepoTag, RepoTag.repo_id == Repo.id).where(RepoTag.tag == topic)
     if language:
         stmt = stmt.where(Repo.primary_language == language)
+    if license:
+        stmt = stmt.where(Repo.license_spdx == license)
     if min_stars:
         stmt = stmt.where(Repo.parent_stars >= min_stars)
     if sync_status:

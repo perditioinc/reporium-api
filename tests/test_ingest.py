@@ -36,6 +36,7 @@ async def test_ingest_with_valid_key(client: AsyncClient):
     library = await client.get("/library/full")
     assert library.status_code == 200
     assert library.json()["repos"][0]["openIssuesCount"] == 42
+    assert library.json()["repos"][0]["licenseSpdx"] == "MIT"
 
 
 @pytest.mark.asyncio
