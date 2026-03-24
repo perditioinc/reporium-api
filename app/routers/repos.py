@@ -20,7 +20,7 @@ from app.models.repo import (
 from app.routers.library import _repo_to_summary
 from app.schemas.repo import RepoDetail, RepoSummary
 
-router = APIRouter()
+router = APIRouter(tags=["Repos"])
 
 VALID_SORT = {"stars", "updated", "behind", "name"}
 VALID_SYNC = {"up-to-date", "behind", "ahead", "diverged"}

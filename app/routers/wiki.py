@@ -9,7 +9,7 @@ from app.models.repo import Repo, RepoAIDevSkill, RepoCategory, RepoPMSkill
 from app.routers.library import _repo_to_summary
 from app.schemas.repo import RepoSummary
 
-router = APIRouter()
+router = APIRouter(tags=["Wiki"])
 
 
 class SkillWikiResponse(BaseModel):
