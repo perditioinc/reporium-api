@@ -173,6 +173,10 @@ _LIFECYCLE_GROUPS_FALLBACK: dict = {
     "Recommendation Systems": "Applied AI",
 }
 
+# Backwards-compatible export retained for tests and callers that still import
+# the old constant name directly. DB-backed lookup remains the live path.
+LIFECYCLE_GROUPS = _LIFECYCLE_GROUPS_FALLBACK
+
 _lifecycle_groups_cache: dict = {}
 _LIFECYCLE_GROUPS_TTL = 300  # 5 minutes
 
