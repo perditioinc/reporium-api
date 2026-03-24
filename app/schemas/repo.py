@@ -176,6 +176,8 @@ class RepoIngestItem(BaseModel):
     commits: list[CommitIngest] = []
 
     license_spdx: str | None = None
+    has_tests: bool | None = None
+    has_ci: bool | None = None
 
     # Dynamic taxonomy dimensions
     skill_areas: list[str] = []
