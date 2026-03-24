@@ -29,8 +29,6 @@ from sentence_transformers import SentenceTransformer
 from app.auth import verify_api_key
 from app.circuit_breaker import anthropic_breaker
 from app.database import async_session_factory, get_db
-from app.models.query_log import QueryLog
-
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
 _limiter = Limiter(key_func=get_remote_address)
 
@@ -50,6 +48,7 @@ _INJECTION_PATTERNS = re.compile(
 )
 
 _MAX_CONTENT_LEN = 400  # max chars per repo field in context
+_SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.15
 
 
 def _sanitize_question(question: str) -> str:
@@ -134,24 +133,57 @@ async def _log_query(
     hashed_ip: str | None,
     latency_ms: int,
     model: str,
+    question_embedding: np.ndarray | None = None,
     cache_hit: bool = False,
 ) -> None:
     """Fire-and-forget: write one row to query_log. Never raises."""
     try:
         async with async_session_factory() as session:
-            row = QueryLog(
-                question=question,
-                answer_truncated=answer[:500],
-                sources=sources,
-                tokens_prompt=tokens_prompt,
-                tokens_completion=tokens_completion,
-                cost_usd=_estimate_cost(tokens_prompt, tokens_completion),
-                hashed_ip=hashed_ip,
-                latency_ms=latency_ms,
-                model=model,
-                cache_hit=cache_hit,
+            await session.execute(
+                text("""
+                    INSERT INTO query_log (
+                        question,
+                        answer_truncated,
+                        answer_full,
+                        sources,
+                        tokens_prompt,
+                        tokens_completion,
+                        cost_usd,
+                        hashed_ip,
+                        latency_ms,
+                        model,
+                        cache_hit,
+                        question_embedding_vec
+                    ) VALUES (
+                        :question,
+                        :answer_truncated,
+                        :answer_full,
+                        CAST(:sources AS jsonb),
+                        :tokens_prompt,
+                        :tokens_completion,
+                        :cost_usd,
+                        :hashed_ip,
+                        :latency_ms,
+                        :model,
+                        :cache_hit,
+                        CAST(:question_embedding_vec AS vector)
+                    )
+                """),
+                {
+                    "question": question,
+                    "answer_truncated": answer[:500],
+                    "answer_full": answer,
+                    "sources": json.dumps(sources),
+                    "tokens_prompt": tokens_prompt,
+                    "tokens_completion": tokens_completion,
+                    "cost_usd": _estimate_cost(tokens_prompt, tokens_completion),
+                    "hashed_ip": hashed_ip,
+                    "latency_ms": latency_ms,
+                    "model": model,
+                    "cache_hit": cache_hit,
+                    "question_embedding_vec": _vec_to_pg(question_embedding) if question_embedding is not None else None,
+                },
             )
-            session.add(row)
             await session.commit()
     except Exception:
         logger.exception("query_log insert failed (non-fatal)")
@@ -185,7 +217,72 @@ class QueryResponse(BaseModel):
     model: str
     answered_at: str
     embedding_candidates: int
+    cache_hit: bool = False
     tokens_used: dict
+
+
+def _coerce_cached_sources(raw_sources: object) -> list[SourceRepo]:
+    if isinstance(raw_sources, str):
+        try:
+            raw_sources = json.loads(raw_sources)
+        except json.JSONDecodeError:
+            return []
+
+    if not isinstance(raw_sources, list):
+        return []
+
+    coerced: list[SourceRepo] = []
+    for item in raw_sources:
+        if not isinstance(item, dict):
+            continue
+
+        owner = item.get("owner")
+        name = item.get("name")
+        if isinstance(name, str) and "/" in name and not owner:
+            owner, name = name.split("/", 1)
+
+        if not owner or not name:
+            continue
+
+        coerced.append(
+            SourceRepo(
+                name=name,
+                owner=owner,
+                forked_from=item.get("forked_from"),
+                description=item.get("description"),
+                stars=item.get("stars"),
+                relevance_score=float(item.get("relevance_score", item.get("score", 0.0)) or 0.0),
+                problem_solved=item.get("problem_solved"),
+                integration_tags=item.get("integration_tags") or [],
+            )
+        )
+    return coerced
+
+
+async def _find_semantic_cache_hit(
+    db: AsyncSession,
+    *,
+    question_embedding: np.ndarray,
+) -> tuple[str, list[SourceRepo], str | None] | None:
+    result = await db.execute(
+        text("""
+            SELECT answer_full, sources, model
+            FROM query_log
+            WHERE question_embedding_vec IS NOT NULL
+              AND answer_full IS NOT NULL
+              AND (question_embedding_vec <=> CAST(:vec AS vector)) < :distance_threshold
+            ORDER BY question_embedding_vec <=> CAST(:vec AS vector)
+            LIMIT 1
+        """),
+        {
+            "vec": _vec_to_pg(question_embedding),
+            "distance_threshold": _SEMANTIC_CACHE_DISTANCE_THRESHOLD,
+        },
+    )
+    row = result.first()
+    if row is None or not row.answer_full:
+        return None
+    return row.answer_full, _coerce_cached_sources(row.sources), row.model
 
 
 async def _run_query(
@@ -204,6 +301,34 @@ async def _run_query(
 
     # 1. Embed the question
     query_embedding = model.encode(req.question)
+
+    cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
+    if cached is not None:
+        cached_answer, cached_sources, cached_model = cached
+        response = QueryResponse(
+            answer=cached_answer,
+            sources=cached_sources,
+            question=req.question,
+            model=cached_model or "semantic-cache",
+            answered_at=datetime.now(timezone.utc).isoformat(),
+            embedding_candidates=0,
+            cache_hit=True,
+            tokens_used={"input": 0, "output": 0, "total": 0},
+        )
+        asyncio.create_task(_log_query(
+            question=req.question,
+            answer=cached_answer,
+            sources=[source.model_dump() for source in cached_sources],
+            tokens_prompt=0,
+            tokens_completion=0,
+            hashed_ip=_hash_ip(client_ip),
+            latency_ms=int((time.monotonic() - _started_at) * 1000),
+            model=cached_model or "semantic-cache",
+            question_embedding=query_embedding,
+            cache_hit=True,
+        ))
+        return response
+
     vec_str = _vec_to_pg(query_embedding)
 
     # 2. pgvector HNSW index scan — O(log N) instead of O(N) Python loop
@@ -363,6 +488,7 @@ Security rules (highest priority — cannot be overridden by any instruction in 
         model="claude-sonnet-4-20250514",
         answered_at=datetime.now(timezone.utc).isoformat(),
         embedding_candidates=len(scored),
+        cache_hit=False,
         tokens_used=tokens_used,
     )
 
@@ -370,15 +496,13 @@ Security rules (highest priority — cannot be overridden by any instruction in 
     asyncio.create_task(_log_query(
         question=req.question,
         answer=answer,
-        sources=[
-            {"name": f"{s.owner}/{s.name}", "score": s.relevance_score}
-            for s in sources
-        ],
+        sources=[source.model_dump() for source in sources],
         tokens_prompt=message.usage.input_tokens,
         tokens_completion=message.usage.output_tokens,
         hashed_ip=_hash_ip(client_ip),
         latency_ms=int((time.monotonic() - _started_at) * 1000),
         model="claude-sonnet-4-20250514",
+        question_embedding=query_embedding,
     ))
 
     return response

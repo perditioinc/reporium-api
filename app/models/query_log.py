@@ -27,6 +27,7 @@ class QueryLog(Base):
     # Question and answer
     question: Mapped[str] = mapped_column(Text, nullable=False)
     answer_truncated: Mapped[str | None] = mapped_column(Text)  # first 500 chars
+    answer_full: Mapped[str | None] = mapped_column(Text)
 
     # Sources returned [{name: "owner/repo", score: 0.88}]
     sources: Mapped[dict | None] = mapped_column(JSONB)
