@@ -77,6 +77,12 @@ class StatsResponse(BaseModel):
     top_tags: list[str]
     sync_states: dict[str, int]
     last_ingestion: IngestionLogOut | None = None
+    # Extended fields
+    taxonomy_dimension_counts: dict[str, int] = {}
+    has_tests_count: int = 0
+    has_ci_count: int = 0
+    quality_score_avg: float | None = None
+    enriched_repo_count: int = 0
 
 
 class TaxonomyGapItem(BaseModel):
