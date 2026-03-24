@@ -325,3 +325,111 @@ async def assign_taxonomy(
 
     await db.commit()
     return {"status": "ok", "assigned": assigned}
+
+
+@router.post(
+    "/admin/taxonomy/deduplicate",
+    response_model=dict,
+    dependencies=[Depends(verify_api_key), Depends(require_admin_key)],
+    summary="Deduplicate near-identical taxonomy values within each dimension",
+)
+async def deduplicate_taxonomy(
+    dry_run: bool = False,
+    similarity_threshold: float = 0.95,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Find taxonomy_values within the same dimension that are near-identical by
+    cosine similarity (>= similarity_threshold, default 0.95), then merge the
+    smaller (lower repo_count) into the larger.
+
+    Merging means:
+    1. Repoint all repo_taxonomy rows from the duplicate to the canonical value.
+    2. Update canonical value's repo_count to sum of both.
+    3. Delete the duplicate taxonomy_value.
+
+    Returns a list of merges performed (or that would be performed in dry_run).
+    """
+    # Find pairs of taxonomy values within same dimension with high similarity
+    # Only consider values that have embeddings
+    result = await db.execute(text(
+        """
+        SELECT a.id AS id_a, a.dimension, a.name AS name_a, a.repo_count AS count_a,
+               b.id AS id_b, b.name AS name_b, b.repo_count AS count_b,
+               1 - (a.embedding_vec <=> b.embedding_vec) AS similarity
+        FROM taxonomy_values a
+        JOIN taxonomy_values b
+          ON a.dimension = b.dimension
+          AND a.id < b.id
+          AND a.embedding_vec IS NOT NULL
+          AND b.embedding_vec IS NOT NULL
+          AND 1 - (a.embedding_vec <=> b.embedding_vec) >= :threshold
+        ORDER BY similarity DESC
+        """,
+    ), {"threshold": similarity_threshold})
+    pairs = result.fetchall()
+
+    if not pairs:
+        return {"merged": 0, "dry_run": dry_run, "pairs": []}
+
+    merges = []
+    already_merged: set[int] = set()
+
+    for pair in pairs:
+        id_a, id_b = pair.id_a, pair.id_b
+        if id_a in already_merged or id_b in already_merged:
+            continue
+
+        # Keep the one with higher repo_count as canonical
+        if pair.count_a >= pair.count_b:
+            canonical_id, dup_id = id_a, id_b
+            canonical_name, dup_name = pair.name_a, pair.name_b
+        else:
+            canonical_id, dup_id = id_b, id_a
+            canonical_name, dup_name = pair.name_b, pair.name_a
+
+        merge_info = {
+            "dimension": pair.dimension,
+            "canonical": canonical_name,
+            "duplicate": dup_name,
+            "similarity": round(float(pair.similarity), 4),
+        }
+        merges.append(merge_info)
+        already_merged.add(dup_id)
+
+        if not dry_run:
+            # Repoint repo_taxonomy rows from dup to canonical
+            await db.execute(text(
+                """
+                UPDATE repo_taxonomy
+                SET raw_value = :canonical_name, taxonomy_value_id = :canonical_id
+                WHERE taxonomy_value_id = :dup_id
+                  AND NOT EXISTS (
+                      SELECT 1 FROM repo_taxonomy rt2
+                      WHERE rt2.repo_id = repo_taxonomy.repo_id
+                        AND rt2.dimension = repo_taxonomy.dimension
+                        AND rt2.raw_value = :canonical_name
+                  )
+                """
+            ), {"canonical_name": canonical_name, "canonical_id": canonical_id, "dup_id": dup_id})
+
+            # Delete rows that would conflict (the dup is already in canonical's position)
+            await db.execute(text(
+                "DELETE FROM repo_taxonomy WHERE taxonomy_value_id = :dup_id"
+            ), {"dup_id": dup_id})
+
+            # Update canonical repo_count
+            new_count = max(pair.count_a, pair.count_b)
+            await db.execute(text(
+                "UPDATE taxonomy_values SET repo_count = :count WHERE id = :id"
+            ), {"count": new_count, "id": canonical_id})
+
+            # Delete duplicate taxonomy_value
+            await db.execute(text(
+                "DELETE FROM taxonomy_values WHERE id = :id"
+            ), {"id": dup_id})
+
+    if not dry_run:
+        await db.commit()
+
+    return {"merged": len(merges), "dry_run": dry_run, "pairs": merges}

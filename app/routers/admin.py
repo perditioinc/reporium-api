@@ -8,7 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import require_admin_key, verify_api_key
 from app.cache import cache
 from app.database import get_db
-from app.models.repo import Repo, RepoEmbedding, RepoTag
+from app.models.repo import IngestRun, Repo, RepoEmbedding, RepoTag
 from app.routers.library_full import invalidate_library_cache
 
 logger = logging.getLogger(__name__)
@@ -376,3 +376,90 @@ async def bootstrap_taxonomy(
     processed = len(untagged_repos)
     await db.commit()
     return {"processed": processed, "assigned": assigned, "errors": errors}
+
+
+# ---------------------------------------------------------------------------
+# Run history
+# ---------------------------------------------------------------------------
+
+@router.get(
+    "/admin/runs",
+    summary="List recent ingestion runs",
+    dependencies=[Depends(require_admin_key)],
+)
+async def list_runs(
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the most recent *limit* ingestion run records, newest first."""
+    result = await db.execute(
+        select(IngestRun).order_by(IngestRun.started_at.desc()).limit(limit)
+    )
+    runs = result.scalars().all()
+    return [
+        {
+            "id": r.id,
+            "run_mode": r.run_mode,
+            "status": r.status,
+            "repos_upserted": r.repos_upserted,
+            "repos_processed": r.repos_processed,
+            "errors": r.errors or [],
+            "started_at": r.started_at.isoformat() if r.started_at else None,
+            "finished_at": r.finished_at.isoformat() if r.finished_at else None,
+            "duration_seconds": (
+                (r.finished_at - r.started_at).total_seconds()
+                if r.finished_at and r.started_at
+                else None
+            ),
+        }
+        for r in runs
+    ]
+
+
+@router.post(
+    "/admin/runs",
+    summary="Record a completed ingestion run",
+    dependencies=[Depends(require_admin_key)],
+    status_code=201,
+)
+async def record_run(
+    payload: dict,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Called by the ingestion pipeline after each run to persist run metadata.
+
+    Expected payload::
+
+        {
+            "run_mode": "quick",
+            "status": "success",
+            "repos_upserted": 42,
+            "repos_processed": 150,
+            "errors": [],
+            "started_at": "2026-03-24T05:00:00Z",
+            "finished_at": "2026-03-24T05:03:12Z"
+        }
+    """
+    from datetime import datetime, timezone
+
+    def _parse_dt(val):
+        if not val:
+            return None
+        if isinstance(val, datetime):
+            return val
+        return datetime.fromisoformat(str(val).replace("Z", "+00:00"))
+
+    run = IngestRun(
+        run_mode=payload.get("run_mode", "unknown"),
+        status=payload.get("status", "unknown"),
+        repos_upserted=int(payload.get("repos_upserted", 0)),
+        repos_processed=int(payload.get("repos_processed", 0)),
+        errors=payload.get("errors") or None,
+        started_at=_parse_dt(payload.get("started_at")),
+        finished_at=_parse_dt(payload.get("finished_at")),
+    )
+    db.add(run)
+    await db.commit()
+    await db.refresh(run)
+    return {"id": run.id, "status": "recorded"}
