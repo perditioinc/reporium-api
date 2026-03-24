@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import verify_api_key
+from app.auth import require_ingest_key, verify_api_key
 from app.database import get_db
 from app.models.repo import Repo, RepoAIDevSkill, RepoCategory
 
@@ -85,7 +85,8 @@ async def audit_status(db: AsyncSession = Depends(get_db)) -> dict:
 async def events_ingest(
     payload: dict,
     _api_key: str = Depends(verify_api_key),
+    _ingest_key: None = Depends(require_ingest_key),
 ) -> dict:
-    """Receive Pub/Sub push events. Requires Authorization: Bearer {REPORIUM_API_KEY} header."""
+    """Receive placeholder event pushes. Requires API and ingest keys in the current implementation."""
     # For now, acknowledge receipt without processing
     return {"status": "accepted", "message": "Event received (processing not yet implemented)"}
