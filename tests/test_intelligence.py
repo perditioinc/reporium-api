@@ -15,12 +15,19 @@ import pytest
 from httpx import AsyncClient
 
 from app.routers.intelligence import (
+    DuplicateClusterSignal,
+    PortfolioInsightsResponse,
     QueryRequest,
+    StaleRepoSignal,
+    TaxonomyGapSignal,
+    VelocityLeaderSignal,
     _coerce_cached_sources,
     _estimate_cost,
     _find_semantic_cache_hit,
     _hash_ip,
     _log_query,
+    _portfolio_insights,
+    _portfolio_summary,
     _run_query,
 )
 
@@ -331,3 +338,62 @@ async def test_run_query_returns_semantic_cache_hit_without_calling_anthropic():
     assert response.sources[0].owner == "perditioinc"
     anthropic_client.assert_not_called()
     mock_log_query.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_portfolio_insights_uses_cached_payload():
+    cached_payload = PortfolioInsightsResponse(
+        generated_at="2026-03-24T00:00:00+00:00",
+        taxonomy_gaps=[],
+        stale_repos=[],
+        velocity_leaders=[],
+        near_duplicate_clusters=[],
+        summary=[],
+    ).model_dump()
+    db = AsyncMock()
+
+    with patch("app.routers.intelligence.cache.get", new=AsyncMock(return_value=cached_payload)), \
+         patch("app.routers.intelligence.cache.set", new=AsyncMock()) as cache_set:
+        response = await _portfolio_insights(db)
+
+    assert response.generated_at == "2026-03-24T00:00:00+00:00"
+    cache_set.assert_not_awaited()
+    db.execute.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_portfolio_insights_builds_and_caches_response():
+    db = AsyncMock()
+    taxonomy_gaps = [TaxonomyGapSignal(dimension="ai_trend", value="Agent Memory", repo_count=2, trending_score=8.4)]
+    stale_repos = [StaleRepoSignal(repo_name="stale-repo", owner="perditioinc", github_url="https://github.com/perditioinc/stale-repo", stale_days=245)]
+    velocity_leaders = [VelocityLeaderSignal(repo_name="fast-repo", owner="perditioinc", github_url="https://github.com/perditioinc/fast-repo", commits_last_7_days=14, commits_last_30_days=41, activity_score=92)]
+    duplicate_clusters = [DuplicateClusterSignal(similarity=0.9442, repos=["perditioinc/a", "perditioinc/b"])]
+
+    with patch("app.routers.intelligence.cache.get", new=AsyncMock(return_value=None)), \
+         patch("app.routers.intelligence.cache.set", new=AsyncMock()) as cache_set, \
+         patch("app.routers.intelligence._taxonomy_gap_signals", new=AsyncMock(return_value=taxonomy_gaps)), \
+         patch("app.routers.intelligence._stale_repo_signals", new=AsyncMock(return_value=stale_repos)), \
+         patch("app.routers.intelligence._velocity_leader_signals", new=AsyncMock(return_value=velocity_leaders)), \
+         patch("app.routers.intelligence._near_duplicate_signals", new=AsyncMock(return_value=duplicate_clusters)):
+        response = await _portfolio_insights(db)
+
+    assert response.taxonomy_gaps[0].value == "Agent Memory"
+    assert response.stale_repos[0].repo_name == "stale-repo"
+    assert response.velocity_leaders[0].repo_name == "fast-repo"
+    assert response.near_duplicate_clusters[0].repos == ["perditioinc/a", "perditioinc/b"]
+    assert len(response.summary) == 4
+    cache_set.assert_awaited_once()
+
+
+def test_portfolio_summary_formats_signal_highlights():
+    summary = _portfolio_summary(
+        [TaxonomyGapSignal(dimension="use_case", value="Synthetic QA", repo_count=3, trending_score=6.2)],
+        [StaleRepoSignal(repo_name="old-repo", owner="perditioinc", github_url="https://github.com/perditioinc/old-repo", stale_days=210)],
+        [VelocityLeaderSignal(repo_name="hot-repo", owner="perditioinc", github_url="https://github.com/perditioinc/hot-repo", commits_last_7_days=9, commits_last_30_days=28, activity_score=88)],
+        [DuplicateClusterSignal(similarity=0.931, repos=["perditioinc/one", "perditioinc/two"])],
+    )
+
+    assert "Synthetic QA" in summary[0]
+    assert "old-repo" in summary[1]
+    assert "hot-repo" in summary[2]
+    assert "perditioinc/one" in summary[3]
