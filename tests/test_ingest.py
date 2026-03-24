@@ -1,5 +1,6 @@
 import pytest
 from httpx import AsyncClient
+from unittest.mock import AsyncMock, patch
 
 from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
 
@@ -116,3 +117,65 @@ async def test_ingest_log(client: AsyncClient):
     data = response.json()
     assert data["mode"] == "quick"
     assert data["status"] == "running"
+
+
+@pytest.mark.asyncio
+async def test_repo_ingested_event_requires_ingest_key_when_configured(client: AsyncClient, monkeypatch):
+    monkeypatch.setenv("INGEST_API_KEY", "secret-ingest")
+
+    response = await client.post("/ingest/events/repo-ingested", json={"source": "test"})
+
+    assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_repo_ingested_event_accepts_x_ingest_key_and_runs_refresh(client: AsyncClient, monkeypatch):
+    monkeypatch.setenv("INGEST_API_KEY", "secret-ingest")
+
+    with patch("app.routers.ingest.rebuild_taxonomy", new=AsyncMock(return_value={"status": "ok", "upserted": 3})), \
+         patch("app.routers.ingest.embed_taxonomy", new=AsyncMock(return_value={"status": "ok", "embedded": 2})), \
+         patch("app.routers.ingest.assign_taxonomy", new=AsyncMock(return_value={"status": "ok", "assigned": 11})), \
+         patch("app.routers.ingest._rebuild_gap_analysis", new=AsyncMock(return_value={"gap_rows": 8})), \
+         patch("app.routers.ingest._refresh_portfolio_intelligence", new=AsyncMock(return_value={"taxonomy_gap_count": 4, "stale_repo_count": 2, "velocity_leader_count": 3, "near_duplicate_cluster_count": 1})), \
+         patch("app.routers.ingest.cache.invalidate", new=AsyncMock()) as invalidate_cache, \
+         patch("app.routers.ingest.invalidate_library_cache") as invalidate_memory:
+        response = await client.post(
+            "/ingest/events/repo-ingested",
+            json={"source": "pubsub-test"},
+            headers={"X-Ingest-Key": "secret-ingest"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["received"]["source"] == "pubsub-test"
+    assert data["taxonomy_rebuild"]["upserted"] == 3
+    assert data["taxonomy_embed"]["embedded"] == 2
+    assert data["taxonomy_assign"]["assigned"] == 11
+    assert data["gap_rebuild"]["gap_rows"] == 8
+    assert data["portfolio_insights"]["taxonomy_gap_count"] == 4
+    assert invalidate_cache.await_count == 3
+    invalidate_memory.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_repo_ingested_event_decodes_pubsub_envelope(client: AsyncClient):
+    import base64
+    import json
+
+    encoded = base64.b64encode(json.dumps({"batch": "nightly", "repos": 25}).encode("utf-8")).decode("utf-8")
+
+    with patch("app.routers.ingest.rebuild_taxonomy", new=AsyncMock(return_value={"status": "ok", "upserted": 0})), \
+         patch("app.routers.ingest.embed_taxonomy", new=AsyncMock(return_value={"status": "ok", "embedded": 0})), \
+         patch("app.routers.ingest.assign_taxonomy", new=AsyncMock(return_value={"status": "ok", "assigned": 0})), \
+         patch("app.routers.ingest._rebuild_gap_analysis", new=AsyncMock(return_value={"gap_rows": 0})), \
+         patch("app.routers.ingest._refresh_portfolio_intelligence", new=AsyncMock(return_value={"taxonomy_gap_count": 0, "stale_repo_count": 0, "velocity_leader_count": 0, "near_duplicate_cluster_count": 0})), \
+         patch("app.routers.ingest.cache.invalidate", new=AsyncMock()), \
+         patch("app.routers.ingest.invalidate_library_cache"):
+        response = await client.post(
+            "/ingest/events/repo-ingested",
+            json={"message": {"data": encoded}},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["received"] == {"batch": "nightly", "repos": 25}
