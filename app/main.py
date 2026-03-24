@@ -40,13 +40,17 @@ app = FastAPI(
         "## Rate Limits\n"
         "| Endpoint | Limit |\n"
         "|----------|-------|\n"
-        "| `GET /repos`, `/stats`, `/library` | 100 requests/minute |\n"
-        "| `GET /search` | 30 requests/minute |\n"
-        "| `POST /ingest/*` | 10 requests/minute |\n"
+        "| `GET /repos`, `/stats`, `/library`, `/library/full` | 200/hour, 30/minute |\n"
+        "| `GET /search` | 200/hour, 30/minute |\n"
+        "| `POST /intelligence/ask`, `/intelligence/query` | 200/hour, 30/minute |\n"
+        "| `POST /ingest/*` | 200/hour, 30/minute |\n"
         "| `GET /health` | No limit |\n\n"
-        "Rate limit headers are included in every response."
+        "Rate limit headers are included in every response.\n\n"
+        "## Repo Lookups\n"
+        "All repo endpoints use `owner/name` (e.g. `perditioinc/reporium-api`). "
+        "Bare-name lookups are not supported."
     ),
-    version="1.0.0",
+    version="1.1.0",
     docs_url=None,      # disable default — we serve Scalar
     redoc_url=None,     # disable default — Scalar replaces both
     lifespan=lifespan,
