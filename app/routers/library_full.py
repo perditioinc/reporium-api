@@ -139,8 +139,10 @@ _AI_DEV_SKILLS_ORDERED: list = [
     "Recommendation Systems",
 ]
 
-# Mapping from skill area name → lifecycle group name (used in API responses).
-LIFECYCLE_GROUPS: dict = {
+# Lifecycle group lookup is now DB-driven (skill_areas table).
+# _get_lifecycle_groups(db) queries the DB and caches for 5 minutes.
+# This dict is a compile-time fallback used only when the DB is unavailable.
+_LIFECYCLE_GROUPS_FALLBACK: dict = {
     "Foundation Model Architecture": "Foundation & Training",
     "Fine-tuning & Alignment": "Foundation & Training",
     "Data Engineering": "Foundation & Training",
@@ -155,11 +157,11 @@ LIFECYCLE_GROUPS: dict = {
     "Structured Output": "LLM Application Layer",
     "Prompt Engineering": "LLM Application Layer",
     "Knowledge Graphs": "LLM Application Layer",
-    "Evaluation": "Eval/Safety/Ops",
-    "Security & Guardrails": "Eval/Safety/Ops",
-    "Observability": "Eval/Safety/Ops",
-    "MLOps": "Eval/Safety/Ops",
-    "AI Governance": "Eval/Safety/Ops",
+    "Evaluation": "Eval / Safety / Ops",
+    "Security & Guardrails": "Eval / Safety / Ops",
+    "Observability": "Eval / Safety / Ops",
+    "MLOps": "Eval / Safety / Ops",
+    "AI Governance": "Eval / Safety / Ops",
     "Computer Vision": "Modality-Specific",
     "Speech & Audio": "Modality-Specific",
     "Generative Media": "Modality-Specific",
@@ -170,6 +172,34 @@ LIFECYCLE_GROUPS: dict = {
     "AI for Science": "Applied AI",
     "Recommendation Systems": "Applied AI",
 }
+
+_lifecycle_groups_cache: dict = {}
+_LIFECYCLE_GROUPS_TTL = 300  # 5 minutes
+
+
+async def _get_lifecycle_groups(db: AsyncSession) -> dict:
+    """Return {skill_area_name: lifecycle_group} from the skill_areas table.
+
+    Results are cached in memory for 5 minutes. Falls back to the compile-time
+    dict if the table is unavailable (e.g. migration not yet applied).
+    """
+    now = time.time()
+    cached = _lifecycle_groups_cache.get("data")
+    if cached and _lifecycle_groups_cache.get("expires_at", 0) > now:
+        return cached
+
+    try:
+        result = await db.execute(text("SELECT name, lifecycle_group FROM skill_areas"))
+        rows = result.fetchall()
+        if rows:
+            mapping = {row.name: row.lifecycle_group for row in rows}
+            _lifecycle_groups_cache["data"] = mapping
+            _lifecycle_groups_cache["expires_at"] = now + _LIFECYCLE_GROUPS_TTL
+            return mapping
+    except Exception:
+        logger.warning("_get_lifecycle_groups: skill_areas table unavailable, using fallback", exc_info=True)
+
+    return _LIFECYCLE_GROUPS_FALLBACK
 
 # Keep a set for O(1) membership checks in _build_ai_dev_skill_stats
 _AI_DEV_SKILL_SET: set = set(_AI_DEV_SKILLS_ORDERED)
@@ -381,7 +411,8 @@ def _iso(val) -> str:
 
 def _build_enriched_repo(repo: dict, languages: list, categories: list,
                          ai_skills: list, tags: list, pm_skills: list,
-                         builders: list = None, industries: list = None) -> dict:
+                         builders: list = None, industries: list = None,
+                         lifecycle_groups: dict = None) -> dict:
     """Transform a DB repo row + junction data into the frontend EnrichedRepo shape."""
     forked_from = repo.get("forked_from")
     owner = repo.get("owner", "perditioinc")
@@ -488,7 +519,7 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         },
         "latestRelease": None,
         "aiDevSkills": [
-            {"skill": s["skill"], "lifecycleGroup": LIFECYCLE_GROUPS.get(s["skill"], "")}
+            {"skill": s["skill"], "lifecycleGroup": (lifecycle_groups or _LIFECYCLE_GROUPS_FALLBACK).get(s["skill"], "")}
             for s in ai_skills
         ],
         "pmSkills": [s["skill"] for s in pm_skills],
@@ -680,7 +711,7 @@ def _build_skill_stats(repos: list, skill_field: str) -> list:
     return stats
 
 
-def _build_ai_dev_skill_stats(repos: list) -> list:
+def _build_ai_dev_skill_stats(repos: list, lifecycle_groups: dict = None) -> list:
     """Build AI Dev Skill stats for the 28-skill taxonomy.
 
     First checks aiDevSkills for direct matches against the canonical 28 skill names.
@@ -727,7 +758,7 @@ def _build_ai_dev_skill_stats(repos: list) -> list:
         top = sorted(skill_top_repos.get(skill, []), reverse=True)[:5]
         stats.append({
             "skill": skill,
-            "lifecycleGroup": LIFECYCLE_GROUPS.get(skill, ""),
+            "lifecycleGroup": (lifecycle_groups or _LIFECYCLE_GROUPS_FALLBACK).get(skill, ""),
             "repoCount": count,
             "coverage": coverage,
             "topRepos": [name for _, name in top],
@@ -868,6 +899,8 @@ async def _fetch_page_repos(
     for r in industry_rows:
         all_industries[str(r.repo_id)].append({"industry": r.industry})
 
+    lifecycle_groups = await _get_lifecycle_groups(db)
+
     enriched = []
     for repo in repo_dicts:
         rid = str(repo["id"])
@@ -880,6 +913,7 @@ async def _fetch_page_repos(
             pm_skills=all_pm_skills.get(rid, []),
             builders=all_builders.get(rid, []),
             industries=all_industries.get(rid, []),
+            lifecycle_groups=lifecycle_groups,
         )))
 
     return enriched, total
@@ -912,7 +946,7 @@ async def _fetch_aggregates(db: AsyncSession) -> dict:
         "tagMetrics": _build_tag_metrics(all_repos),
         "categories": _build_categories(all_repos),
         "builderStats": _build_builder_stats(all_repos),
-        "aiDevSkillStats": _build_ai_dev_skill_stats(all_repos),
+        "aiDevSkillStats": _build_ai_dev_skill_stats(all_repos, lifecycle_groups=await _get_lifecycle_groups(db)),
         "pmSkillStats": _build_skill_stats(all_repos, "pmSkills"),
     }
     logger.info(f"Aggregates built in {time.monotonic() - t0:.1f}s across {len(all_repos)} repos")
