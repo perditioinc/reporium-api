@@ -54,9 +54,10 @@ async def lifespan(app: FastAPI):
     await engine.dispose()
 
 
+_rate_limits = [] if os.environ.get("RATELIMIT_ENABLED", "1") == "0" else ["200 per hour", "30 per minute"]
 limiter = Limiter(
     key_func=get_remote_address,
-    default_limits=["200 per hour", "30 per minute"],
+    default_limits=_rate_limits,
     storage_uri="memory://",
 )
 

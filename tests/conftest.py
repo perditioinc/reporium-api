@@ -11,6 +11,7 @@ os.environ["DATABASE_URL"] = "postgresql+asyncpg://postgres:postgres@localhost:5
 os.environ["INGESTION_API_KEY"] = "test-api-key"
 os.environ["GH_USERNAME"] = "testuser"
 os.environ["REDIS_URL"] = ""  # disable Redis in tests
+os.environ["RATELIMIT_ENABLED"] = "0"  # disable rate limiting in tests
 
 import app.database as db_module
 from app.database import Base, get_db
@@ -40,6 +41,10 @@ async def _setup_db(event_loop):
     async with db_module.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     yield
+    # Dispose engine first to drain connection pool before loop teardown
+    await db_module.engine.dispose()
+    # Recreate for drop_all, then dispose again
+    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, pool_pre_ping=True)
     async with db_module.engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     await db_module.engine.dispose()
