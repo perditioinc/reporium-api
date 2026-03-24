@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -35,7 +36,7 @@ limiter = Limiter(
 app = FastAPI(
     title="Reporium API",
     description=(
-        "The central API for the Reporium platform — tracks 826+ AI development tools on GitHub.\n\n"
+        "The central API for the Reporium platform — tracks 1,400+ AI development tools on GitHub.\n\n"
         "## Rate Limits\n"
         "| Endpoint | Limit |\n"
         "|----------|-------|\n"
@@ -54,6 +55,7 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=1000)  # compress responses > 1KB
 
 
 @app.get("/docs", include_in_schema=False)
