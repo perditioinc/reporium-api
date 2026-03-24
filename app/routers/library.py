@@ -43,6 +43,8 @@ def _repo_to_summary(repo: Repo) -> RepoSummary:
         commits_last_90_days=repo.commits_last_90_days,
         readme_summary=repo.readme_summary,
         activity_score=repo.activity_score,
+        quality_signals=repo.quality_signals,
+        problem_solved=repo.problem_solved,
         ingested_at=repo.ingested_at,
         updated_at=repo.updated_at,
         github_updated_at=repo.github_updated_at,
