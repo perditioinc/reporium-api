@@ -1,5 +1,6 @@
 """Platform-level endpoints consumed by sibling repos (reporium-metrics, reporium-roadmap)."""
 
+import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
@@ -46,8 +47,8 @@ async def metrics_latest(db: AsyncSession = Depends(get_db)) -> dict:
         "repos_with_categories": repos_with_categories,
         "languages": lang_count,
         "last_sync": last_updated.isoformat() if last_updated else None,
-        "api_version": "1.0.0",
-        "build_number": 1,
+        "api_version": os.getenv("APP_VERSION", os.getenv("GITHUB_SHA", "unknown")[:7]),
+        "build_number": os.getenv("BUILD_NUMBER", "0"),
     }
 
 

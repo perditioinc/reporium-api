@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import CACHE_TTL_GAPS, CACHE_TTL_STATS, CACHE_TTL_TRENDS, cache
 from app.database import get_db
-from app.models.repo import Repo, RepoCategory
+from app.models.repo import Repo, RepoCategory, RepoTag
 from app.models.trend import GapAnalysis, IngestionLog, TrendSnapshot
 from app.schemas.trend import GapAnalysisOut, IngestionLogOut, StatsResponse, TrendSnapshotOut
 
@@ -109,13 +109,26 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
         else None
     )
 
+    # Top tags by repo count — excludes system tags (Active, Forked, Built by Me)
+    _SYSTEM_TAGS = {"Active", "Forked", "Built by Me", "Inactive", "Archived", "Popular"}
+    tag_rows = (
+        await db.execute(
+            select(RepoTag.tag, func.count().label("cnt"))
+            .where(RepoTag.tag.not_in(_SYSTEM_TAGS))
+            .group_by(RepoTag.tag)
+            .order_by(func.count().desc())
+            .limit(20)
+        )
+    ).all()
+    top_tags = [row.tag for row in tag_rows]
+
     response = StatsResponse(
         total_repos=total,
         total_forks=total_forks,
         total_non_forks=total - total_forks,
         languages=languages,
         categories=categories,
-        top_tags=list(languages.keys())[:10],
+        top_tags=top_tags,
         sync_states=sync_states,
         last_ingestion=last_ingestion,
     )
