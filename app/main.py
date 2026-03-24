@@ -15,7 +15,7 @@ from slowapi.util import get_remote_address
 
 from app.cache import cache
 from app.database import check_db_connection, engine
-from app.routers import admin, ingest, intelligence, library, library_full, platform, repos, search, trends, wiki
+from app.routers import admin, ingest, intelligence, library, library_full, platform, repos, search, taxonomy, trends, wiki
 
 
 class _JsonFormatter(logging.Formatter):
@@ -224,6 +224,7 @@ app.include_router(platform.router)
 app.include_router(ingest.router)
 app.include_router(intelligence.router)
 app.include_router(library_full.router)
+app.include_router(taxonomy.router, prefix="/taxonomy")
 app.include_router(admin.router)
 
 
