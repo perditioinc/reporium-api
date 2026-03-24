@@ -5,7 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import require_admin_key, verify_api_key
 from app.cache import cache
 from app.database import get_db
-from app.models.repo import RepoTag
+from app.models.repo import Repo, RepoTag
 from app.routers.library_full import invalidate_library_cache
 
 router = APIRouter()
@@ -121,3 +121,63 @@ async def prune_tags(
     _admin_key: None = Depends(require_admin_key),
 ):
     return await _prune_noise_tags(db, dry_run=dry_run)
+
+
+@router.post("/admin/quality/compute")
+async def compute_quality_signals(
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Compute quality_signals for all repos from existing data (no GitHub API calls)."""
+    BATCH_SIZE = 100
+    offset = 0
+    computed = 0
+    skipped = 0
+
+    while True:
+        stmt = select(Repo).offset(offset).limit(BATCH_SIZE)
+        result = await db.execute(stmt)
+        repos = result.scalars().all()
+
+        if not repos:
+            break
+
+        for repo in repos:
+            try:
+                commit_velocity_30d = repo.commits_last_30_days / 30.0
+                commit_velocity_7d = repo.commits_last_7_days / 7.0
+                is_active = repo.commits_last_30_days > 0
+                has_open_issues = repo.open_issues_count > 0
+
+                activity = repo.activity_score  # 0-100
+
+                weekly_score = (min(repo.commits_last_7_days, 10) / 10.0) * 100
+                if repo.open_issues_count < 10:
+                    issues_score = 100
+                else:
+                    issues_score = max(0, 100 - repo.open_issues_count * 2)
+
+                overall_raw = (
+                    activity * 0.5
+                    + weekly_score * 0.3
+                    + issues_score * 0.2
+                )
+                overall_score = max(0, min(100, round(overall_raw)))
+
+                repo.quality_signals = {
+                    "commit_velocity_30d": commit_velocity_30d,
+                    "commit_velocity_7d": commit_velocity_7d,
+                    "is_active": is_active,
+                    "has_open_issues": has_open_issues,
+                    "activity_score": activity,
+                    "overall_score": overall_score,
+                }
+                computed += 1
+            except Exception:
+                skipped += 1
+
+        await db.commit()
+        offset += BATCH_SIZE
+
+    return {"computed": computed, "skipped": skipped}

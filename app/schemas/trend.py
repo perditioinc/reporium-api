@@ -77,3 +77,11 @@ class StatsResponse(BaseModel):
     top_tags: list[str]
     sync_states: dict[str, int]
     last_ingestion: IngestionLogOut | None = None
+
+
+class TaxonomyGapItem(BaseModel):
+    dimension: str
+    name: str
+    repo_count: int
+    gap_score: float   # 0.0 (well covered) → 1.0 (completely absent)
+    severity: str      # "low" | "medium" | "high"
