@@ -172,6 +172,8 @@ class RepoIngestItem(BaseModel):
     languages: list[LanguageIngest] = []
     commits: list[CommitIngest] = []
 
+    license_spdx: str | None = None
+
     # Dynamic taxonomy dimensions
     skill_areas: list[str] = []
     industries: list[str] = []
@@ -179,6 +181,7 @@ class RepoIngestItem(BaseModel):
     modalities: list[str] = []
     ai_trends: list[str] = []
     deployment_context: list[str] = []
+    dependencies: list[str] = []
 
 
 class RepoEnrichItem(BaseModel):
