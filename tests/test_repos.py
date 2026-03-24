@@ -49,6 +49,18 @@ async def test_get_repo_detail(client: AsyncClient):
     assert data["name"] == "test-repo"
     assert data["owner"] == "testuser"
     assert "commits" in data
+    assert data["license_spdx"] == "MIT"
+
+
+@pytest.mark.asyncio
+async def test_filter_by_license(client: AsyncClient):
+    await client.post("/ingest/repos", json=[TEST_REPO_FIXTURE], headers=AUTH_HEADERS)
+
+    response = await client.get("/repos?license=MIT")
+    assert response.status_code == 200
+    repos = response.json()["repos"]
+    assert len(repos) > 0
+    assert all(r["license_spdx"] == "MIT" for r in repos)
 
 
 @pytest.mark.asyncio
