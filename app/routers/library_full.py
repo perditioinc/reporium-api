@@ -37,6 +37,11 @@ CATEGORY_MAP = {
     "Other": "Dev Tools & Automation",
     "Data Processing": "MLOps & Infrastructure",
     "Embeddings": "RAG & Retrieval",
+    "Audio": "Industry: Audio & Music",
+    "Fine Tuning": "Model Training",
+    "Deployment": "MLOps & Infrastructure",
+    "Evaluation": "Evals & Benchmarking",
+    "Datasets": "Datasets",
 }
 
 
