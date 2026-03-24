@@ -1,6 +1,7 @@
 import logging
 import os
 
+from pydantic import Field
 from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
@@ -70,6 +71,8 @@ class Settings(BaseSettings):
 
     # GCP
     gcp_project: str = "perditio-platform"
+    pubsub_audience: str = Field('', env='PUBSUB_AUDIENCE')
+    gcp_project_id: str = Field('perditio-platform', env='GCP_PROJECT_ID')
 
     # Mode
     environment: str = "development"  # development, production

@@ -1,3 +1,5 @@
+import base64
+import json
 import logging
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -267,3 +269,110 @@ async def ingest_log(
     await db.commit()
     await db.refresh(log)
     return IngestionLogOut.model_validate(log, from_attributes=True)
+
+
+@router.post("/events/repo-ingested", response_model=dict)
+async def pubsub_repo_ingested(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    GCP Pub/Sub push subscription handler.
+    Called automatically after each ingestion run completes.
+    Triggers: taxonomy embed → assign → invalidate portfolio insights cache.
+
+    Expected body (GCP push format):
+        {"message": {"data": "<base64-encoded JSON>", "messageId": "..."}, "subscription": "..."}
+
+    Protected by X-Ingest-Key (same as other ingest endpoints via router dependency).
+    """
+    try:
+        body = await request.json()
+        message = body.get("message", {})
+        data_b64 = message.get("data", "")
+        if data_b64:
+            payload = json.loads(base64.b64decode(data_b64).decode("utf-8"))
+        else:
+            payload = {}
+    except Exception as exc:
+        logger.warning("pubsub_repo_ingested: failed to parse body: %s", exc)
+        payload = {}
+
+    event = payload.get("event", "unknown")
+    upserted = payload.get("upserted", 0)
+    run_mode = payload.get("run_mode", "unknown")
+    logger.info("pubsub_repo_ingested: event=%s run_mode=%s upserted=%d", event, run_mode, upserted)
+
+    if upserted == 0:
+        return {"status": "skipped", "reason": "no repos upserted"}
+
+    # Trigger taxonomy embedding for any new raw_values that lack an embedding
+    try:
+        from sqlalchemy import text as _text
+        from app.embeddings import get_embedding_model
+
+        model = get_embedding_model()
+
+        # Find taxonomy_values without embeddings
+        result = await db.execute(
+            _text(
+                "SELECT id, name, description FROM taxonomy_values "
+                "WHERE embedding_vec IS NULL LIMIT 500"
+            )
+        )
+        rows = result.fetchall()
+        if rows:
+            for row in rows:
+                text_to_embed = f"{row.name}. {row.description or ''}"
+                vec = model.encode([text_to_embed])[0].tolist()
+                await db.execute(
+                    _text(
+                        "UPDATE taxonomy_values SET embedding_vec = CAST(:vec AS vector) "
+                        "WHERE id = :id"
+                    ),
+                    {"vec": str(vec), "id": row.id},
+                )
+            await db.commit()
+            logger.info("pubsub_repo_ingested: embedded %d taxonomy values", len(rows))
+    except Exception as exc:
+        logger.warning("pubsub_repo_ingested: taxonomy embed step failed: %s", exc)
+
+    # Trigger cosine similarity taxonomy assignment for repos missing assignments
+    try:
+        from sqlalchemy import text as _text
+
+        threshold = 0.65
+        await db.execute(
+            _text("""
+                INSERT INTO repo_taxonomy (repo_id, dimension, raw_value, taxonomy_value_id, similarity_score, assigned_by)
+                SELECT
+                    rt.repo_id,
+                    rt.dimension,
+                    rt.raw_value,
+                    tv.id AS taxonomy_value_id,
+                    1 - (tv.embedding_vec <=> re.embedding_vec) AS similarity_score,
+                    'pubsub_auto'
+                FROM repo_taxonomy rt
+                JOIN repo_embeddings re ON re.repo_id = rt.repo_id
+                JOIN taxonomy_values tv ON tv.dimension = rt.dimension
+                    AND 1 - (tv.embedding_vec <=> re.embedding_vec) >= :threshold
+                WHERE rt.taxonomy_value_id IS NULL
+                  AND tv.embedding_vec IS NOT NULL
+                  AND re.embedding_vec IS NOT NULL
+                ON CONFLICT (repo_id, dimension, raw_value) DO UPDATE
+                    SET taxonomy_value_id = EXCLUDED.taxonomy_value_id,
+                        similarity_score = EXCLUDED.similarity_score,
+                        assigned_by = EXCLUDED.assigned_by
+            """),
+            {"threshold": threshold},
+        )
+        await db.commit()
+        logger.info("pubsub_repo_ingested: taxonomy assignment complete")
+    except Exception as exc:
+        logger.warning("pubsub_repo_ingested: taxonomy assign step failed: %s", exc)
+
+    # Invalidate portfolio intelligence cache
+    await cache.invalidate("intelligence:portfolio*")
+    await cache.invalidate("gaps:latest")
+
+    return {"status": "ok", "event": event, "run_mode": run_mode, "upserted": upserted}
