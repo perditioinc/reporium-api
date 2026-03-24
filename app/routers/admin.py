@@ -1,3 +1,6 @@
+import json
+import logging
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -5,8 +8,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import require_admin_key, verify_api_key
 from app.cache import cache
 from app.database import get_db
-from app.models.repo import Repo, RepoTag
+from app.models.repo import Repo, RepoEmbedding, RepoTag
 from app.routers.library_full import invalidate_library_cache
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -181,3 +186,84 @@ async def compute_quality_signals(
         offset += BATCH_SIZE
 
     return {"computed": computed, "skipped": skipped}
+
+
+@router.post("/admin/embeddings/backfill")
+async def backfill_embeddings(
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """
+    Generate embeddings for all repos that have no row in repo_embeddings.
+    Uses the sentence-transformers model (all-MiniLM-L6-v2) from app.embeddings.
+    Returns the count of embeddings inserted and any per-repo errors.
+    """
+    from app.embeddings import get_embedding_model
+
+    # Find repos with no embedding (LEFT JOIN → NULL on repo_embeddings side)
+    result = await db.execute(text(
+        """
+        SELECT r.id, r.name, r.description, r.readme_summary,
+               r.primary_language
+        FROM repos r
+        LEFT JOIN repo_embeddings e ON e.repo_id = r.id
+        WHERE e.repo_id IS NULL
+        ORDER BY r.updated_at DESC
+        """
+    ))
+    rows = result.fetchall()
+
+    if not rows:
+        return {"backfilled": 0, "errors": []}
+
+    # Fetch tags for these repos so we can build embed text
+    repo_ids = [str(row.id) for row in rows]
+    tags_result = await db.execute(text(
+        "SELECT repo_id::text, tag FROM repo_tags WHERE repo_id::text = ANY(:ids)"
+    ), {"ids": repo_ids})
+    tags_by_repo: dict[str, list[str]] = {}
+    for t_row in tags_result.fetchall():
+        tags_by_repo.setdefault(t_row.repo_id, []).append(t_row.tag)
+
+    # Build embed texts
+    embed_texts = []
+    for row in rows:
+        parts = [row.name or ""]
+        if row.description:
+            parts.append(row.description)
+        if row.readme_summary:
+            parts.append(row.readme_summary)
+        tags = tags_by_repo.get(str(row.id), [])
+        if tags:
+            parts.append("tags: " + ", ".join(tags))
+        if row.primary_language:
+            parts.append("language: " + row.primary_language)
+        embed_texts.append(" | ".join(parts))
+
+    # Generate embeddings in batch
+    try:
+        model = get_embedding_model()
+        embeddings = model.encode(embed_texts, normalize_embeddings=True)
+    except Exception as exc:
+        return {"backfilled": 0, "errors": [f"Model error: {exc}"]}
+
+    backfilled = 0
+    errors: list[str] = []
+    for row, emb in zip(rows, embeddings):
+        try:
+            vec_json = json.dumps([float(v) for v in emb])
+            await db.execute(text(
+                """
+                INSERT INTO repo_embeddings (repo_id, embedding, model, generated_at)
+                VALUES (:repo_id, :embedding, 'nomic-embed-text', NOW())
+                ON CONFLICT (repo_id) DO NOTHING
+                """
+            ), {"repo_id": str(row.id), "embedding": vec_json})
+            backfilled += 1
+        except Exception as exc:
+            errors.append(f"{row.name}: {exc}")
+            logger.warning("Embedding insert failed for %s: %s", row.name, exc)
+
+    await db.commit()
+    return {"backfilled": backfilled, "errors": errors}
