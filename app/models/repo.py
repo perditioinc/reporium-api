@@ -42,6 +42,7 @@ class Repo(Base):
 
     # Own star count (for non-fork / built repos)
     stargazers_count: Mapped[int | None] = mapped_column(Integer)
+    open_issues_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     # Activity
     commits_last_7_days: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
@@ -191,3 +192,17 @@ class RepoEmbedding(Base):
     )
 
     repo: Mapped["Repo"] = relationship(back_populates="embedding")
+
+
+class SkillArea(Base):
+    __tablename__ = "skill_areas"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False, unique=True)
+    lifecycle_group: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    description: Mapped[str | None] = mapped_column(Text)
+    icon: Mapped[str | None] = mapped_column(Text)
+    color: Mapped[str | None] = mapped_column(Text)
+    sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    min_repos_to_display: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
