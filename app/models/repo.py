@@ -2,7 +2,7 @@ import uuid as _uuid_mod
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, Float, ForeignKey, Integer, Text, TIMESTAMP
+from sqlalchemy import Boolean, Float, ForeignKey, Integer, Text, TIMESTAMP, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -249,3 +249,7 @@ class RepoTaxonomy(Base):
     similarity_score: Mapped[float | None] = mapped_column(Float)
     assigned_by: Mapped[str] = mapped_column(Text, default="enrichment")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("repo_id", "dimension", "raw_value", name="uq_repo_taxonomy_repo_dim_val"),
+    )
