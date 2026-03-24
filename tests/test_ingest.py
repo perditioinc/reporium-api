@@ -32,6 +32,10 @@ async def test_ingest_with_valid_key(client: AsyncClient):
     assert data["upserted"] == 1
     assert data["errors"] == []
 
+    library = await client.get("/library/full")
+    assert library.status_code == 200
+    assert library.json()["repos"][0]["openIssuesCount"] == 42
+
 
 @pytest.mark.asyncio
 async def test_ingest_is_idempotent(client: AsyncClient):
