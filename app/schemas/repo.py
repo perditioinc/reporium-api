@@ -128,6 +128,7 @@ class RepoIngestItem(BaseModel):
     behind_by: int = 0
     ahead_by: int = 0
 
+    github_created_at: datetime | None = None
     upstream_created_at: datetime | None = None
     forked_at: datetime | None = None
     your_last_push_at: datetime | None = None

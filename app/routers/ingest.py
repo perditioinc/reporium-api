@@ -50,7 +50,8 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
     else:
         for key, val in repo_fields.items():
             if val is not None or key in {"description", "forked_from", "primary_language",
-                                           "fork_sync_state", "readme_summary", "github_updated_at"}:
+                                           "fork_sync_state", "readme_summary", "github_updated_at",
+                                           "github_created_at"}:
                 setattr(repo, key, val)
         repo.updated_at = datetime.now(timezone.utc)
 
