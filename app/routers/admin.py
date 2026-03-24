@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import verify_api_key
+from app.auth import require_admin_key, verify_api_key
 from app.cache import cache
 from app.database import get_db
 from app.models.repo import RepoTag
@@ -61,6 +61,7 @@ async def _prune_noise_tags(db: AsyncSession, *, dry_run: bool) -> dict:
 async def data_quality(
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
 ):
 
     # Query counts
@@ -117,5 +118,6 @@ async def prune_tags(
     dry_run: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
 ):
     return await _prune_noise_tags(db, dry_run=dry_run)
