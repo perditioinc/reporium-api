@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cache_redis import redis_cache
 from app.database import get_db
 
 logger = logging.getLogger(__name__)
@@ -178,6 +179,14 @@ CACHE_TTL = 300  # 5 minutes
 def invalidate_library_cache() -> None:
     """Bust the in-memory /library/full cache. Called by ingest router after writes."""
     _cache.clear()
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            asyncio.ensure_future(redis_cache.clear_prefix("library:"))
+        else:
+            loop.run_until_complete(redis_cache.clear_prefix("library:"))
+    except Exception:
+        logger.warning("invalidate_library_cache: could not clear Redis prefix", exc_info=True)
 
 
 def sanitize_repo(repo: dict) -> dict:
@@ -824,11 +833,22 @@ async def library_full(
     page — memory is O(page_size), not O(total). Safe at 10K+ repos.
     """
     cache_key = f"page_{page}_{page_size}"
+    redis_key = f"library:page:{page}:size:{page_size}"
     now = time.time()
-    cached = _cache.get(cache_key)
-    if cached and cached.get("expires_at", 0) > now:
-        logger.info(f"Returning cached /library/full page={page} page_size={page_size}")
-        return cached["data"]
+
+    # 1. Check Redis cache first (shared, survives restarts)
+    redis_hit = await redis_cache.get(redis_key)
+    if redis_hit is not None:
+        logger.info(f"Redis hit /library/full page={page} page_size={page_size}")
+        # Warm in-memory cache too so subsequent requests on this instance are instant
+        _cache[cache_key] = {"data": redis_hit, "expires_at": now + CACHE_TTL}
+        return redis_hit
+
+    # 2. Fall back to in-memory cache (per-instance, zero latency)
+    mem_cached = _cache.get(cache_key)
+    if mem_cached and mem_cached.get("expires_at", 0) > now:
+        logger.info(f"Memory hit /library/full page={page} page_size={page_size}")
+        return mem_cached["data"]
 
     t0 = time.monotonic()
     logger.info(f"Building /library/full page={page} page_size={page_size}...")
@@ -852,7 +872,9 @@ async def library_full(
     elapsed = time.monotonic() - t0
     logger.info(f"/library/full page={page} built in {elapsed:.1f}s — {len(enriched_repos)}/{total} repos")
 
+    # Store in both caches
     _cache[cache_key] = {"data": response, "expires_at": now + CACHE_TTL}
+    await redis_cache.set(redis_key, response, ttl=CACHE_TTL)
     return response
 
 
