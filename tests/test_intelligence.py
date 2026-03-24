@@ -5,13 +5,24 @@ These are unit/contract tests — they validate auth, input validation, and
 injection rejection without requiring a real DB or Anthropic API key.
 Full end-to-end query tests belong in a separate integration test suite.
 """
+import asyncio
 import hashlib
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import numpy as np
 import pytest
 from httpx import AsyncClient
 
-from app.routers.intelligence import _estimate_cost, _hash_ip, _log_query
+from app.routers.intelligence import (
+    QueryRequest,
+    _coerce_cached_sources,
+    _estimate_cost,
+    _find_semantic_cache_hit,
+    _hash_ip,
+    _log_query,
+    _run_query,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -181,18 +192,16 @@ def test_estimate_cost_typical_query():
 
 
 def _make_mock_session():
-    """Return an AsyncMock session with a sync .add() method."""
+    """Return an AsyncMock async session context manager."""
     mock_session = AsyncMock()
     mock_session.__aenter__ = AsyncMock(return_value=mock_session)
     mock_session.__aexit__ = AsyncMock(return_value=False)
-    # .add() is synchronous in SQLAlchemy — override so it doesn't return a coroutine
-    mock_session.add = MagicMock()
     return mock_session
 
 
 @pytest.mark.asyncio
 async def test_log_query_writes_row():
-    """_log_query commits a QueryLog row with correct fields."""
+    """_log_query writes the query row with full answer and embedding."""
     mock_session = _make_mock_session()
 
     with patch("app.routers.intelligence.async_session_factory", return_value=mock_session):
@@ -205,19 +214,22 @@ async def test_log_query_writes_row():
             hashed_ip=_hash_ip("203.0.113.42"),
             latency_ms=3450,
             model="claude-sonnet-4-20250514",
+            question_embedding=np.array([0.1, 0.2, 0.3]),
         )
 
-    mock_session.add.assert_called_once()
-    row = mock_session.add.call_args[0][0]
-    assert row.question == "What are the best RAG frameworks?"
-    assert row.answer_truncated == "Based on the data, LlamaIndex and LangChain are top choices."
-    assert row.tokens_prompt == 1800
-    assert row.tokens_completion == 220
-    assert abs(row.cost_usd - _estimate_cost(1800, 220)) < 1e-9
-    assert row.hashed_ip == _hash_ip("203.0.113.42")
-    assert row.latency_ms == 3450
-    assert row.model == "claude-sonnet-4-20250514"
-    assert row.cache_hit is False
+    mock_session.execute.assert_awaited_once()
+    params = mock_session.execute.await_args.args[1]
+    assert params["question"] == "What are the best RAG frameworks?"
+    assert params["answer_truncated"] == "Based on the data, LlamaIndex and LangChain are top choices."
+    assert params["answer_full"] == "Based on the data, LlamaIndex and LangChain are top choices."
+    assert params["tokens_prompt"] == 1800
+    assert params["tokens_completion"] == 220
+    assert abs(params["cost_usd"] - _estimate_cost(1800, 220)) < 1e-9
+    assert params["hashed_ip"] == _hash_ip("203.0.113.42")
+    assert params["latency_ms"] == 3450
+    assert params["model"] == "claude-sonnet-4-20250514"
+    assert params["cache_hit"] is False
+    assert params["question_embedding_vec"] == "[0.10000000,0.20000000,0.30000000]"
     mock_session.commit.assert_awaited_once()
 
 
@@ -238,8 +250,9 @@ async def test_log_query_truncates_long_answer():
             model="claude-sonnet-4-20250514",
         )
 
-    row = mock_session.add.call_args[0][0]
-    assert len(row.answer_truncated) == 500
+    params = mock_session.execute.await_args.args[1]
+    assert len(params["answer_truncated"]) == 500
+    assert len(params["answer_full"]) == 1000
 
 
 @pytest.mark.asyncio
@@ -260,3 +273,61 @@ async def test_log_query_does_not_raise_on_db_error():
             latency_ms=50,
             model="claude-sonnet-4-20250514",
         )
+
+
+def test_coerce_cached_sources_supports_legacy_name_only_shape():
+    sources = _coerce_cached_sources([{"name": "owner/repo", "score": 0.91}])
+    assert len(sources) == 1
+    assert sources[0].owner == "owner"
+    assert sources[0].name == "repo"
+    assert sources[0].relevance_score == 0.91
+
+
+@pytest.mark.asyncio
+async def test_find_semantic_cache_hit_returns_cached_answer():
+    row = SimpleNamespace(
+        answer_full="Cached answer",
+        sources=[{"owner": "perditioinc", "name": "reporium", "relevance_score": 0.88}],
+        model="claude-sonnet-4-20250514",
+    )
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=SimpleNamespace(first=lambda: row))
+
+    cached = await _find_semantic_cache_hit(db, question_embedding=np.array([0.1, 0.2, 0.3]))
+
+    assert cached is not None
+    answer, sources, model = cached
+    assert answer == "Cached answer"
+    assert sources[0].owner == "perditioinc"
+    assert sources[0].name == "reporium"
+    assert model == "claude-sonnet-4-20250514"
+
+
+@pytest.mark.asyncio
+async def test_run_query_returns_semantic_cache_hit_without_calling_anthropic():
+    db = AsyncMock()
+    fake_model = MagicMock()
+    fake_model.encode.return_value = np.array([0.1, 0.2, 0.3])
+    mock_log_query = AsyncMock()
+
+    with patch("app.routers.intelligence._get_model", return_value=fake_model), \
+         patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(return_value=(
+             "Cached answer",
+             _coerce_cached_sources([{"owner": "perditioinc", "name": "reporium", "relevance_score": 0.88}]),
+             "claude-sonnet-4-20250514",
+         ))), \
+         patch("app.routers.intelligence._log_query", new=mock_log_query), \
+         patch("app.routers.intelligence.anthropic.Anthropic") as anthropic_client:
+        response = await _run_query(
+            QueryRequest(question="What is Reporium?"),
+            db,
+            client_ip="203.0.113.42",
+        )
+        await asyncio.sleep(0)
+
+    assert response.cache_hit is True
+    assert response.answer == "Cached answer"
+    assert response.tokens_used == {"input": 0, "output": 0, "total": 0}
+    assert response.sources[0].owner == "perditioinc"
+    anthropic_client.assert_not_called()
+    mock_log_query.assert_awaited_once()
