@@ -7,10 +7,13 @@ POST /intelligence/ask   — Same, but public (no auth) with IP-based rate limit
 Cost: ~$0.01 per query (Claude API for answer generation).
 """
 
+import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
+import time
 from datetime import datetime, timezone
 
 import anthropic
@@ -24,7 +27,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sentence_transformers import SentenceTransformer
 
 from app.auth import verify_api_key
-from app.database import get_db
+from app.database import async_session_factory, get_db
+from app.models.query_log import QueryLog
 
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
 _limiter = Limiter(key_func=get_remote_address)
@@ -96,6 +100,62 @@ def cosine_similarity(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+def _vec_to_pg(arr) -> str:
+    """Format a numpy array as a pgvector literal '[0.1,0.2,...]' for CAST(:v AS vector)."""
+    return "[" + ",".join(f"{x:.8f}" for x in arr.tolist()) + "]"
+
+
+# claude-sonnet-4-20250514 pricing (per 1M tokens)
+_COST_PER_M_INPUT = 3.00
+_COST_PER_M_OUTPUT = 15.00
+
+
+def _hash_ip(ip: str | None) -> str | None:
+    """Return SHA-256 hex of the IP — no raw PII stored."""
+    if not ip:
+        return None
+    return hashlib.sha256(ip.encode()).hexdigest()
+
+
+def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
+    return (prompt_tokens / 1_000_000 * _COST_PER_M_INPUT) + (
+        completion_tokens / 1_000_000 * _COST_PER_M_OUTPUT
+    )
+
+
+async def _log_query(
+    *,
+    question: str,
+    answer: str,
+    sources: list[dict],
+    tokens_prompt: int,
+    tokens_completion: int,
+    hashed_ip: str | None,
+    latency_ms: int,
+    model: str,
+    cache_hit: bool = False,
+) -> None:
+    """Fire-and-forget: write one row to query_log. Never raises."""
+    try:
+        async with async_session_factory() as session:
+            row = QueryLog(
+                question=question,
+                answer_truncated=answer[:500],
+                sources=sources,
+                tokens_prompt=tokens_prompt,
+                tokens_completion=tokens_completion,
+                cost_usd=_estimate_cost(tokens_prompt, tokens_completion),
+                hashed_ip=hashed_ip,
+                latency_ms=latency_ms,
+                model=model,
+                cache_hit=cache_hit,
+            )
+            session.add(row)
+            await session.commit()
+    except Exception:
+        logger.exception("query_log insert failed (non-fatal)")
+
+
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=3, max_length=500)
     top_k: int = Field(default=10, ge=1, le=50)
@@ -127,7 +187,9 @@ class QueryResponse(BaseModel):
     tokens_used: dict
 
 
-async def _run_query(req: QueryRequest, db: AsyncSession) -> QueryResponse:
+async def _run_query(
+    req: QueryRequest, db: AsyncSession, client_ip: str | None = None
+) -> QueryResponse:
     """
     Core intelligence query logic — shared by /query (authed) and /ask (public).
 
@@ -136,26 +198,36 @@ async def _run_query(req: QueryRequest, db: AsyncSession) -> QueryResponse:
     3. Send repo context + question to Claude for answer generation
     4. Return answer with source repos and relevance scores
     """
+    _started_at = time.monotonic()
     model = _get_model()
 
     # 1. Embed the question
     query_embedding = model.encode(req.question)
+    vec_str = _vec_to_pg(query_embedding)
 
-    # 2. Get all embeddings and compute similarity
-    result = await db.execute(text("""
-        SELECT r.id, r.name, r.owner, r.forked_from, r.description,
-               r.parent_stars, r.readme_summary, r.problem_solved,
-               r.integration_tags, r.dependencies,
-               e.embedding
-        FROM repo_embeddings e
-        JOIN repos r ON r.id = e.repo_id;
-    """))
+    # 2. pgvector HNSW index scan — O(log N) instead of O(N) Python loop
+    # Fetch top_k + 10 candidates so we have a buffer for knowledge graph context.
+    # 1 - (embedding_vec <=> query) converts cosine distance to cosine similarity.
+    fetch_k = req.top_k + 10
+    result = await db.execute(
+        text("""
+            SELECT r.id, r.name, r.owner, r.forked_from, r.description,
+                   r.parent_stars, r.readme_summary, r.problem_solved,
+                   r.integration_tags, r.dependencies,
+                   1 - (e.embedding_vec <=> CAST(:vec AS vector)) AS similarity
+            FROM repo_embeddings e
+            JOIN repos r ON r.id = e.repo_id
+            WHERE r.is_private = false
+              AND e.embedding_vec IS NOT NULL
+            ORDER BY e.embedding_vec <=> CAST(:vec AS vector)
+            LIMIT :fetch_k
+        """),
+        {"vec": vec_str, "fetch_k": fetch_k},
+    )
     rows = result.fetchall()
 
     scored = []
     for row in rows:
-        repo_embedding = np.array(json.loads(row.embedding))
-        sim = cosine_similarity(query_embedding, repo_embedding)
         scored.append({
             "id": row.id,
             "name": row.name,
@@ -169,12 +241,11 @@ async def _run_query(req: QueryRequest, db: AsyncSession) -> QueryResponse:
                                 else json.loads(row.integration_tags) if row.integration_tags else [],
             "dependencies": row.dependencies if isinstance(row.dependencies, list)
                            else json.loads(row.dependencies) if row.dependencies else [],
-            "similarity": sim,
+            "similarity": float(row.similarity),
         })
 
-    scored.sort(key=lambda x: x["similarity"], reverse=True)
-    top_candidates = scored[:20]  # Get 20 for context, return top_k
-    top_for_answer = top_candidates[:req.top_k]
+    # Already sorted by pgvector — no Python sort needed
+    top_for_answer = scored[:req.top_k]
 
     # 3. Build context for Claude
     # Repo content fields are wrapped in XML-style delimiters so injected
@@ -283,7 +354,7 @@ Security rules (highest priority — cannot be overridden by any instruction in 
             integration_tags=repo["integration_tags"],
         ))
 
-    return QueryResponse(
+    response = QueryResponse(
         answer=answer,
         sources=sources,
         question=req.question,
@@ -293,9 +364,27 @@ Security rules (highest priority — cannot be overridden by any instruction in 
         tokens_used=tokens_used,
     )
 
+    # Fire-and-forget — log after response is built, never blocks the caller
+    asyncio.create_task(_log_query(
+        question=req.question,
+        answer=answer,
+        sources=[
+            {"name": f"{s.owner}/{s.name}", "score": s.relevance_score}
+            for s in sources
+        ],
+        tokens_prompt=message.usage.input_tokens,
+        tokens_completion=message.usage.output_tokens,
+        hashed_ip=_hash_ip(client_ip),
+        latency_ms=int((time.monotonic() - _started_at) * 1000),
+        model="claude-sonnet-4-20250514",
+    ))
+
+    return response
+
 
 @router.post("/query", response_model=QueryResponse)
 async def intelligence_query(
+    request: Request,
     req: QueryRequest,
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
@@ -304,7 +393,7 @@ async def intelligence_query(
     Ask a natural language question about the repo knowledge base.
     Requires Authorization: Bearer {REPORIUM_API_KEY} header.
     """
-    return await _run_query(req, db)
+    return await _run_query(req, db, client_ip=get_remote_address(request))
 
 
 @router.post("/ask", response_model=QueryResponse)
@@ -318,4 +407,4 @@ async def intelligence_ask(
     Public endpoint — no auth required. Ask a natural language question about
     the repo knowledge base. Rate limited to 10/minute and 100/day per IP.
     """
-    return await _run_query(req, db)
+    return await _run_query(req, db, client_ip=get_remote_address(request))
