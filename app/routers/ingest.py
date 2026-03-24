@@ -1,3 +1,5 @@
+import base64
+import json
 import logging
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -9,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_ingest_key, verify_api_key
+from app.auth import require_ingest_key, require_pubsub_push, verify_api_key
 from app.cache import cache
 from app.database import get_db
 from app.models.repo import (
@@ -24,13 +26,16 @@ from app.models.repo import (
     RepoTaxonomy,
 )
 from app.models.trend import GapAnalysis, IngestionLog, TrendSnapshot
+from app.routers.intelligence import _portfolio_insights
 from app.routers.library_full import invalidate_library_cache
+from app.routers.taxonomy import AssignBody, RebuildBody, assign_taxonomy, embed_taxonomy, rebuild_taxonomy
 from app.schemas.repo import IngestResponse, RepoEnrichItem, RepoIngestItem
 from app.schemas.trend import GapAnalysisIn, GapAnalysisOut, IngestionLogIn, IngestionLogOut, TrendSnapshotIn, TrendSnapshotOut
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/ingest", dependencies=[Depends(verify_api_key), Depends(require_ingest_key)])
+events_router = APIRouter(prefix="/ingest/events", dependencies=[Depends(require_ingest_key), Depends(require_pubsub_push)])
 limiter = Limiter(key_func=get_remote_address)
 
 MAX_BATCH = 100
@@ -44,6 +49,92 @@ _TAXONOMY_DIMENSION_MAP = {
     "ai_trends": "ai_trend",
     "deployment_context": "deployment_context",
 }
+
+
+def _severity_for_repo_count(repo_count: int) -> str:
+    if repo_count == 0:
+        return "missing"
+    if repo_count <= 2:
+        return "weak"
+    if repo_count <= 5:
+        return "moderate"
+    return "strong"
+
+
+def _trend_label(trending_score: float) -> str:
+    if trending_score >= 5:
+        return "rising"
+    if trending_score <= -1:
+        return "cooling"
+    return "stable"
+
+
+async def _rebuild_gap_analysis(db: AsyncSession) -> dict[str, int]:
+    await db.execute(GapAnalysis.__table__.delete())
+
+    rows = (
+        await db.execute(
+            text(
+                """
+                SELECT sa.name AS skill,
+                       COUNT(DISTINCT ras.repo_id) AS repo_count,
+                       COALESCE(tv.trending_score, 0) AS trending_score
+                FROM skill_areas sa
+                LEFT JOIN repo_ai_dev_skills ras ON ras.skill = sa.name
+                LEFT JOIN taxonomy_values tv
+                  ON tv.dimension = 'skill_area' AND tv.name = sa.name
+                GROUP BY sa.name, tv.trending_score
+                ORDER BY repo_count ASC, sa.name ASC
+                """
+            )
+        )
+    ).all()
+
+    inserted = 0
+    for row in rows:
+        repo_count = int(row.repo_count or 0)
+        gap = GapAnalysis(
+            skill=row.skill,
+            severity=_severity_for_repo_count(repo_count),
+            repo_count=repo_count,
+            why=f"{repo_count} repos currently cover {row.skill}.",
+            trend=_trend_label(float(row.trending_score or 0.0)),
+            essential_repos=None,
+        )
+        db.add(gap)
+        inserted += 1
+
+    await db.commit()
+    await cache.invalidate("gaps:latest")
+    return {"gap_rows": inserted}
+
+
+def _parse_pubsub_payload(payload: dict) -> dict:
+    message = payload.get("message")
+    if not isinstance(message, dict):
+        return payload
+
+    raw_data = message.get("data")
+    if not raw_data:
+        return payload
+
+    decoded = base64.b64decode(raw_data).decode("utf-8")
+    try:
+        parsed = json.loads(decoded)
+        return parsed if isinstance(parsed, dict) else {"decoded": parsed}
+    except json.JSONDecodeError:
+        return {"decoded": decoded}
+
+
+async def _refresh_portfolio_intelligence(db: AsyncSession) -> dict[str, int]:
+    await cache.invalidate("intelligence:portfolio-insights")
+    response = await _portfolio_insights(db)
+    return {
+        "taxonomy_gap_count": len(response.taxonomy_gaps),
+        "stale_repo_count": len(response.stale_repos),
+        "velocity_leader_count": len(response.velocity_leaders),
+        "near_duplicate_cluster_count": len(response.near_duplicate_clusters),
+    }
 
 
 async def _upsert_repo_taxonomy(db: AsyncSession, repo_id, item_dict: dict) -> None:
@@ -267,3 +358,33 @@ async def ingest_log(
     await db.commit()
     await db.refresh(log)
     return IngestionLogOut.model_validate(log, from_attributes=True)
+
+
+@events_router.post("/repo-ingested", response_model=dict)
+async def repo_ingested_event(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    payload = _parse_pubsub_payload(await request.json())
+
+    rebuild_result = await rebuild_taxonomy(RebuildBody(), db)
+    embed_result = await embed_taxonomy(db)
+    assign_result = await assign_taxonomy(AssignBody(), db)
+    gap_result = await _rebuild_gap_analysis(db)
+
+    await cache.invalidate("library:full*")
+    await cache.invalidate("repos:list:*")
+    await cache.invalidate("stats:overview")
+    invalidate_library_cache()
+
+    insights_result = await _refresh_portfolio_intelligence(db)
+
+    return {
+        "status": "ok",
+        "received": payload,
+        "taxonomy_rebuild": rebuild_result,
+        "taxonomy_embed": embed_result,
+        "taxonomy_assign": assign_result,
+        "gap_rebuild": gap_result,
+        "portfolio_insights": insights_result,
+    }
