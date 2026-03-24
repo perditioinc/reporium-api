@@ -42,6 +42,7 @@ class Repo(Base):
 
     # Own star count (for non-fork / built repos)
     stargazers_count: Mapped[int | None] = mapped_column(Integer)
+    open_issues_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     # Activity
     commits_last_7_days: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
