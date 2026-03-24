@@ -15,5 +15,4 @@ google-cloud-secret-manager>=2.16
 slowapi>=0.1.9
 anthropic>=0.40.0
 sentence-transformers>=3.0.0
-sentry-sdk[fastapi]>=2.0.0
 numpy>=1.26
