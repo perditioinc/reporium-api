@@ -53,6 +53,7 @@ class Repo(Base):
     # Enrichment
     readme_summary: Mapped[str | None] = mapped_column(Text)
     activity_score: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    quality_signals: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     # Metadata
     ingested_at: Mapped[datetime] = mapped_column(
@@ -66,6 +67,8 @@ class Repo(Base):
     # Enrichment extras
     problem_solved: Mapped[str | None] = mapped_column(Text)
     license_spdx: Mapped[str | None] = mapped_column(Text)
+    has_tests: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    has_ci: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
     # Relationships
     tags: Mapped[list["RepoTag"]] = relationship(

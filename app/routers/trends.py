@@ -6,7 +6,7 @@ from app.cache import CACHE_TTL_GAPS, CACHE_TTL_STATS, CACHE_TTL_TRENDS, cache
 from app.database import get_db
 from app.models.repo import Repo, RepoCategory, RepoTag
 from app.models.trend import GapAnalysis, IngestionLog, TrendSnapshot
-from app.schemas.trend import GapAnalysisOut, IngestionLogOut, StatsResponse, TrendSnapshotOut
+from app.schemas.trend import GapAnalysisOut, IngestionLogOut, StatsResponse, TaxonomyGapItem, TrendSnapshotOut
 
 router = APIRouter()
 
@@ -134,3 +134,72 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
     )
     await cache.set("stats:overview", response.model_dump(), ttl=CACHE_TTL_STATS)
     return response
+
+
+@router.get("/gaps/taxonomy", response_model=list[TaxonomyGapItem])
+async def get_taxonomy_gaps(
+    min_repos: int = 1,
+    max_repos: int = 10,
+    db: AsyncSession = Depends(get_db),
+) -> list[TaxonomyGapItem]:
+    """
+    Compute gap analysis across all 8 taxonomy dimensions from repo_taxonomy.
+    Returns values that are underrepresented relative to the rest of their dimension.
+
+    Args:
+        min_repos: Only include values with at least this many repos (filters noise).
+        max_repos: Only include values with at most this many repos (these are the gaps).
+    """
+    cache_key = f"gaps:taxonomy:{min_repos}:{max_repos}"
+    cached = await cache.get(cache_key)
+    if cached:
+        return [TaxonomyGapItem(**g) for g in cached]
+
+    from sqlalchemy import text as _text
+
+    # Get repo counts per (dimension, raw_value)
+    rows = (await db.execute(_text("""
+        SELECT dimension, raw_value, COUNT(DISTINCT repo_id) AS repo_count
+        FROM repo_taxonomy
+        GROUP BY dimension, raw_value
+        HAVING COUNT(DISTINCT repo_id) BETWEEN :min_repos AND :max_repos
+        ORDER BY dimension, repo_count ASC
+    """), {"min_repos": min_repos, "max_repos": max_repos})).fetchall()
+
+    if not rows:
+        return []
+
+    # Get max count per dimension for normalisation
+    max_rows = (await db.execute(_text("""
+        SELECT dimension, MAX(cnt) AS max_count FROM (
+            SELECT dimension, COUNT(DISTINCT repo_id) AS cnt
+            FROM repo_taxonomy
+            GROUP BY dimension, raw_value
+        ) sub
+        GROUP BY dimension
+    """))).fetchall()
+    max_by_dim = {r.dimension: r.max_count for r in max_rows}
+
+    gaps: list[TaxonomyGapItem] = []
+    for row in rows:
+        max_count = max_by_dim.get(row.dimension, 1) or 1
+        gap_score = round(1.0 - (row.repo_count / max_count), 3)
+        if gap_score < 0.3:
+            severity = "low"
+        elif gap_score < 0.7:
+            severity = "medium"
+        else:
+            severity = "high"
+        gaps.append(TaxonomyGapItem(
+            dimension=row.dimension,
+            name=row.raw_value,
+            repo_count=row.repo_count,
+            gap_score=gap_score,
+            severity=severity,
+        ))
+
+    # Sort: highest gap first, then by dimension
+    gaps.sort(key=lambda g: (-g.gap_score, g.dimension))
+
+    await cache.set(cache_key, [g.model_dump() for g in gaps], ttl=CACHE_TTL_GAPS)
+    return gaps

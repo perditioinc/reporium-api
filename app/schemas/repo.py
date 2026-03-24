@@ -76,6 +76,7 @@ class RepoSummary(BaseModel):
 
     readme_summary: str | None = None
     activity_score: int = 0
+    quality_signals: dict | None = None
     problem_solved: str | None = None
     license_spdx: str | None = None
 
@@ -175,6 +176,8 @@ class RepoIngestItem(BaseModel):
     commits: list[CommitIngest] = []
 
     license_spdx: str | None = None
+    has_tests: bool | None = None
+    has_ci: bool | None = None
 
     # Dynamic taxonomy dimensions
     skill_areas: list[str] = []
