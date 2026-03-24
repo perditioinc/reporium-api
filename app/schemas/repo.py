@@ -86,6 +86,10 @@ class RepoDetail(RepoSummary):
     commits: list[CommitRef] = []
 
 
+class RepoSemanticResult(RepoSummary):
+    similarity: float
+
+
 # --- Ingest input schemas ---
 
 class CategoryIngest(BaseModel):
