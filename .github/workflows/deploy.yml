@@ -23,6 +23,13 @@ jobs:
           service: reporium-api
           region: us-central1
           source: .
+          flags: >-
+            --memory=1Gi
+            --cpu=1
+            --min-instances=1
+            --max-instances=10
+            --concurrency=20
+            --timeout=60
 
       - name: Publish api.deployed event
         if: success()
