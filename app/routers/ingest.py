@@ -86,7 +86,7 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
 
 
 @router.post("/repos", response_model=IngestResponse)
-@limiter.limit("10/minute")
+@limiter.limit("200/minute")
 async def ingest_repos(
     request: Request,
     items: list[RepoIngestItem],

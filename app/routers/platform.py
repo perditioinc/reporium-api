@@ -1,11 +1,13 @@
 """Platform-level endpoints consumed by sibling repos (reporium-metrics, reporium-roadmap)."""
 
+import os
 from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.auth import verify_api_key
 from app.database import get_db
 from app.models.repo import Repo, RepoAIDevSkill, RepoCategory
 
@@ -46,8 +48,8 @@ async def metrics_latest(db: AsyncSession = Depends(get_db)) -> dict:
         "repos_with_categories": repos_with_categories,
         "languages": lang_count,
         "last_sync": last_updated.isoformat() if last_updated else None,
-        "api_version": "1.0.0",
-        "build_number": 1,
+        "api_version": os.getenv("APP_VERSION", os.getenv("GITHUB_SHA", "unknown")[:7]),
+        "build_number": os.getenv("BUILD_NUMBER", "0"),
     }
 
 
@@ -80,7 +82,10 @@ async def audit_status(db: AsyncSession = Depends(get_db)) -> dict:
 
 
 @router.post("/events/ingest")
-async def events_ingest(payload: dict) -> dict:
-    """Receive Pub/Sub push events (placeholder for future reporium-events integration)."""
+async def events_ingest(
+    payload: dict,
+    _api_key: str = Depends(verify_api_key),
+) -> dict:
+    """Receive Pub/Sub push events. Requires Authorization: Bearer {REPORIUM_API_KEY} header."""
     # For now, acknowledge receipt without processing
     return {"status": "accepted", "message": "Event received (processing not yet implemented)"}

@@ -6,12 +6,13 @@ All fields camelCase, nested objects, all repos in one response.
 Cached for 5 minutes to avoid repeated expensive queries.
 """
 
+import asyncio
 import logging
 import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -36,6 +37,11 @@ CATEGORY_MAP = {
     "Other": "Dev Tools & Automation",
     "Data Processing": "MLOps & Infrastructure",
     "Embeddings": "RAG & Retrieval",
+    "Audio": "Industry: Audio & Music",
+    "Fine Tuning": "Model Training",
+    "Deployment": "MLOps & Infrastructure",
+    "Evaluation": "Evals & Benchmarking",
+    "Datasets": "Datasets",
 }
 
 
@@ -162,15 +168,16 @@ for _group, _tags in _AI_DEV_SKILL_GROUPS.items():
 
 router = APIRouter(tags=["Library"])
 
-# In-memory cache
-_cache: dict = {"data": None, "expires_at": 0}
+# In-memory cache: two tiers
+#   _cache["page_{page}_{page_size}"] → per-page enriched repos (5 min TTL)
+#   _cache["aggregates"]              → stats/categories/tagMetrics across all repos (5 min TTL)
+_cache: dict = {}
 CACHE_TTL = 300  # 5 minutes
 
 
 def invalidate_library_cache() -> None:
     """Bust the in-memory /library/full cache. Called by ingest router after writes."""
-    _cache["data"] = None
-    _cache["expires_at"] = 0
+    _cache.clear()
 
 
 def sanitize_repo(repo: dict) -> dict:
@@ -335,10 +342,14 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
     all_cats = list(dict.fromkeys(_normalize_category(c["category_name"]) for c in categories))
     primary_cat = all_cats[0] if all_cats else "Dev Tools & Automation"
 
+    # Use the DB-computed full_name (owner/name) as canonical identity.
+    # Falls back to constructing it if the column is somehow NULL (shouldn't happen post-006).
+    full_name = repo.get("full_name") or f"{owner}/{name}"
+
     return {
-        "id": hash(str(repo.get("id"))) & 0x7FFFFFFF,  # Convert UUID to positive int
+        "id": str(repo.get("id")),  # Stable DB UUID — never use hash() which changes per restart
         "name": name,
-        "fullName": f"{owner}/{name}",
+        "fullName": full_name,
         "description": repo.get("description"),
         "isFork": repo.get("is_fork", False),
         "forkedFrom": forked_from,
@@ -653,24 +664,19 @@ def _build_builder_stats(repos: list) -> list:
     return stats[:50]  # Top 50 builders by repo count
 
 
-@router.get("/library/full")
-async def library_full(db: AsyncSession = Depends(get_db)):
+async def _fetch_page_repos(
+    db: AsyncSession, page: int, page_size: int
+) -> tuple[list[dict], int]:
     """
-    Returns the complete LibraryData response matching the frontend TypeScript interface.
-    Cached for 5 minutes.
+    Fetch one page of enriched repos. Junction data is fetched only for the
+    current page's IDs — never the full table — so memory is O(page_size), not O(N).
+    Returns (enriched_repos, total_count).
     """
-    now = time.time()
-    if _cache["data"] and _cache["expires_at"] > now:
-        logger.info("Returning cached /library/full response")
-        return _cache["data"]
+    offset = (page - 1) * page_size
 
-    t0 = time.monotonic()
-    logger.info("Building /library/full response...")
-
-    # SECURITY: Only return public repos — never expose private repos
-    # Public forks ARE included (frontend has built/forked toggle)
+    # Main repos query — paginated
     result = await db.execute(text("""
-        SELECT id, name, owner, description, is_fork, forked_from, primary_language,
+        SELECT id, name, owner, full_name, description, is_fork, forked_from, primary_language,
                github_url, fork_sync_state, behind_by, ahead_by,
                upstream_created_at, forked_at, your_last_push_at, upstream_last_push_at,
                parent_stars, parent_forks, parent_is_archived, stargazers_count,
@@ -679,74 +685,79 @@ async def library_full(db: AsyncSession = Depends(get_db)):
                problem_solved, integration_tags, dependencies
         FROM repos
         WHERE is_private = false
-        ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC;
-    """))
+        ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+        LIMIT :lim OFFSET :off
+    """), {"lim": page_size, "off": offset})
     rows = result.fetchall()
-    columns = result.keys()
+    columns = list(result.keys())
 
-    # Fetch all junction data in bulk
-    lang_result = await db.execute(text(
-        "SELECT repo_id, language, bytes, percentage FROM repo_languages;"
+    count_result = await db.execute(text(
+        "SELECT COUNT(*) FROM repos WHERE is_private = false"
     ))
-    all_languages = defaultdict(list)
-    for r in lang_result.fetchall():
-        all_languages[str(r.repo_id)].append({
-            "language": r.language, "bytes": r.bytes, "percentage": r.percentage
-        })
+    total = count_result.scalar() or 0
 
-    cat_result = await db.execute(text(
-        "SELECT repo_id, category_name, is_primary FROM repo_categories;"
-    ))
-    all_categories = defaultdict(list)
-    for r in cat_result.fetchall():
-        all_categories[str(r.repo_id)].append({
-            "category_name": r.category_name, "is_primary": r.is_primary
-        })
+    if not rows:
+        return [], total
 
-    skill_result = await db.execute(text(
-        "SELECT repo_id, skill FROM repo_ai_dev_skills;"
-    ))
-    all_ai_skills = defaultdict(list)
-    for r in skill_result.fetchall():
+    # Extract just this page's IDs for targeted junction fetches
+    repo_dicts = [dict(zip(columns, row)) for row in rows]
+    page_ids = [str(r["id"]) for r in repo_dicts]
+
+    # Fetch junction data only for this page
+    def _junction(query: str) -> dict:
+        return {}  # placeholder — populated by async calls below
+
+    async def _fetch_junction(q: str) -> list:
+        r = await db.execute(text(q), {"ids": page_ids})
+        return r.fetchall()
+
+    lang_rows, cat_rows, skill_rows, tag_rows, pm_rows, builder_rows, industry_rows = (
+        await asyncio.gather(
+            _fetch_junction("SELECT repo_id, language, bytes, percentage FROM repo_languages WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction("SELECT repo_id, category_name, is_primary FROM repo_categories WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction("SELECT repo_id, skill FROM repo_ai_dev_skills WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction("SELECT repo_id, tag FROM repo_tags WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction("SELECT repo_id, skill FROM repo_pm_skills WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction("SELECT repo_id, login, display_name, org_category, is_known_org FROM repo_builders WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction("SELECT repo_id, industry FROM repo_industries WHERE repo_id::text = ANY(:ids)"),
+        )
+    )
+
+    all_languages: dict = defaultdict(list)
+    for r in lang_rows:
+        all_languages[str(r.repo_id)].append({"language": r.language, "bytes": r.bytes, "percentage": r.percentage})
+
+    all_categories: dict = defaultdict(list)
+    for r in cat_rows:
+        all_categories[str(r.repo_id)].append({"category_name": r.category_name, "is_primary": r.is_primary})
+
+    all_ai_skills: dict = defaultdict(list)
+    for r in skill_rows:
         all_ai_skills[str(r.repo_id)].append({"skill": r.skill})
 
-    tag_result = await db.execute(text(
-        "SELECT repo_id, tag FROM repo_tags;"
-    ))
-    all_tags = defaultdict(list)
-    for r in tag_result.fetchall():
+    all_tags: dict = defaultdict(list)
+    for r in tag_rows:
         all_tags[str(r.repo_id)].append({"tag": r.tag})
 
-    pm_result = await db.execute(text(
-        "SELECT repo_id, skill FROM repo_pm_skills;"
-    ))
-    all_pm_skills = defaultdict(list)
-    for r in pm_result.fetchall():
+    all_pm_skills: dict = defaultdict(list)
+    for r in pm_rows:
         all_pm_skills[str(r.repo_id)].append({"skill": r.skill})
 
-    builder_result = await db.execute(text(
-        "SELECT repo_id, login, display_name, org_category, is_known_org FROM repo_builders;"
-    ))
-    all_builders = defaultdict(list)
-    for r in builder_result.fetchall():
+    all_builders: dict = defaultdict(list)
+    for r in builder_rows:
         all_builders[str(r.repo_id)].append({
             "login": r.login, "display_name": r.display_name,
-            "org_category": r.org_category, "is_known_org": r.is_known_org
+            "org_category": r.org_category, "is_known_org": r.is_known_org,
         })
 
-    industry_result = await db.execute(text(
-        "SELECT repo_id, industry FROM repo_industries;"
-    ))
-    all_industries = defaultdict(list)
-    for r in industry_result.fetchall():
+    all_industries: dict = defaultdict(list)
+    for r in industry_rows:
         all_industries[str(r.repo_id)].append({"industry": r.industry})
 
-    # Build enriched repos
-    enriched_repos = []
-    for row in rows:
-        repo = dict(zip(columns, row))
+    enriched = []
+    for repo in repo_dicts:
         rid = str(repo["id"])
-        enriched = _build_enriched_repo(
+        enriched.append(sanitize_repo(_build_enriched_repo(
             repo,
             languages=all_languages.get(rid, []),
             categories=all_categories.get(rid, []),
@@ -755,36 +766,93 @@ async def library_full(db: AsyncSession = Depends(get_db)):
             pm_skills=all_pm_skills.get(rid, []),
             builders=all_builders.get(rid, []),
             industries=all_industries.get(rid, []),
-        )
-        enriched_repos.append(sanitize_repo(enriched))
+        )))
 
-    # Build aggregated data
-    stats = _build_stats(enriched_repos)
-    tag_metrics = _build_tag_metrics(enriched_repos)
-    categories = _build_categories(enriched_repos)
-    ai_skill_stats = _build_ai_dev_skill_stats(enriched_repos)
-    pm_skill_stats = _build_skill_stats(enriched_repos, "pmSkills")
+    return enriched, total
+
+
+async def _fetch_aggregates(db: AsyncSession) -> dict:
+    """
+    Compute library-wide aggregates (stats, categories, tagMetrics, etc.) by loading
+    all repos in pages to avoid a single OOM-inducing fetch.
+
+    This runs at most once per CACHE_TTL window — cached under _cache['aggregates'].
+    """
+    now = time.time()
+    cached = _cache.get("aggregates")
+    if cached and cached.get("expires_at", 0) > now:
+        return cached["data"]
+
+    t0 = time.monotonic()
+    all_repos: list[dict] = []
+    page = 1
+    while True:
+        page_repos, total = await _fetch_page_repos(db, page=page, page_size=500)
+        all_repos.extend(page_repos)
+        if len(all_repos) >= total or not page_repos:
+            break
+        page += 1
+
+    aggregates = {
+        "stats": _build_stats(all_repos),
+        "tagMetrics": _build_tag_metrics(all_repos),
+        "categories": _build_categories(all_repos),
+        "builderStats": _build_builder_stats(all_repos),
+        "aiDevSkillStats": _build_ai_dev_skill_stats(all_repos),
+        "pmSkillStats": _build_skill_stats(all_repos, "pmSkills"),
+    }
+    logger.info(f"Aggregates built in {time.monotonic() - t0:.1f}s across {len(all_repos)} repos")
+
+    _cache["aggregates"] = {"data": aggregates, "expires_at": now + CACHE_TTL}
+    return aggregates
+
+
+@router.get("/library/full")
+async def library_full(
+    db: AsyncSession = Depends(get_db),
+    page: int = Query(default=1, ge=1, description="1-based page number"),
+    page_size: int = Query(default=200, ge=1, le=500, description="Repos per page (max 500)"),
+):
+    """
+    Returns a paginated page of LibraryData. Aggregates (stats, categories, tagMetrics)
+    are included on every page from a separate cache — they reflect the full corpus.
+
+    ?page=1&page_size=200  → first 200 repos
+    ?page=2&page_size=200  → next 200 repos
+
+    Junction data (tags, categories, languages, etc.) is fetched only for the current
+    page — memory is O(page_size), not O(total). Safe at 10K+ repos.
+    """
+    cache_key = f"page_{page}_{page_size}"
+    now = time.time()
+    cached = _cache.get(cache_key)
+    if cached and cached.get("expires_at", 0) > now:
+        logger.info(f"Returning cached /library/full page={page} page_size={page_size}")
+        return cached["data"]
+
+    t0 = time.monotonic()
+    logger.info(f"Building /library/full page={page} page_size={page_size}...")
+
+    # SECURITY: Only return public repos — is_private=false enforced inside _fetch_page_repos
+    enriched_repos, total = await _fetch_page_repos(db, page=page, page_size=page_size)
+    aggregates = await _fetch_aggregates(db)
 
     response = {
         "username": "perditioinc",
         "generatedAt": datetime.now(timezone.utc).isoformat(),
-        "stats": stats,
+        "page": page,
+        "pageSize": page_size,
+        "totalRepos": total,
+        "totalPages": (total + page_size - 1) // page_size,
         "repos": enriched_repos,
-        "tagMetrics": tag_metrics,
-        "categories": categories,
         "gapAnalysis": {"generatedAt": datetime.now(timezone.utc).isoformat(), "gaps": []},
-        "builderStats": _build_builder_stats(enriched_repos),
-        "aiDevSkillStats": ai_skill_stats,
-        "pmSkillStats": pm_skill_stats,
+        **aggregates,
     }
 
     elapsed = time.monotonic() - t0
-    logger.info(f"/library/full built in {elapsed:.1f}s — {len(enriched_repos)} repos")
+    logger.info(f"/library/full page={page} built in {elapsed:.1f}s — {len(enriched_repos)}/{total} repos")
 
-    # Cache
-    _cache["data"] = response
-    _cache["expires_at"] = now + CACHE_TTL
-
+    _cache[cache_key] = {"data": response, "expires_at": now + CACHE_TTL}
     return response
 
 
