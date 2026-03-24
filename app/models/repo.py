@@ -65,6 +65,7 @@ class Repo(Base):
 
     # Enrichment extras
     problem_solved: Mapped[str | None] = mapped_column(Text)
+    license_spdx: Mapped[str | None] = mapped_column(Text)
 
     # Relationships
     tags: Mapped[list["RepoTag"]] = relationship(
