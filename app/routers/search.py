@@ -11,7 +11,7 @@ from app.models.repo import Repo
 from app.routers.library import _repo_to_summary
 from app.schemas.repo import RepoSemanticResult, RepoSummary
 
-router = APIRouter()
+router = APIRouter(tags=["Search"])
 limiter = Limiter(key_func=get_remote_address)
 
 MAX_RESULTS = 20

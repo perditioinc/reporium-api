@@ -34,8 +34,16 @@ from app.schemas.trend import GapAnalysisIn, GapAnalysisOut, IngestionLogIn, Ing
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/ingest", dependencies=[Depends(verify_api_key), Depends(require_ingest_key)])
-events_router = APIRouter(prefix="/ingest/events", dependencies=[Depends(require_ingest_key), Depends(require_pubsub_push)])
+router = APIRouter(
+    prefix="/ingest",
+    tags=["Ingest"],
+    dependencies=[Depends(verify_api_key), Depends(require_ingest_key)],
+)
+events_router = APIRouter(
+    prefix="/ingest/events",
+    tags=["Ingest"],
+    dependencies=[Depends(require_ingest_key), Depends(require_pubsub_push)],
+)
 limiter = Limiter(key_func=get_remote_address)
 
 MAX_BATCH = 100
@@ -219,6 +227,7 @@ async def ingest_repos(
     items: list[RepoIngestItem],
     db: AsyncSession = Depends(get_db),
 ) -> IngestResponse:
+    """Upsert a bounded batch of repos from ingestion. Requires API and ingest keys."""
     if len(items) > MAX_BATCH:
         raise HTTPException(status_code=400, detail=f"Max {MAX_BATCH} repos per request")
 
@@ -250,6 +259,7 @@ async def enrich_repo(
     item: RepoEnrichItem,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Apply enrichment-only fields to an existing repo. Requires API and ingest keys."""
     stmt = select(Repo).where(Repo.name == name)
     result = await db.execute(stmt)
     repo = result.scalar_one_or_none()
@@ -293,6 +303,7 @@ async def ingest_trend_snapshot(
     items: list[TrendSnapshotIn],
     db: AsyncSession = Depends(get_db),
 ) -> list[TrendSnapshotOut]:
+    """Persist trend snapshots produced by ingestion. Requires API and ingest keys."""
     rows = []
     for item in items:
         snap = TrendSnapshot(**item.model_dump())
@@ -312,6 +323,7 @@ async def ingest_gaps(
     items: list[GapAnalysisIn],
     db: AsyncSession = Depends(get_db),
 ) -> list[GapAnalysisOut]:
+    """Persist gap-analysis rows produced by ingestion. Requires API and ingest keys."""
     rows = []
     for item in items:
         gap = GapAnalysis(**item.model_dump())
@@ -331,6 +343,7 @@ async def ingest_log(
     item: IngestionLogIn,
     db: AsyncSession = Depends(get_db),
 ) -> IngestionLogOut:
+    """Persist or update an ingestion run log record. Requires API and ingest keys."""
     # Find the latest running log for this mode, or create a new one
     stmt = (
         select(IngestionLog)
@@ -368,6 +381,7 @@ async def repo_ingested_event(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ) -> dict:
+    """Handle Pub/Sub repo-ingested pushes and refresh taxonomy, gaps, and insights."""
     payload = _parse_pubsub_payload(await request.json())
 
     rebuild_result = await rebuild_taxonomy(RebuildBody(), db)
