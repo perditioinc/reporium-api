@@ -162,6 +162,13 @@ async def add_security_headers(request: Request, call_next):
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
     response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["Content-Security-Policy"] = (
+        "default-src 'none'; "
+        "script-src 'none'; "
+        "style-src 'none'; "
+        "frame-ancestors 'none'"
+    )
     return response
 
 app.include_router(library.router)
