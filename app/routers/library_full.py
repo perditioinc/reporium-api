@@ -843,7 +843,7 @@ async def _fetch_page_repos(
                parent_stars, parent_forks, parent_is_archived, stargazers_count, open_issues_count,
                commits_last_7_days, commits_last_30_days, commits_last_90_days,
                readme_summary, activity_score, ingested_at, updated_at, github_updated_at,
-               problem_solved, integration_tags, dependencies
+               problem_solved
         FROM repos
         WHERE is_private = false
         ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
@@ -872,7 +872,7 @@ async def _fetch_page_repos(
         r = await db.execute(text(q), {"ids": page_ids})
         return r.fetchall()
 
-    lang_rows, cat_rows, skill_rows, tag_rows, pm_rows, builder_rows, industry_rows, taxonomy_rows = (
+    lang_rows, cat_rows, skill_rows, tag_rows, pm_rows, builder_rows, taxonomy_rows = (
         await asyncio.gather(
             _fetch_junction("SELECT repo_id, language, bytes, percentage FROM repo_languages WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, category_name, is_primary FROM repo_categories WHERE repo_id::text = ANY(:ids)"),
@@ -880,7 +880,6 @@ async def _fetch_page_repos(
             _fetch_junction("SELECT repo_id, tag FROM repo_tags WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, skill FROM repo_pm_skills WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, login, display_name, org_category, is_known_org FROM repo_builders WHERE repo_id::text = ANY(:ids)"),
-            _fetch_junction("SELECT repo_id, industry FROM repo_industries WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, dimension, raw_value, similarity_score, assigned_by FROM repo_taxonomy WHERE repo_id::text = ANY(:ids)"),
         )
     )
@@ -912,10 +911,6 @@ async def _fetch_page_repos(
             "org_category": r.org_category, "is_known_org": r.is_known_org,
         })
 
-    all_industries: dict = defaultdict(list)
-    for r in industry_rows:
-        all_industries[str(r.repo_id)].append({"industry": r.industry})
-
     all_taxonomy: dict = defaultdict(list)
     for r in taxonomy_rows:
         all_taxonomy[str(r.repo_id)].append({
@@ -938,7 +933,7 @@ async def _fetch_page_repos(
             tags=all_tags.get(rid, []),
             pm_skills=all_pm_skills.get(rid, []),
             builders=all_builders.get(rid, []),
-            industries=all_industries.get(rid, []),
+            industries=[],
             lifecycle_groups=lifecycle_groups,
             taxonomy=all_taxonomy.get(rid, []),
         )))
