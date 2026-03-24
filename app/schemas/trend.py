@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 
 class TrendSnapshotOut(BaseModel):
@@ -50,6 +50,12 @@ class IngestionLogOut(BaseModel):
     api_calls_made: int = 0
     errors: list = []
     status: str
+
+    @field_validator("errors", mode="before")
+    @classmethod
+    def coerce_null_errors(cls, v):
+        """JSONB errors column stores null for old rows — coerce to empty list."""
+        return v if v is not None else []
 
 
 class IngestionLogIn(BaseModel):
