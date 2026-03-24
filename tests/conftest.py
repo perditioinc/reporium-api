@@ -66,6 +66,7 @@ TEST_REPO_FIXTURE = {
     "parent_forks": 200,
     "parent_is_archived": False,
     "open_issues_count": 42,
+    "license_spdx": "MIT",
     "commits_last_7_days": 3,
     "commits_last_30_days": 12,
     "commits_last_90_days": 40,

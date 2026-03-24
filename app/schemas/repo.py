@@ -68,6 +68,7 @@ class RepoSummary(BaseModel):
     parent_is_archived: bool = False
     stargazers_count: int | None = None
     open_issues_count: int = 0
+    license_spdx: str | None = None
 
     commits_last_7_days: int = 0
     commits_last_30_days: int = 0
@@ -154,6 +155,7 @@ class RepoIngestItem(BaseModel):
     parent_is_archived: bool = False
     stargazers_count: int | None = None
     open_issues_count: int = 0
+    license_spdx: str | None = None
 
     commits_last_7_days: int = 0
     commits_last_30_days: int = 0
@@ -172,6 +174,8 @@ class RepoIngestItem(BaseModel):
     languages: list[LanguageIngest] = []
     commits: list[CommitIngest] = []
 
+    license_spdx: str | None = None
+
     # Dynamic taxonomy dimensions
     skill_areas: list[str] = []
     industries: list[str] = []
@@ -179,6 +183,7 @@ class RepoIngestItem(BaseModel):
     modalities: list[str] = []
     ai_trends: list[str] = []
     deployment_context: list[str] = []
+    dependencies: list[str] = []
 
 
 class RepoEnrichItem(BaseModel):
