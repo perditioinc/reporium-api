@@ -21,6 +21,7 @@ from app.models.repo import (
     RepoLanguage,
     RepoPMSkill,
     RepoTag,
+    RepoTaxonomy,
 )
 from app.models.trend import GapAnalysis, IngestionLog, TrendSnapshot
 from app.routers.library_full import invalidate_library_cache
@@ -33,6 +34,34 @@ router = APIRouter(prefix="/ingest", dependencies=[Depends(verify_api_key)])
 limiter = Limiter(key_func=get_remote_address)
 
 MAX_BATCH = 100
+
+# Mapping from ingest payload field → taxonomy dimension string
+_TAXONOMY_DIMENSION_MAP = {
+    "skill_areas": "skill_area",
+    "industries": "industry",
+    "use_cases": "use_case",
+    "modalities": "modality",
+    "ai_trends": "ai_trend",
+    "deployment_context": "deployment_context",
+}
+
+
+async def _upsert_repo_taxonomy(db: AsyncSession, repo_id, item_dict: dict) -> None:
+    """Write taxonomy dimension values to repo_taxonomy using INSERT ... ON CONFLICT DO NOTHING."""
+    from sqlalchemy import text as _text
+    for field, dimension in _TAXONOMY_DIMENSION_MAP.items():
+        values = item_dict.get(field) or []
+        for raw_value in values:
+            if not raw_value:
+                continue
+            await db.execute(
+                _text(
+                    "INSERT INTO repo_taxonomy (repo_id, dimension, raw_value, assigned_by) "
+                    "VALUES (:repo_id, :dimension, :raw_value, 'enrichment') "
+                    "ON CONFLICT (repo_id, dimension, raw_value) DO NOTHING"
+                ),
+                {"repo_id": str(repo_id), "dimension": dimension, "raw_value": raw_value},
+            )
 
 
 async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
@@ -82,6 +111,9 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
         await db.execute(RepoCommit.__table__.delete().where(RepoCommit.repo_id == repo.id))
         for commit in item.commits:
             db.add(RepoCommit(repo_id=repo.id, **commit.model_dump()))
+
+    # Write dynamic taxonomy dimensions (ON CONFLICT DO NOTHING — safe to re-run)
+    await _upsert_repo_taxonomy(db, repo.id, item.model_dump())
 
     return repo
 
@@ -150,6 +182,9 @@ async def enrich_repo(
         await db.execute(RepoPMSkill.__table__.delete().where(RepoPMSkill.repo_id == repo.id))
         for skill in item.pm_skills:
             db.add(RepoPMSkill(repo_id=repo.id, skill=skill))
+
+    # Write any new taxonomy dimension values (ON CONFLICT DO NOTHING)
+    await _upsert_repo_taxonomy(db, repo.id, item.model_dump())
 
     await db.commit()
 
