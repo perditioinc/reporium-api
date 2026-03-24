@@ -9,7 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import verify_api_key
+from app.auth import require_ingest_key, verify_api_key
 from app.cache import cache
 from app.database import get_db
 from app.models.repo import (
@@ -30,7 +30,7 @@ from app.schemas.trend import GapAnalysisIn, GapAnalysisOut, IngestionLogIn, Ing
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter(prefix="/ingest", dependencies=[Depends(verify_api_key)])
+router = APIRouter(prefix="/ingest", dependencies=[Depends(verify_api_key), Depends(require_ingest_key)])
 limiter = Limiter(key_func=get_remote_address)
 
 MAX_BATCH = 100
