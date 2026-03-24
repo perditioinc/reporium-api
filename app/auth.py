@@ -1,8 +1,10 @@
 import os
 
-from fastapi import HTTPException, Security, status
+from fastapi import HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.security.api_key import APIKeyHeader
+from google.auth.transport import requests as google_requests
+from google.oauth2 import id_token
 
 from app.config import settings
 
@@ -21,7 +23,7 @@ async def verify_api_key(
 
 
 # ---------------------------------------------------------------------------
-# Admin key — protects admin-only endpoints (POST /admin/*, /admin/taxonomy/*)
+# Admin key - protects admin-only endpoints (POST /admin/*, /admin/taxonomy/*)
 # ---------------------------------------------------------------------------
 
 _ADMIN_KEY_HEADER = APIKeyHeader(name="X-Admin-Key", auto_error=False)
@@ -32,24 +34,51 @@ async def require_admin_key(
 ) -> None:
     admin_key = os.getenv("ADMIN_API_KEY")
     if not admin_key:
-        return  # No key configured — allow (dev mode)
+        return  # No key configured - allow (dev mode)
     if x_admin_key != admin_key:
         raise HTTPException(status_code=403, detail="Invalid admin key")
 
 
 # ---------------------------------------------------------------------------
-# Ingest key — protects ingest pipeline endpoints (POST /ingest/repos, /enrich)
-# Separate credential from admin key so the ingestion pipeline has its own token.
+# Ingest key - protects ingest pipeline endpoints (POST /ingest/*)
+# Accept both X-Ingest-Key and the legacy X-Admin-Key for backward compatibility.
 # ---------------------------------------------------------------------------
 
-_INGEST_KEY_HEADER = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+_INGEST_KEY_HEADER = APIKeyHeader(name="X-Ingest-Key", auto_error=False)
+_LEGACY_INGEST_KEY_HEADER = APIKeyHeader(name="X-Admin-Key", auto_error=False)
 
 
 async def require_ingest_key(
-    x_admin_key: str | None = Security(_INGEST_KEY_HEADER),
+    x_ingest_key: str | None = Security(_INGEST_KEY_HEADER),
+    x_admin_key: str | None = Security(_LEGACY_INGEST_KEY_HEADER),
 ) -> None:
     ingest_key = os.getenv("INGEST_API_KEY")
     if not ingest_key:
-        return  # No key configured — allow (dev mode)
-    if x_admin_key != ingest_key:
-        raise HTTPException(status_code=403, detail="Invalid ingest key")
+        return  # No key configured - allow (dev mode)
+    if x_ingest_key == ingest_key or x_admin_key == ingest_key:
+        return
+    raise HTTPException(status_code=403, detail="Invalid ingest key")
+
+
+async def require_pubsub_push(
+    request: Request,
+    credentials: HTTPAuthorizationCredentials | None = Security(HTTPBearer(auto_error=False)),
+) -> None:
+    audience = settings.pubsub_audience
+    if not audience:
+        return  # No audience configured - allow (dev/manual mode)
+    if credentials is None or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Missing Pub/Sub bearer token")
+
+    try:
+        id_token.verify_oauth2_token(
+            credentials.credentials,
+            google_requests.Request(),
+            audience=audience,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail="Invalid Pub/Sub bearer token") from exc
+
+    # Pub/Sub push headers are optional in local/manual testing, so no additional
+    # hard requirement is enforced once the OIDC token is valid for the audience.
+    _ = request

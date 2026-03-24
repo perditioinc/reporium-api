@@ -70,6 +70,8 @@ class Settings(BaseSettings):
 
     # GCP
     gcp_project: str = "perditio-platform"
+    gcp_project_id: str = "perditio-platform"
+    pubsub_audience: str | None = None
 
     # Mode
     environment: str = "development"  # development, production
