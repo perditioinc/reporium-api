@@ -100,6 +100,11 @@ def cosine_similarity(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
+def _vec_to_pg(arr) -> str:
+    """Format a numpy array as a pgvector literal '[0.1,0.2,...]' for CAST(:v AS vector)."""
+    return "[" + ",".join(f"{x:.8f}" for x in arr.tolist()) + "]"
+
+
 # claude-sonnet-4-20250514 pricing (per 1M tokens)
 _COST_PER_M_INPUT = 3.00
 _COST_PER_M_OUTPUT = 15.00
@@ -198,22 +203,31 @@ async def _run_query(
 
     # 1. Embed the question
     query_embedding = model.encode(req.question)
+    vec_str = _vec_to_pg(query_embedding)
 
-    # 2. Get all embeddings and compute similarity
-    result = await db.execute(text("""
-        SELECT r.id, r.name, r.owner, r.forked_from, r.description,
-               r.parent_stars, r.readme_summary, r.problem_solved,
-               r.integration_tags, r.dependencies,
-               e.embedding
-        FROM repo_embeddings e
-        JOIN repos r ON r.id = e.repo_id;
-    """))
+    # 2. pgvector HNSW index scan — O(log N) instead of O(N) Python loop
+    # Fetch top_k + 10 candidates so we have a buffer for knowledge graph context.
+    # 1 - (embedding_vec <=> query) converts cosine distance to cosine similarity.
+    fetch_k = req.top_k + 10
+    result = await db.execute(
+        text("""
+            SELECT r.id, r.name, r.owner, r.forked_from, r.description,
+                   r.parent_stars, r.readme_summary, r.problem_solved,
+                   r.integration_tags, r.dependencies,
+                   1 - (e.embedding_vec <=> CAST(:vec AS vector)) AS similarity
+            FROM repo_embeddings e
+            JOIN repos r ON r.id = e.repo_id
+            WHERE r.is_private = false
+              AND e.embedding_vec IS NOT NULL
+            ORDER BY e.embedding_vec <=> CAST(:vec AS vector)
+            LIMIT :fetch_k
+        """),
+        {"vec": vec_str, "fetch_k": fetch_k},
+    )
     rows = result.fetchall()
 
     scored = []
     for row in rows:
-        repo_embedding = np.array(json.loads(row.embedding))
-        sim = cosine_similarity(query_embedding, repo_embedding)
         scored.append({
             "id": row.id,
             "name": row.name,
@@ -227,12 +241,11 @@ async def _run_query(
                                 else json.loads(row.integration_tags) if row.integration_tags else [],
             "dependencies": row.dependencies if isinstance(row.dependencies, list)
                            else json.loads(row.dependencies) if row.dependencies else [],
-            "similarity": sim,
+            "similarity": float(row.similarity),
         })
 
-    scored.sort(key=lambda x: x["similarity"], reverse=True)
-    top_candidates = scored[:20]  # Get 20 for context, return top_k
-    top_for_answer = top_candidates[:req.top_k]
+    # Already sorted by pgvector — no Python sort needed
+    top_for_answer = scored[:req.top_k]
 
     # 3. Build context for Claude
     # Repo content fields are wrapped in XML-style delimiters so injected
