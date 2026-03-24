@@ -7,10 +7,10 @@ import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
-os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test")
-os.environ.setdefault("INGESTION_API_KEY", "test-api-key")
-os.environ.setdefault("GH_USERNAME", "testuser")
-os.environ.setdefault("REDIS_URL", "")  # disable Redis in tests
+os.environ["DATABASE_URL"] = "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test"
+os.environ["INGESTION_API_KEY"] = "test-api-key"
+os.environ["GH_USERNAME"] = "testuser"
+os.environ["REDIS_URL"] = ""  # disable Redis in tests
 
 import app.database as db_module
 from app.database import Base, get_db
@@ -65,6 +65,7 @@ TEST_REPO_FIXTURE = {
     "parent_stars": 1000,
     "parent_forks": 200,
     "parent_is_archived": False,
+    "open_issues_count": 42,
     "commits_last_7_days": 3,
     "commits_last_30_days": 12,
     "commits_last_90_days": 40,
