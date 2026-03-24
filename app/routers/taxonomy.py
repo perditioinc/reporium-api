@@ -20,7 +20,7 @@ from pydantic import BaseModel
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import verify_api_key
+from app.auth import require_admin_key, verify_api_key
 from app.database import get_db
 from app.models.repo import SkillArea, TaxonomyValue
 
@@ -196,7 +196,7 @@ async def list_taxonomy_values(
     }
 
 
-@router.post("/admin/taxonomy/rebuild", dependencies=[Depends(verify_api_key)])
+@router.post("/admin/taxonomy/rebuild", dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def rebuild_taxonomy(
     body: RebuildBody = RebuildBody(),
     db: AsyncSession = Depends(get_db),
@@ -240,7 +240,7 @@ async def rebuild_taxonomy(
     return {"status": "ok", "upserted": upserted, "dimensions": dimensions}
 
 
-@router.post("/admin/taxonomy/embed", dependencies=[Depends(verify_api_key)])
+@router.post("/admin/taxonomy/embed", dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def embed_taxonomy(db: AsyncSession = Depends(get_db)) -> dict:
     """
     Generate embeddings for taxonomy_values that are missing embedding_vec.
@@ -272,7 +272,7 @@ async def embed_taxonomy(db: AsyncSession = Depends(get_db)) -> dict:
     return {"status": "ok", "embedded": embedded}
 
 
-@router.post("/admin/taxonomy/assign", dependencies=[Depends(verify_api_key)])
+@router.post("/admin/taxonomy/assign", dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def assign_taxonomy(
     body: AssignBody = AssignBody(),
     db: AsyncSession = Depends(get_db),

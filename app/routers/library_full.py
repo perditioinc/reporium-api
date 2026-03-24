@@ -536,6 +536,7 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
             for t in (taxonomy or [])
         ],
         "problemSolved": repo.get("problem_solved"),
+        "licenseSpdx": repo.get("license_spdx"),
         "builders": [
             {
                 "login": b["login"],
