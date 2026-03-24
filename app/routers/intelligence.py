@@ -476,12 +476,18 @@ async def _portfolio_insights(db: AsyncSession) -> PortfolioInsightsResponse:
     if cached:
         return PortfolioInsightsResponse(**cached)
 
-    taxonomy_gaps, stale_repos, velocity_leaders, near_duplicate_clusters = await asyncio.gather(
+    results = await asyncio.gather(
         _taxonomy_gap_signals(db),
         _stale_repo_signals(db),
         _velocity_leader_signals(db),
         _near_duplicate_signals(db),
+        return_exceptions=True,
     )
+    logger = logging.getLogger(__name__)
+    taxonomy_gaps = results[0] if not isinstance(results[0], Exception) else (logger.error("_taxonomy_gap_signals failed: %s", results[0]) or [])
+    stale_repos = results[1] if not isinstance(results[1], Exception) else (logger.error("_stale_repo_signals failed: %s", results[1]) or [])
+    velocity_leaders = results[2] if not isinstance(results[2], Exception) else (logger.error("_velocity_leader_signals failed: %s", results[2]) or [])
+    near_duplicate_clusters = results[3] if not isinstance(results[3], Exception) else (logger.error("_near_duplicate_signals failed: %s", results[3]) or [])
 
     response = PortfolioInsightsResponse(
         generated_at=datetime.now(timezone.utc).isoformat(),
