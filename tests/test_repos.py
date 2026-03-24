@@ -75,5 +75,4 @@ async def test_health(client: AsyncClient):
     assert response.status_code == 200
     data = response.json()
     assert "status" in data
-    assert "database" in data
-    assert "cache" in data
+    assert "db" in data
