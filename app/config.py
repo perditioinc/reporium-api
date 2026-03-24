@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     gcp_project_id: str = "perditio-platform"
     pubsub_audience: str | None = None
 
+    # Webhooks
+    github_webhook_secret: str = ""
+
     # Mode
     environment: str = "development"  # development, production
 
