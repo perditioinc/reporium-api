@@ -328,6 +328,7 @@ def _make_db_repo(**kwargs) -> dict:
         "parent_forks": None,
         "parent_is_archived": False,
         "stargazers_count": None,
+        "open_issues_count": 0,
         "commits_last_7_days": 0,
         "commits_last_30_days": 0,
         "commits_last_90_days": 0,
@@ -401,3 +402,13 @@ class TestBuildEnrichedRepoStars:
         )
         enriched = _build_enriched_repo(repo, [], [], [], [], [])
         assert enriched["forks"] == 0
+
+    def test_open_issues_count_round_trips_from_repo_row(self):
+        """Repo open issue counts should be exposed on the frontend contract."""
+        repo = _make_db_repo(
+            is_fork=False,
+            stargazers_count=10,
+            open_issues_count=17,
+        )
+        enriched = _build_enriched_repo(repo, [], [], [], [], [])
+        assert enriched["openIssuesCount"] == 17
