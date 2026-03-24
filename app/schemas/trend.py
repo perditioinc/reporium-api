@@ -1,7 +1,7 @@
 from datetime import datetime
 from uuid import UUID
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 class TrendSnapshotOut(BaseModel):
@@ -54,7 +54,6 @@ class IngestionLogOut(BaseModel):
     @field_validator("errors", mode="before")
     @classmethod
     def coerce_null_errors(cls, v):
-        """JSONB errors column stores null for old rows — coerce to empty list."""
         return v if v is not None else []
 
 
@@ -77,7 +76,6 @@ class StatsResponse(BaseModel):
     top_tags: list[str]
     sync_states: dict[str, int]
     last_ingestion: IngestionLogOut | None = None
-    # Extended fields
     taxonomy_dimension_counts: dict[str, int] = {}
     has_tests_count: int = 0
     has_ci_count: int = 0
@@ -89,5 +87,30 @@ class TaxonomyGapItem(BaseModel):
     dimension: str
     name: str
     repo_count: int
-    gap_score: float   # 0.0 (well covered) → 1.0 (completely absent)
-    severity: str      # "low" | "medium" | "high"
+    gap_score: float
+    severity: str
+
+
+class TrendReportPeriodOut(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    from_: datetime | None = Field(default=None, alias="from")
+    to: datetime | None = None
+    snapshots: int = 0
+
+
+class TrendReportSignalOut(BaseModel):
+    name: str
+    changePercent: float
+    repoCount: int
+
+
+class TrendReportOut(BaseModel):
+    generatedAt: datetime
+    period: TrendReportPeriodOut
+    trending: list[TrendReportSignalOut]
+    emerging: list[TrendReportSignalOut]
+    cooling: list[TrendReportSignalOut]
+    stable: list[TrendReportSignalOut]
+    newReleases: list[dict]
+    insights: list[str]

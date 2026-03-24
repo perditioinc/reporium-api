@@ -7,14 +7,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
 from app.cache import cache
-from app.database import check_db_connection, engine
+from app.database import async_session_factory, check_db_connection, engine
 from app.routers import admin, analytics, ingest, intelligence, library, library_full, platform, repos, search, taxonomy, trends, webhooks, wiki
 
 
@@ -239,43 +239,28 @@ if __name__ == "__main__":
 
 
 @app.get("/health")
-async def health() -> dict:
+async def health():
     from sqlalchemy import text
-    from app.database import async_session_factory
-    from app.models.trend import IngestionLog
-    from sqlalchemy import select
 
-    db_ok = False
+    db_error: str | None = None
     try:
         async with async_session_factory() as session:
             await session.execute(text("SELECT 1"))
-            db_ok = True
     except Exception as e:
+        db_error = str(e)
         logger.warning(f"DB health check failed: {e}")
 
-    last_ingestion = None
-    if db_ok:
-        try:
-            async with async_session_factory() as session:
-                stmt = (
-                    select(IngestionLog)
-                    .order_by(IngestionLog.started_at.desc())
-                    .limit(1)
-                )
-                result = await session.execute(stmt)
-                log = result.scalar_one_or_none()
-                if log:
-                    last_ingestion = {
-                        "started_at": log.started_at.isoformat(),
-                        "status": log.status,
-                        "mode": log.mode,
-                    }
-        except Exception:
-            pass
+    if db_error:
+        return JSONResponse(
+            status_code=503,
+            content={
+                "status": "degraded",
+                "db": "error",
+                "detail": db_error,
+            },
+        )
 
     return {
-        "status": "ok" if db_ok else "degraded",
-        "database": "ok" if db_ok else "error",
-        "cache": "ok" if await cache.is_available() else "disabled",
-        "last_ingestion": last_ingestion,
+        "status": "ok",
+        "db": "ok",
     }
