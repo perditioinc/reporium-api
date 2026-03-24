@@ -29,6 +29,7 @@ class Repo(Base):
     ahead_by: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     # Dates
+    github_created_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
     upstream_created_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     forked_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
     your_last_push_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
