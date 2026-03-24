@@ -1,105 +1,55 @@
 # Load Benchmarking
 
-This directory provides a lightweight Locust harness for recurring load and concurrency checks against `reporium-api`.
+This directory provides a Locust load test suite for `reporium-api`.
 
 ## Prerequisites
 
 - Python 3.11+
-- repo dependencies installed
-- Locust installed locally:
+- Locust installed:
 
 ```bash
-pip install locust
+pip install -r requirements-dev.txt
 ```
 
-- API target available locally or in staging
+## Running the Load Tests
 
-## Files
+```bash
+locust -f tests/load/locustfile.py --host https://reporium-api-573778300586.us-central1.run.app
+```
 
-- `tests/load/locustfile.py`: baseline Locust workload for `/library/full` and `/intelligence/ask`
+This opens the Locust web UI at `http://localhost:8089` where you can configure user count and spawn rate interactively.
+
+### Headless (CI / scripted) runs
+
+```bash
+locust -f tests/load/locustfile.py \
+  --host https://reporium-api-573778300586.us-central1.run.app \
+  --headless -u 10 -r 2 -t 2m
+```
 
 ## Endpoints Covered
 
-- `GET /library/full`
-- `POST /intelligence/ask`
+| Method | Path | Weight | Notes |
+|--------|------|--------|-------|
+| `GET` | `/library/full?page=1&pageSize=200` | 3 | Most common read |
+| `GET` | `/library` | 2 | |
+| `GET` | `/stats` | 2 | |
+| `POST` | `/intelligence/ask` | 1 | Body: `{"question": "what AI tools do you use for testing?"}` |
+| `GET` | `/health` | 1 | |
 
-### `/intelligence/ask` payload
+## User Configuration
 
-Default request body:
-
-```json
-{
-  "question": "What repositories help with AI evaluation and observability?",
-  "top_k": 8
-}
-```
-
-Override with environment variables:
-
-- `LOAD_INTELLIGENCE_QUESTION`
-- `LOAD_INTELLIGENCE_TOP_K`
-- `LOAD_INTELLIGENCE_ASK_PATH`
-
-If you want to exercise an authenticated variant instead, set:
-
-- `LOAD_INTELLIGENCE_ASK_PATH=/intelligence/query`
-- `LOAD_TEST_BEARER_TOKEN=<token>`
-
-## Local Runs
-
-Set the target host:
-
-```bash
-$env:LOCUST_HOST="http://localhost:8000"
-```
-
-### Baseline sustained
-
-Target: approximately 1 request/second overall.
-
-```bash
-locust -f tests/load/locustfile.py --host $env:LOCUST_HOST --headless -u 1 -r 1 -t 5m
-```
-
-### Burst
-
-Target: 10 users ramped immediately for 60 seconds.
-
-```bash
-locust -f tests/load/locustfile.py --host $env:LOCUST_HOST --headless -u 10 -r 10 -t 60s
-```
-
-## Staging Runs
-
-```bash
-$env:LOCUST_HOST="https://your-staging-host"
-locust -f tests/load/locustfile.py --host $env:LOCUST_HOST --headless -u 10 -r 10 -t 60s
-```
-
-If staging requires an authenticated intelligence endpoint:
-
-```bash
-$env:LOAD_INTELLIGENCE_ASK_PATH="/intelligence/query"
-$env:LOAD_TEST_BEARER_TOKEN="replace-me"
-locust -f tests/load/locustfile.py --host $env:LOCUST_HOST --headless -u 10 -r 10 -t 60s
-```
+- `wait_time = between(1, 3)` seconds between tasks per simulated user
+- Tasks use `@task(weight)` decorators to control relative frequency
 
 ## Metrics To Watch
 
-- p50, p95, and p99 latency
-- failure rate per endpoint
-- request throughput
-- saturation of `/library/full` cache behavior
-- downstream error responses from `/intelligence/ask`
+- p50, p95, and p99 latency per endpoint
+- Failure rate
+- Request throughput (RPS)
 
 ## Proposed SLOs
 
-- p95 `GET /library/full` < 2s when cached
+- p95 `GET /library/full` < 2s (when cached)
 - p95 `POST /intelligence/ask` < 15s
 - p99 error rate < 1%
-
-## Monthly Run Guidance
-
-- run the baseline profile monthly
-- run the burst profile before major releases and after infra changes
-- archive the command, target environment, and key latency/error metrics with the run notes
