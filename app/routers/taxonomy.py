@@ -156,7 +156,7 @@ class AssignBody(BaseModel):
     threshold: float = 0.65
 
 
-@router.get("/dimensions")
+@router.get("/dimensions", response_model=dict)
 async def list_dimensions(db: AsyncSession = Depends(get_db)) -> dict:
     """Return distinct dimension strings from repo_taxonomy with repo counts."""
     result = await db.execute(text(
@@ -174,7 +174,7 @@ async def list_dimensions(db: AsyncSession = Depends(get_db)) -> dict:
     }
 
 
-@router.get("/{dimension}")
+@router.get("/{dimension}", response_model=dict)
 async def list_taxonomy_values(
     dimension: str,
     db: AsyncSession = Depends(get_db),
@@ -196,7 +196,7 @@ async def list_taxonomy_values(
     }
 
 
-@router.post("/admin/taxonomy/rebuild", dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
+@router.post("/admin/taxonomy/rebuild", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def rebuild_taxonomy(
     body: RebuildBody = RebuildBody(),
     db: AsyncSession = Depends(get_db),
@@ -240,7 +240,7 @@ async def rebuild_taxonomy(
     return {"status": "ok", "upserted": upserted, "dimensions": dimensions}
 
 
-@router.post("/admin/taxonomy/embed", dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
+@router.post("/admin/taxonomy/embed", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def embed_taxonomy(db: AsyncSession = Depends(get_db)) -> dict:
     """
     Generate embeddings for taxonomy_values that are missing embedding_vec.
@@ -272,7 +272,7 @@ async def embed_taxonomy(db: AsyncSession = Depends(get_db)) -> dict:
     return {"status": "ok", "embedded": embedded}
 
 
-@router.post("/admin/taxonomy/assign", dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
+@router.post("/admin/taxonomy/assign", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def assign_taxonomy(
     body: AssignBody = AssignBody(),
     db: AsyncSession = Depends(get_db),

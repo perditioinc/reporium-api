@@ -12,7 +12,7 @@ from app.models.repo import Repo, RepoCategory, RepoTag
 from app.schemas.library import CategorySummary, LibraryResponse, LibraryStats, TagMetric
 from app.schemas.repo import RepoSummary
 
-router = APIRouter()
+router = APIRouter(tags=["Library"])
 
 
 def _repo_to_summary(repo: Repo) -> RepoSummary:

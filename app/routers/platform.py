@@ -11,10 +11,10 @@ from app.auth import verify_api_key
 from app.database import get_db
 from app.models.repo import Repo, RepoAIDevSkill, RepoCategory
 
-router = APIRouter()
+router = APIRouter(tags=["Platform"])
 
 
-@router.get("/metrics/latest")
+@router.get("/metrics/latest", response_model=dict)
 async def metrics_latest(db: AsyncSession = Depends(get_db)) -> dict:
     """Platform metrics for reporium-metrics to consume."""
     total = (await db.execute(select(func.count(Repo.id)))).scalar_one()
@@ -53,7 +53,7 @@ async def metrics_latest(db: AsyncSession = Depends(get_db)) -> dict:
     }
 
 
-@router.get("/audit/status")
+@router.get("/audit/status", response_model=dict)
 async def audit_status(db: AsyncSession = Depends(get_db)) -> dict:
     """Platform health for reporium-roadmap to consume."""
     db_ok = False
@@ -81,7 +81,7 @@ async def audit_status(db: AsyncSession = Depends(get_db)) -> dict:
     }
 
 
-@router.post("/events/ingest")
+@router.post("/events/ingest", response_model=dict)
 async def events_ingest(
     payload: dict,
     _api_key: str = Depends(verify_api_key),
