@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -35,17 +36,21 @@ limiter = Limiter(
 app = FastAPI(
     title="Reporium API",
     description=(
-        "The central API for the Reporium platform — tracks 826+ AI development tools on GitHub.\n\n"
+        "The central API for the Reporium platform — tracks 1,400+ AI development tools on GitHub.\n\n"
         "## Rate Limits\n"
         "| Endpoint | Limit |\n"
         "|----------|-------|\n"
-        "| `GET /repos`, `/stats`, `/library` | 100 requests/minute |\n"
-        "| `GET /search` | 30 requests/minute |\n"
-        "| `POST /ingest/*` | 10 requests/minute |\n"
+        "| `GET /repos`, `/stats`, `/library`, `/library/full` | 200/hour, 30/minute |\n"
+        "| `GET /search` | 200/hour, 30/minute |\n"
+        "| `POST /intelligence/ask`, `/intelligence/query` | 200/hour, 30/minute |\n"
+        "| `POST /ingest/*` | 200/hour, 30/minute |\n"
         "| `GET /health` | No limit |\n\n"
-        "Rate limit headers are included in every response."
+        "Rate limit headers are included in every response.\n\n"
+        "## Repo Lookups\n"
+        "All repo endpoints use `owner/name` (e.g. `perditioinc/reporium-api`). "
+        "Bare-name lookups are not supported."
     ),
-    version="1.0.0",
+    version="1.1.0",
     docs_url=None,      # disable default — we serve Scalar
     redoc_url=None,     # disable default — Scalar replaces both
     lifespan=lifespan,
@@ -54,6 +59,7 @@ app = FastAPI(
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
+app.add_middleware(GZipMiddleware, minimum_size=1000)  # compress responses > 1KB
 
 
 @app.get("/docs", include_in_schema=False)
