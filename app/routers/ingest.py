@@ -43,6 +43,7 @@ _TAXONOMY_DIMENSION_MAP = {
     "modalities": "modality",
     "ai_trends": "ai_trend",
     "deployment_context": "deployment_context",
+    "dependencies": "dependency",
 }
 
 
@@ -70,7 +71,9 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
     repo = result.scalar_one_or_none()
 
     repo_fields = item.model_dump(
-        exclude={"tags", "categories", "builders", "ai_dev_skills", "pm_skills", "languages", "commits"}
+        exclude={"tags", "categories", "builders", "ai_dev_skills", "pm_skills", "languages", "commits",
+                 "skill_areas", "industries", "use_cases", "modalities", "ai_trends", "deployment_context",
+                 "dependencies"}
     )
 
     if repo is None:
