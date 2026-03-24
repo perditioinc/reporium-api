@@ -98,73 +98,190 @@ KNOWN_ORG_CATEGORIES: dict = {
     'deepset-ai':      ('startup',   'deepset'),
 }
 
-# AI Dev Skill taxonomy — mirrors frontend buildTaxonomy.ts AI_DEV_SKILLS exactly.
-# Used to aggregate repo counts per skill group for the AI Dev Coverage section.
-_AI_DEV_SKILL_GROUPS: dict = {
-    'Observability & Monitoring': [
-        'Langfuse', 'Phoenix', 'OpenLIT', 'OpenLLMetry', 'Helicone',
-        'Traceloop', 'Weights & Biases', 'MLflow', 'OpenTelemetry',
-        'Monitoring', 'Tracing', 'LLM Monitoring',
-    ],
-    'Evals & Benchmarking': [
-        'DeepEval', 'RAGAS', 'PromptFoo', 'LM Eval Harness', 'Evals',
-        'Benchmarking', 'Red Teaming', 'Garak', 'PyRIT', 'MMLU', 'HumanEval',
-    ],
-    'Inference & Serving': [
-        'vLLM', 'SGLang', 'TGI', 'Triton', 'TensorRT', 'ONNX',
-        'llama.cpp', 'Llamafile', 'LLM Serving', 'Quantization',
-        'Speculative Decoding', 'KV Cache', 'GPU / CUDA', 'Inference',
-    ],
-    'Model Training & Fine-tuning': [
-        'Unsloth', 'Axolotl', 'TRL', 'TorchTune', 'LoRA / PEFT',
-        'RLHF', 'DPO', 'GRPO', 'DeepSpeed', 'FSDP',
-        'Synthetic Data', 'Distillation', 'Fine-Tuning', 'MergeKit',
-    ],
-    'Structured Output & Reliability': [
-        'Instructor', 'Outlines', 'Guidance', 'Guardrails',
-        'NeMo Guardrails', 'Structured Output', 'Tool Use', 'Pydantic',
-    ],
-    'AI Agents & Orchestration': [
-        'AI Agents', 'LangChain', 'LangGraph', 'DSPy', 'Semantic Kernel',
-        'Haystack', 'Agno', 'CrewAI', 'AutoGen', 'Swarm',
-        'OpenAI Agents SDK', 'Multi-Agent', 'MCP', 'Autonomous Systems',
-    ],
-    'RAG & Knowledge': [
-        'RAG', 'Vector Database', 'Embeddings', 'Knowledge Graph',
-        'Chroma', 'Qdrant', 'Milvus', 'Weaviate', 'Pinecone', 'pgvector',
-        'Reranking', 'Hybrid Search', 'GraphRAG', 'Document Processing',
-        'LlamaIndex', 'LightRAG',
-    ],
-    'Context Engineering': [
-        'Context Engineering', 'Agent Memory', 'Letta / MemGPT', 'Mem0',
-        'Long Context', 'Planning / CoT', 'Prompt Engineering',
-    ],
-    'Security & Safety': [
-        'AI Safety', 'Red Teaming', 'Garak', 'PyRIT', 'Prompt Injection',
-        'Guardrails', 'Watermarking', 'Privacy-Preserving AI', 'Alignment',
-    ],
-    'Coding Assistants & Dev Tools': [
-        'OpenHands', 'Cline', 'Continue.dev', 'Aider', 'SWE-Agent',
-        'Claude Code', 'Gemini CLI', 'Kilocode', 'CLI Tool', 'Automation',
-    ],
-    'MLOps & Data': [
-        'MLOps', 'DVC', 'ZenML', 'Prefect', 'Airflow', 'Ray',
-        'Kubeflow', 'Feature Store', 'MLflow', 'Docker', 'Kubernetes',
-        'CI/CD', 'Model Registry',
-    ],
-    'Multimodal & Vision': [
-        'Computer Vision', 'Image Generation', 'Video Generation',
-        'Multimodal AI', 'Point Cloud / 3D Vision', 'Object Detection',
-        'Segmentation', 'Depth Estimation', '3D Reconstruction',
-        'Text to Speech', 'Speech to Text', 'Music / Audio AI',
-    ],
+# AI Dev Skill taxonomy — 28 skill areas across 6 lifecycle groups.
+# Each skill area is a direct match (stored verbatim in repo_ai_dev_skills).
+
+# Ordered list of the 28 skill areas in taxonomy order.
+_AI_DEV_SKILLS_ORDERED: list = [
+    # Foundation & Training
+    "Foundation Model Architecture",
+    "Fine-tuning & Alignment",
+    "Data Engineering",
+    "Synthetic Data",
+    # Inference & Deployment
+    "Inference & Serving",
+    "Model Compression",
+    "Edge AI",
+    # LLM Application Layer
+    "Agents & Orchestration",
+    "RAG & Retrieval",
+    "Context Engineering",
+    "Tool Use",
+    "Structured Output",
+    "Prompt Engineering",
+    "Knowledge Graphs",
+    # Eval/Safety/Ops
+    "Evaluation",
+    "Security & Guardrails",
+    "Observability",
+    "MLOps",
+    "AI Governance",
+    # Modality-Specific
+    "Computer Vision",
+    "Speech & Audio",
+    "Generative Media",
+    "NLP",
+    "Multimodal",
+    # Applied AI
+    "Coding Assistants",
+    "Robotics",
+    "AI for Science",
+    "Recommendation Systems",
+]
+
+# Lifecycle group lookup is now DB-driven (skill_areas table).
+# _get_lifecycle_groups(db) queries the DB and caches for 5 minutes.
+# This dict is a compile-time fallback used only when the DB is unavailable.
+_LIFECYCLE_GROUPS_FALLBACK: dict = {
+    "Foundation Model Architecture": "Foundation & Training",
+    "Fine-tuning & Alignment": "Foundation & Training",
+    "Data Engineering": "Foundation & Training",
+    "Synthetic Data": "Foundation & Training",
+    "Inference & Serving": "Inference & Deployment",
+    "Model Compression": "Inference & Deployment",
+    "Edge AI": "Inference & Deployment",
+    "Agents & Orchestration": "LLM Application Layer",
+    "RAG & Retrieval": "LLM Application Layer",
+    "Context Engineering": "LLM Application Layer",
+    "Tool Use": "LLM Application Layer",
+    "Structured Output": "LLM Application Layer",
+    "Prompt Engineering": "LLM Application Layer",
+    "Knowledge Graphs": "LLM Application Layer",
+    "Evaluation": "Eval / Safety / Ops",
+    "Security & Guardrails": "Eval / Safety / Ops",
+    "Observability": "Eval / Safety / Ops",
+    "MLOps": "Eval / Safety / Ops",
+    "AI Governance": "Eval / Safety / Ops",
+    "Computer Vision": "Modality-Specific",
+    "Speech & Audio": "Modality-Specific",
+    "Generative Media": "Modality-Specific",
+    "NLP": "Modality-Specific",
+    "Multimodal": "Modality-Specific",
+    "Coding Assistants": "Applied AI",
+    "Robotics": "Applied AI",
+    "AI for Science": "Applied AI",
+    "Recommendation Systems": "Applied AI",
 }
 
-# Reverse lookup: tag (case-insensitive) → skill group name
-_SKILL_TAG_TO_GROUP: dict = {}
-for _group, _tags in _AI_DEV_SKILL_GROUPS.items():
-    for _tag in _tags:
-        _SKILL_TAG_TO_GROUP[_tag.lower()] = _group
+_lifecycle_groups_cache: dict = {}
+_LIFECYCLE_GROUPS_TTL = 300  # 5 minutes
+
+
+async def _get_lifecycle_groups(db: AsyncSession) -> dict:
+    """Return {skill_area_name: lifecycle_group} from the skill_areas table.
+
+    Results are cached in memory for 5 minutes. Falls back to the compile-time
+    dict if the table is unavailable (e.g. migration not yet applied).
+    """
+    now = time.time()
+    cached = _lifecycle_groups_cache.get("data")
+    if cached and _lifecycle_groups_cache.get("expires_at", 0) > now:
+        return cached
+
+    try:
+        result = await db.execute(text("SELECT name, lifecycle_group FROM skill_areas"))
+        rows = result.fetchall()
+        if rows:
+            mapping = {row.name: row.lifecycle_group for row in rows}
+            _lifecycle_groups_cache["data"] = mapping
+            _lifecycle_groups_cache["expires_at"] = now + _LIFECYCLE_GROUPS_TTL
+            return mapping
+    except Exception:
+        logger.warning("_get_lifecycle_groups: skill_areas table unavailable, using fallback", exc_info=True)
+
+    return _LIFECYCLE_GROUPS_FALLBACK
+
+# Keep a set for O(1) membership checks in _build_ai_dev_skill_stats
+_AI_DEV_SKILL_SET: set = set(_AI_DEV_SKILLS_ORDERED)
+
+# Legacy reverse-lookup retained for tag-based matching (enrichedTags / topics).
+# Maps individual tool/framework tags → the nearest new skill area.
+_SKILL_TAG_TO_GROUP: dict = {
+    # Observability tools → Observability
+    'langfuse': 'Observability', 'phoenix': 'Observability', 'openlit': 'Observability',
+    'openllmetry': 'Observability', 'helicone': 'Observability', 'traceloop': 'Observability',
+    'weights & biases': 'Observability', 'mlflow': 'Observability',
+    'opentelemetry': 'Observability', 'monitoring': 'Observability',
+    'tracing': 'Observability', 'llm monitoring': 'Observability',
+    # Evaluation tools → Evaluation
+    'deepeval': 'Evaluation', 'ragas': 'Evaluation', 'promptfoo': 'Evaluation',
+    'lm eval harness': 'Evaluation', 'evals': 'Evaluation', 'benchmarking': 'Evaluation',
+    'red teaming': 'Evaluation', 'garak': 'Evaluation', 'pyrit': 'Evaluation',
+    'mmlu': 'Evaluation', 'humaneval': 'Evaluation',
+    # Inference tools → Inference & Serving
+    'vllm': 'Inference & Serving', 'sglang': 'Inference & Serving', 'tgi': 'Inference & Serving',
+    'triton': 'Inference & Serving', 'tensorrt': 'Inference & Serving', 'onnx': 'Inference & Serving',
+    'llama.cpp': 'Inference & Serving', 'llamafile': 'Inference & Serving',
+    'llm serving': 'Inference & Serving', 'quantization': 'Model Compression',
+    'speculative decoding': 'Inference & Serving', 'kv cache': 'Inference & Serving',
+    'gpu / cuda': 'Inference & Serving', 'inference': 'Inference & Serving',
+    # Training tools → Fine-tuning & Alignment
+    'unsloth': 'Fine-tuning & Alignment', 'axolotl': 'Fine-tuning & Alignment',
+    'trl': 'Fine-tuning & Alignment', 'torchtune': 'Fine-tuning & Alignment',
+    'lora / peft': 'Fine-tuning & Alignment', 'rlhf': 'Fine-tuning & Alignment',
+    'dpo': 'Fine-tuning & Alignment', 'grpo': 'Fine-tuning & Alignment',
+    'deepspeed': 'Fine-tuning & Alignment', 'fsdp': 'Fine-tuning & Alignment',
+    'synthetic data': 'Synthetic Data', 'distillation': 'Fine-tuning & Alignment',
+    'fine-tuning': 'Fine-tuning & Alignment', 'mergekit': 'Fine-tuning & Alignment',
+    # Structured output → Structured Output
+    'instructor': 'Structured Output', 'outlines': 'Structured Output',
+    'guidance': 'Structured Output', 'guardrails': 'Security & Guardrails',
+    'nemo guardrails': 'Security & Guardrails', 'structured output': 'Structured Output',
+    'tool use': 'Tool Use', 'pydantic': 'Structured Output',
+    # Agents → Agents & Orchestration
+    'ai agents': 'Agents & Orchestration', 'langchain': 'Agents & Orchestration',
+    'langgraph': 'Agents & Orchestration', 'dspy': 'Agents & Orchestration',
+    'semantic kernel': 'Agents & Orchestration', 'haystack': 'Agents & Orchestration',
+    'agno': 'Agents & Orchestration', 'crewai': 'Agents & Orchestration',
+    'autogen': 'Agents & Orchestration', 'swarm': 'Agents & Orchestration',
+    'openai agents sdk': 'Agents & Orchestration', 'multi-agent': 'Agents & Orchestration',
+    'mcp': 'Tool Use', 'autonomous systems': 'Agents & Orchestration',
+    # RAG → RAG & Retrieval
+    'rag': 'RAG & Retrieval', 'vector database': 'RAG & Retrieval',
+    'embeddings': 'RAG & Retrieval', 'knowledge graph': 'Knowledge Graphs',
+    'chroma': 'RAG & Retrieval', 'qdrant': 'RAG & Retrieval', 'milvus': 'RAG & Retrieval',
+    'weaviate': 'RAG & Retrieval', 'pinecone': 'RAG & Retrieval', 'pgvector': 'RAG & Retrieval',
+    'reranking': 'RAG & Retrieval', 'hybrid search': 'RAG & Retrieval',
+    'graphrag': 'Knowledge Graphs', 'document processing': 'RAG & Retrieval',
+    'llamaindex': 'RAG & Retrieval', 'lightrag': 'RAG & Retrieval',
+    # Context → Context Engineering
+    'context engineering': 'Context Engineering', 'agent memory': 'Context Engineering',
+    'letta / memgpt': 'Context Engineering', 'mem0': 'Context Engineering',
+    'long context': 'Context Engineering', 'planning / cot': 'Context Engineering',
+    'prompt engineering': 'Prompt Engineering',
+    # Security → Security & Guardrails
+    'ai safety': 'Security & Guardrails', 'prompt injection': 'Security & Guardrails',
+    'watermarking': 'Security & Guardrails', 'privacy-preserving ai': 'Security & Guardrails',
+    'alignment': 'Fine-tuning & Alignment',
+    # Coding assistants → Coding Assistants
+    'openhands': 'Coding Assistants', 'cline': 'Coding Assistants',
+    'continue.dev': 'Coding Assistants', 'aider': 'Coding Assistants',
+    'swe-agent': 'Coding Assistants', 'claude code': 'Coding Assistants',
+    'gemini cli': 'Coding Assistants', 'kilocode': 'Coding Assistants',
+    'cli tool': 'Coding Assistants', 'automation': 'Coding Assistants',
+    # MLOps → MLOps
+    'mlops': 'MLOps', 'dvc': 'MLOps', 'zenml': 'MLOps', 'prefect': 'MLOps',
+    'airflow': 'MLOps', 'ray': 'MLOps', 'kubeflow': 'MLOps',
+    'feature store': 'MLOps', 'docker': 'MLOps', 'kubernetes': 'MLOps',
+    'ci/cd': 'MLOps', 'model registry': 'MLOps',
+    # Multimodal / Vision → Modality-Specific skill areas
+    'computer vision': 'Computer Vision', 'image generation': 'Generative Media',
+    'video generation': 'Generative Media', 'multimodal ai': 'Multimodal',
+    'point cloud / 3d vision': 'Computer Vision', 'object detection': 'Computer Vision',
+    'segmentation': 'Computer Vision', 'depth estimation': 'Computer Vision',
+    '3d reconstruction': 'Computer Vision', 'text to speech': 'Speech & Audio',
+    'speech to text': 'Speech & Audio', 'music / audio ai': 'Speech & Audio',
+}
 
 
 router = APIRouter(tags=["Library"])
@@ -205,6 +322,9 @@ def sanitize_repo(repo: dict) -> dict:
     if not repo.get("readmeSummary"):
         repo["readmeSummary"] = repo["description"]
         logger.warning("Contract fallback: %s missing readmeSummary", name)
+
+    if repo.get("openIssuesCount") is None:
+        repo["openIssuesCount"] = 0
 
     if not repo.get("primaryCategory") or repo["primaryCategory"] == "Other":
         repo["primaryCategory"] = "Uncategorized"
@@ -291,7 +411,8 @@ def _iso(val) -> str:
 
 def _build_enriched_repo(repo: dict, languages: list, categories: list,
                          ai_skills: list, tags: list, pm_skills: list,
-                         builders: list = None, industries: list = None) -> dict:
+                         builders: list = None, industries: list = None,
+                         lifecycle_groups: dict = None) -> dict:
     """Transform a DB repo row + junction data into the frontend EnrichedRepo shape."""
     forked_from = repo.get("forked_from")
     owner = repo.get("owner", "perditioinc")
@@ -367,6 +488,7 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         "enrichedTags": list(dict.fromkeys([s["skill"] for s in ai_skills] + [t["tag"] for t in tags])),
         "stars": repo.get("parent_stars") if repo.get("is_fork") else (repo.get("stargazers_count") or 0),
         "forks": repo.get("parent_forks") if repo.get("is_fork") else 0,
+        "openIssuesCount": repo.get("open_issues_count") or 0,
         "lastUpdated": _iso(repo.get("github_updated_at") or repo.get("updated_at")),
         "url": repo.get("github_url") or f"https://github.com/{owner}/{name}",
         "isArchived": repo.get("parent_is_archived") or False,
@@ -396,7 +518,10 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
             "recentCommits": [],
         },
         "latestRelease": None,
-        "aiDevSkills": [s["skill"] for s in ai_skills],
+        "aiDevSkills": [
+            {"skill": s["skill"], "lifecycleGroup": (lifecycle_groups or _LIFECYCLE_GROUPS_FALLBACK).get(s["skill"], "")}
+            for s in ai_skills
+        ],
         "pmSkills": [s["skill"] for s in pm_skills],
         "industries": [ind["industry"] for ind in (industries or [])],
         "programmingLanguages": list(lang_breakdown.keys()),
@@ -586,30 +711,40 @@ def _build_skill_stats(repos: list, skill_field: str) -> list:
     return stats
 
 
-def _build_ai_dev_skill_stats(repos: list) -> list:
-    """Build AI Dev Skill group stats using taxonomy group names the frontend expects.
+def _build_ai_dev_skill_stats(repos: list, lifecycle_groups: dict = None) -> list:
+    """Build AI Dev Skill stats for the 28-skill taxonomy.
 
-    Scans enrichedTags and aiDevSkills on each repo and maps individual tool/skill
-    names to their parent group (e.g. 'vLLM' → 'Inference & Serving') using
-    _SKILL_TAG_TO_GROUP. Returns one entry per group in taxonomy order.
+    First checks aiDevSkills for direct matches against the canonical 28 skill names.
+    Falls back to mapping enrichedTags through _SKILL_TAG_TO_GROUP for legacy data.
+    Returns one entry per skill area in taxonomy order.
     """
-    group_repo_names: dict = defaultdict(set)
-    group_top_repos: dict = defaultdict(list)
+    skill_repo_names: dict = defaultdict(set)
+    skill_top_repos: dict = defaultdict(list)
 
     for r in repos:
-        all_tags = set(r.get("enrichedTags", []) + r.get("aiDevSkills", []))
         matched: set = set()
-        for tag in all_tags:
-            group = _SKILL_TAG_TO_GROUP.get(tag.lower())
-            if group and group not in matched:
-                matched.add(group)
-                group_repo_names[group].add(r["name"])
-                group_top_repos[group].append((r.get("stars", 0), r["name"]))
+
+        # Primary: direct match against canonical 28 skill names
+        # aiDevSkills entries are dicts {"skill": ..., "lifecycleGroup": ...}
+        for entry in r.get("aiDevSkills", []):
+            skill = entry["skill"] if isinstance(entry, dict) else entry
+            if skill in _AI_DEV_SKILL_SET and skill not in matched:
+                matched.add(skill)
+                skill_repo_names[skill].add(r["name"])
+                skill_top_repos[skill].append((r.get("stars", 0), r["name"]))
+
+        # Fallback: map enrichedTags through legacy tag→skill lookup
+        for tag in r.get("enrichedTags", []):
+            skill = _SKILL_TAG_TO_GROUP.get(tag.lower())
+            if skill and skill in _AI_DEV_SKILL_SET and skill not in matched:
+                matched.add(skill)
+                skill_repo_names[skill].add(r["name"])
+                skill_top_repos[skill].append((r.get("stars", 0), r["name"]))
 
     total = len(repos) if repos else 1
     stats = []
-    for group in _AI_DEV_SKILL_GROUPS:
-        names = group_repo_names.get(group, set())
+    for skill in _AI_DEV_SKILLS_ORDERED:
+        names = skill_repo_names.get(skill, set())
         count = len(names)
         pct = count / total
         if pct >= 0.1:
@@ -620,9 +755,10 @@ def _build_ai_dev_skill_stats(repos: list) -> list:
             coverage = "weak"
         else:
             coverage = "none"
-        top = sorted(group_top_repos.get(group, []), reverse=True)[:5]
+        top = sorted(skill_top_repos.get(skill, []), reverse=True)[:5]
         stats.append({
-            "skill": group,
+            "skill": skill,
+            "lifecycleGroup": (lifecycle_groups or _LIFECYCLE_GROUPS_FALLBACK).get(skill, ""),
             "repoCount": count,
             "coverage": coverage,
             "topRepos": [name for _, name in top],
@@ -688,7 +824,7 @@ async def _fetch_page_repos(
         SELECT id, name, owner, full_name, description, is_fork, forked_from, primary_language,
                github_url, fork_sync_state, behind_by, ahead_by,
                github_created_at, upstream_created_at, forked_at, your_last_push_at, upstream_last_push_at,
-               parent_stars, parent_forks, parent_is_archived, stargazers_count,
+               parent_stars, parent_forks, parent_is_archived, stargazers_count, open_issues_count,
                commits_last_7_days, commits_last_30_days, commits_last_90_days,
                readme_summary, activity_score, ingested_at, updated_at, github_updated_at,
                problem_solved, integration_tags, dependencies
@@ -763,6 +899,8 @@ async def _fetch_page_repos(
     for r in industry_rows:
         all_industries[str(r.repo_id)].append({"industry": r.industry})
 
+    lifecycle_groups = await _get_lifecycle_groups(db)
+
     enriched = []
     for repo in repo_dicts:
         rid = str(repo["id"])
@@ -775,6 +913,7 @@ async def _fetch_page_repos(
             pm_skills=all_pm_skills.get(rid, []),
             builders=all_builders.get(rid, []),
             industries=all_industries.get(rid, []),
+            lifecycle_groups=lifecycle_groups,
         )))
 
     return enriched, total
@@ -807,7 +946,7 @@ async def _fetch_aggregates(db: AsyncSession) -> dict:
         "tagMetrics": _build_tag_metrics(all_repos),
         "categories": _build_categories(all_repos),
         "builderStats": _build_builder_stats(all_repos),
-        "aiDevSkillStats": _build_ai_dev_skill_stats(all_repos),
+        "aiDevSkillStats": _build_ai_dev_skill_stats(all_repos, lifecycle_groups=await _get_lifecycle_groups(db)),
         "pmSkillStats": _build_skill_stats(all_repos, "pmSkills"),
     }
     logger.info(f"Aggregates built in {time.monotonic() - t0:.1f}s across {len(all_repos)} repos")
