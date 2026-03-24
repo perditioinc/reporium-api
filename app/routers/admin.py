@@ -13,7 +13,7 @@ from app.routers.library_full import invalidate_library_cache
 
 logger = logging.getLogger(__name__)
 
-router = APIRouter()
+router = APIRouter(tags=["Admin"])
 
 # Canonical noise-tag list from Reporium taxonomy Phase 4 cleanup rules.
 NOISE_TAGS = frozenset({
@@ -62,12 +62,13 @@ async def _prune_noise_tags(db: AsyncSession, *, dry_run: bool) -> dict:
     }
 
 
-@router.get("/admin/data-quality")
+@router.get("/admin/data-quality", response_model=dict)
 async def data_quality(
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
     _admin_key: None = Depends(require_admin_key),
 ):
+    """Return aggregate admin-only data quality metrics for the current repo corpus."""
 
     # Query counts
     total = (await db.execute(text("SELECT COUNT(*) FROM repos;"))).scalar()
@@ -118,17 +119,18 @@ async def data_quality(
     }
 
 
-@router.post("/admin/tags/prune")
+@router.post("/admin/tags/prune", response_model=dict)
 async def prune_tags(
     dry_run: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
     _admin_key: None = Depends(require_admin_key),
 ):
+    """Count or delete noise tags from repo_tags. Requires API and admin keys."""
     return await _prune_noise_tags(db, dry_run=dry_run)
 
 
-@router.post("/admin/quality/compute")
+@router.post("/admin/quality/compute", response_model=dict)
 async def compute_quality_signals(
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
@@ -188,7 +190,7 @@ async def compute_quality_signals(
     return {"computed": computed, "skipped": skipped}
 
 
-@router.post("/admin/embeddings/backfill")
+@router.post("/admin/embeddings/backfill", response_model=dict)
 async def backfill_embeddings(
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
@@ -269,7 +271,7 @@ async def backfill_embeddings(
     return {"backfilled": backfilled, "errors": errors}
 
 
-@router.post("/admin/taxonomy/bootstrap")
+@router.post("/admin/taxonomy/bootstrap", response_model=dict)
 async def bootstrap_taxonomy(
     limit: int = Query(default=100, ge=1, le=500),
     dimension: str | None = Query(default=None),

@@ -8,7 +8,7 @@ from app.models.repo import Repo, RepoCategory, RepoTag
 from app.models.trend import GapAnalysis, IngestionLog, TrendSnapshot
 from app.schemas.trend import GapAnalysisOut, IngestionLogOut, StatsResponse, TaxonomyGapItem, TrendSnapshotOut
 
-router = APIRouter()
+router = APIRouter(tags=["Trends"])
 
 
 @router.get("/trends", response_model=list[TrendSnapshotOut])
@@ -33,7 +33,7 @@ async def get_trends(db: AsyncSession = Depends(get_db)) -> list[TrendSnapshotOu
     return out
 
 
-@router.get("/gaps", response_model=list[GapAnalysisOut])
+@router.get("/gaps", response_model=list[GapAnalysisOut], tags=["Trends", "Taxonomy"])
 async def get_gaps(db: AsyncSession = Depends(get_db)) -> list[GapAnalysisOut]:
     cached = await cache.get("gaps:latest")
     if cached:

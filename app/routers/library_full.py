@@ -982,7 +982,7 @@ async def _fetch_aggregates(db: AsyncSession) -> dict:
     return aggregates
 
 
-@router.get("/library/full")
+@router.get("/library/full", response_model=dict)
 async def library_full(
     db: AsyncSession = Depends(get_db),
     page: int = Query(default=1, ge=1, description="1-based page number"),
@@ -1044,7 +1044,7 @@ async def library_full(
     return response
 
 
-@router.get("/forks")
+@router.get("/forks", response_model=dict)
 async def list_forks(
     db: AsyncSession = Depends(get_db),
     limit: int = 100,
