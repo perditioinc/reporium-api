@@ -554,7 +554,6 @@ async def _run_query(
         text("""
             SELECT r.id, r.name, r.owner, r.forked_from, r.description,
                    r.parent_stars, r.readme_summary, r.problem_solved,
-                   r.integration_tags, r.dependencies,
                    1 - (e.embedding_vec <=> CAST(:vec AS vector)) AS similarity
             FROM repo_embeddings e
             JOIN repos r ON r.id = e.repo_id
@@ -578,10 +577,6 @@ async def _run_query(
             "stars": row.parent_stars,
             "readme_summary": row.readme_summary,
             "problem_solved": row.problem_solved,
-            "integration_tags": row.integration_tags if isinstance(row.integration_tags, list)
-                                else json.loads(row.integration_tags) if row.integration_tags else [],
-            "dependencies": row.dependencies if isinstance(row.dependencies, list)
-                           else json.loads(row.dependencies) if row.dependencies else [],
             "similarity": float(row.similarity),
         })
 
@@ -594,9 +589,6 @@ async def _run_query(
     context_parts = []
     for i, repo in enumerate(top_for_answer, 1):
         upstream = repo["forked_from"] or f"{repo['owner']}/{repo['name']}"
-        tags_str = ", ".join(repo["integration_tags"]) if repo["integration_tags"] else "none"
-        deps_str = ", ".join(repo["dependencies"][:10]) if repo["dependencies"] else "none"
-
         context_parts.append(
             f"<repo index=\"{i}\">\n"
             f"name: {upstream}\n"
@@ -604,8 +596,6 @@ async def _run_query(
             f"description: {_truncate(repo['description'])}\n"
             f"summary: {_truncate(repo['readme_summary'])}\n"
             f"problem_solved: {_truncate(repo['problem_solved'])}\n"
-            f"integration_tags: {tags_str}\n"
-            f"key_dependencies: {deps_str}\n"
             f"relevance_score: {repo['similarity']:.4f}\n"
             f"</repo>"
         )
