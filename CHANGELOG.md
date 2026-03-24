@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased] - 2026-03-24
+
+### Added
+- Open-issues count support in schema, ingest, and `/library/full` responses.
+- Dynamic taxonomy administration endpoints for rebuild, embedding, assignment, and noise-tag pruning.
+- Semantic cache support for `/intelligence/ask` using stored query embeddings and cached answers.
+- Cross-dimension analytics at `GET /analytics/cross-dimension`.
+- Proactive portfolio insights feed at `GET /intelligence/portfolio-insights`.
+- Pub/Sub-triggered ingestion refresh hook at `POST /ingest/events/repo-ingested`.
+- Semantic repo search at `GET /search/semantic` using pgvector cosine similarity.
+
+### Changed
+- Taxonomy is now managed as an open, embedding-assigned system rather than fixed frontend-only skill lists.
+- API docs and admin surfaces now cover taxonomy, analytics, intelligence refresh, and semantic search flows.
+
+### Fixed
+- Pytest collection no longer crashes on the FastAPI/Starlette router import mismatch.
+- Alembic migration chain conflict resolved across the 010/011/012 feature wave.
+
 ## [1.5.0] - 2026-03-23
 
 ### Security
