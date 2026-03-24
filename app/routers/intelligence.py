@@ -27,6 +27,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sentence_transformers import SentenceTransformer
 
 from app.auth import verify_api_key
+from app.cache import CACHE_TTL_STATS, cache
 from app.circuit_breaker import anthropic_breaker
 from app.database import async_session_factory, get_db
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
@@ -221,6 +222,47 @@ class QueryResponse(BaseModel):
     tokens_used: dict
 
 
+class TaxonomyGapSignal(BaseModel):
+    dimension: str
+    value: str
+    repo_count: int
+    trending_score: float
+    description: str | None = None
+
+
+class StaleRepoSignal(BaseModel):
+    repo_name: str
+    owner: str
+    github_url: str
+    parent_stars: int | None = None
+    activity_score: int = 0
+    last_updated_at: str | None = None
+    stale_days: int
+
+
+class VelocityLeaderSignal(BaseModel):
+    repo_name: str
+    owner: str
+    github_url: str
+    commits_last_7_days: int
+    commits_last_30_days: int
+    activity_score: int
+
+
+class DuplicateClusterSignal(BaseModel):
+    similarity: float
+    repos: list[str]
+
+
+class PortfolioInsightsResponse(BaseModel):
+    generated_at: str
+    taxonomy_gaps: list[TaxonomyGapSignal]
+    stale_repos: list[StaleRepoSignal]
+    velocity_leaders: list[VelocityLeaderSignal]
+    near_duplicate_clusters: list[DuplicateClusterSignal]
+    summary: list[str]
+
+
 def _coerce_cached_sources(raw_sources: object) -> list[SourceRepo]:
     if isinstance(raw_sources, str):
         try:
@@ -283,6 +325,179 @@ async def _find_semantic_cache_hit(
     if row is None or not row.answer_full:
         return None
     return row.answer_full, _coerce_cached_sources(row.sources), row.model
+
+
+async def _taxonomy_gap_signals(db: AsyncSession, limit: int = 6) -> list[TaxonomyGapSignal]:
+    result = await db.execute(
+        text("""
+            SELECT dimension, name, repo_count, trending_score, description
+            FROM taxonomy_values
+            WHERE repo_count <= 5
+              AND trending_score > 0
+            ORDER BY trending_score DESC, repo_count ASC, name ASC
+            LIMIT :limit
+        """),
+        {"limit": limit},
+    )
+    return [
+        TaxonomyGapSignal(
+            dimension=row.dimension,
+            value=row.name,
+            repo_count=int(row.repo_count or 0),
+            trending_score=float(row.trending_score or 0.0),
+            description=row.description,
+        )
+        for row in result.fetchall()
+    ]
+
+
+async def _stale_repo_signals(db: AsyncSession, limit: int = 6) -> list[StaleRepoSignal]:
+    result = await db.execute(
+        text("""
+            SELECT name,
+                   owner,
+                   github_url,
+                   parent_stars,
+                   activity_score,
+                   COALESCE(your_last_push_at, upstream_last_push_at, github_updated_at, updated_at) AS last_updated_at,
+                   EXTRACT(DAY FROM (NOW() - COALESCE(your_last_push_at, upstream_last_push_at, github_updated_at, updated_at))) AS stale_days
+            FROM repos
+            WHERE is_private = false
+              AND parent_is_archived = false
+              AND COALESCE(your_last_push_at, upstream_last_push_at, github_updated_at, updated_at) < NOW() - INTERVAL '180 days'
+            ORDER BY stale_days DESC, COALESCE(parent_stars, stargazers_count, 0) DESC
+            LIMIT :limit
+        """),
+        {"limit": limit},
+    )
+    return [
+        StaleRepoSignal(
+            repo_name=row.name,
+            owner=row.owner,
+            github_url=row.github_url,
+            parent_stars=row.parent_stars,
+            activity_score=int(row.activity_score or 0),
+            last_updated_at=row.last_updated_at.isoformat() if row.last_updated_at else None,
+            stale_days=int(float(row.stale_days or 0)),
+        )
+        for row in result.fetchall()
+    ]
+
+
+async def _velocity_leader_signals(db: AsyncSession, limit: int = 6) -> list[VelocityLeaderSignal]:
+    result = await db.execute(
+        text("""
+            SELECT name, owner, github_url, commits_last_7_days, commits_last_30_days, activity_score
+            FROM repos
+            WHERE is_private = false
+              AND commits_last_30_days > 0
+            ORDER BY commits_last_30_days DESC, commits_last_7_days DESC, activity_score DESC
+            LIMIT :limit
+        """),
+        {"limit": limit},
+    )
+    return [
+        VelocityLeaderSignal(
+            repo_name=row.name,
+            owner=row.owner,
+            github_url=row.github_url,
+            commits_last_7_days=int(row.commits_last_7_days or 0),
+            commits_last_30_days=int(row.commits_last_30_days or 0),
+            activity_score=int(row.activity_score or 0),
+        )
+        for row in result.fetchall()
+    ]
+
+
+async def _near_duplicate_signals(db: AsyncSession, limit: int = 4) -> list[DuplicateClusterSignal]:
+    result = await db.execute(
+        text("""
+            SELECT r1.owner AS owner_a,
+                   r1.name AS repo_a,
+                   r2.owner AS owner_b,
+                   r2.name AS repo_b,
+                   1 - (e1.embedding_vec <=> e2.embedding_vec) AS similarity
+            FROM repo_embeddings e1
+            JOIN repo_embeddings e2 ON e1.repo_id < e2.repo_id
+            JOIN repos r1 ON r1.id = e1.repo_id
+            JOIN repos r2 ON r2.id = e2.repo_id
+            WHERE e1.embedding_vec IS NOT NULL
+              AND e2.embedding_vec IS NOT NULL
+              AND r1.is_private = false
+              AND r2.is_private = false
+              AND (1 - (e1.embedding_vec <=> e2.embedding_vec)) >= 0.92
+            ORDER BY similarity DESC
+            LIMIT :limit
+        """),
+        {"limit": limit},
+    )
+    return [
+        DuplicateClusterSignal(
+            similarity=round(float(row.similarity or 0.0), 4),
+            repos=[f"{row.owner_a}/{row.repo_a}", f"{row.owner_b}/{row.repo_b}"],
+        )
+        for row in result.fetchall()
+    ]
+
+
+def _portfolio_summary(
+    taxonomy_gaps: list[TaxonomyGapSignal],
+    stale_repos: list[StaleRepoSignal],
+    velocity_leaders: list[VelocityLeaderSignal],
+    near_duplicate_clusters: list[DuplicateClusterSignal],
+) -> list[str]:
+    summary: list[str] = []
+    if taxonomy_gaps:
+        top_gap = taxonomy_gaps[0]
+        summary.append(
+            f"{top_gap.value} is the sharpest emerging {top_gap.dimension.replace('_', ' ')} gap with a trending score of {top_gap.trending_score:.2f} across only {top_gap.repo_count} repos."
+        )
+    if stale_repos:
+        stalest = stale_repos[0]
+        summary.append(
+            f"{stalest.owner}/{stalest.repo_name} is the stalest high-signal repo in the portfolio at {stalest.stale_days} days since the last observed update."
+        )
+    if velocity_leaders:
+        leader = velocity_leaders[0]
+        summary.append(
+            f"{leader.owner}/{leader.repo_name} is leading portfolio velocity with {leader.commits_last_30_days} commits in the last 30 days."
+        )
+    if near_duplicate_clusters:
+        duplicate = near_duplicate_clusters[0]
+        summary.append(
+            f"{duplicate.repos[0]} and {duplicate.repos[1]} look like the strongest near-duplicate pair at {duplicate.similarity * 100:.1f}% similarity."
+        )
+    return summary
+
+
+async def _portfolio_insights(db: AsyncSession) -> PortfolioInsightsResponse:
+    cache_key = "intelligence:portfolio-insights"
+    cached = await cache.get(cache_key)
+    if cached:
+        return PortfolioInsightsResponse(**cached)
+
+    taxonomy_gaps, stale_repos, velocity_leaders, near_duplicate_clusters = await asyncio.gather(
+        _taxonomy_gap_signals(db),
+        _stale_repo_signals(db),
+        _velocity_leader_signals(db),
+        _near_duplicate_signals(db),
+    )
+
+    response = PortfolioInsightsResponse(
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        taxonomy_gaps=taxonomy_gaps,
+        stale_repos=stale_repos,
+        velocity_leaders=velocity_leaders,
+        near_duplicate_clusters=near_duplicate_clusters,
+        summary=_portfolio_summary(
+            taxonomy_gaps,
+            stale_repos,
+            velocity_leaders,
+            near_duplicate_clusters,
+        ),
+    )
+    await cache.set(cache_key, response.model_dump(), ttl=CACHE_TTL_STATS)
+    return response
 
 
 async def _run_query(
@@ -534,3 +749,13 @@ async def intelligence_ask(
     the repo knowledge base. Rate limited to 10/minute and 100/day per IP.
     """
     return await _run_query(req, db, client_ip=get_remote_address(request))
+
+
+@router.get("/portfolio-insights", response_model=PortfolioInsightsResponse)
+@_limiter.limit("12/minute")
+async def portfolio_insights(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Curated intelligence feed for the portfolio dashboard."""
+    return await _portfolio_insights(db)
