@@ -60,3 +60,22 @@ No field may ever be `null` or `undefined` in the API response.
 The `/admin/data-quality` endpoint reports a `quality_score` (0-100).
 The nightly audit workflow fails if `quality_score < 90`.
 Any repo missing a required field after fallbacks indicates a data pipeline issue.
+
+---
+
+# Additional Endpoint Contract Notes (March 2026)
+
+The sections above describe the `/library/full` repo-card contract.
+The endpoints below were added later and are called by ingestion, operator tooling, or the frontend.
+
+| Method | Path | Auth Required | Description | Key Request Fields | Key Response Fields |
+|-------|------|---------------|-------------|--------------------|---------------------|
+| `POST` | `/ingest/events/repo-ingested` | `Bearer` API key + `X-Ingest-Key`; optional Pub/Sub JWT when `PUBSUB_AUDIENCE` is set | Receives a repo-ingested event and refreshes taxonomy, gap analysis, and cached portfolio insights. | Pub/Sub push body or direct JSON body | `status`, `received`, `taxonomy_rebuild`, `taxonomy_embed`, `taxonomy_assign`, `gap_rebuild`, `portfolio_insights` |
+| `GET` | `/gaps/taxonomy` | none | Returns underrepresented values across taxonomy dimensions. | Query: `min_repos`, `max_repos` | `dimension`, `name`, `repo_count`, `gap_score`, `severity` |
+| `POST` | `/admin/quality/compute` | `Bearer` API key + `X-Admin-Key` | Computes `quality_signals` for all repos from stored metadata without external API calls. | none | `computed`, `skipped` |
+| `POST` | `/admin/embeddings/backfill` | `Bearer` API key + `X-Admin-Key` | Generates missing repo embeddings from stored repo text and tags. | none | `backfilled`, `errors` |
+| `POST` | `/admin/taxonomy/bootstrap` | `Bearer` API key + `X-Admin-Key` | Assigns existing taxonomy values to repos that are missing taxonomy coverage. | Query: `limit`, optional `dimension` | `processed`, `assigned`, `errors` |
+| `POST` | `/admin/taxonomy/deduplicate` | `Bearer` API key + `X-Admin-Key` | Groups similar taxonomy values inside a dimension and optionally merges them. | Query: `dimension`, optional `threshold`, optional `dry_run` | `dimension`, `dry_run`, `groups`, `merged` |
+| `POST` | `/webhooks/github` | none in development; HMAC signature required when `GITHUB_WEBHOOK_SECRET` is configured | Receives GitHub `ping` and `push` webhooks and invalidates affected cache keys. | Headers: `X-Hub-Signature-256`, `X-GitHub-Event`; raw webhook payload | `status`, `event` |
+| `GET` | `/admin/runs` | `X-Admin-Key` | Lists recent ingestion runs for dashboards and operator inspection. | Query: `limit` | Array of run objects with `id`, `run_mode`, `status`, `repos_upserted`, `repos_processed`, `errors`, `started_at`, `finished_at`, `duration_seconds` |
+| `POST` | `/admin/runs` | `X-Admin-Key` | Records a completed ingestion run from the ingestion pipeline. | `run_mode`, `status`, `repos_upserted`, `repos_processed`, `errors`, `started_at`, `finished_at` | `id`, `status` |
