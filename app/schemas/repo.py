@@ -6,6 +6,13 @@ from pydantic import BaseModel, ConfigDict
 
 # --- Sub-schemas ---
 
+class TaxonomyEntry(BaseModel):
+    dimension: str
+    value: str
+    similarityScore: float | None = None
+    assignedBy: str = "enrichment"
+
+
 class CategoryRef(BaseModel):
     category_id: str
     category_name: str
@@ -68,6 +75,7 @@ class RepoSummary(BaseModel):
 
     readme_summary: str | None = None
     activity_score: int = 0
+    problem_solved: str | None = None
 
     ingested_at: datetime
     updated_at: datetime
@@ -80,6 +88,7 @@ class RepoSummary(BaseModel):
     ai_dev_skills: list[str] = []
     pm_skills: list[str] = []
     languages: list[LanguageRef] = []
+    taxonomy: list[TaxonomyEntry] = []
 
 
 class RepoDetail(RepoSummary):
@@ -162,6 +171,14 @@ class RepoIngestItem(BaseModel):
     languages: list[LanguageIngest] = []
     commits: list[CommitIngest] = []
 
+    # Dynamic taxonomy dimensions
+    skill_areas: list[str] = []
+    industries: list[str] = []
+    use_cases: list[str] = []
+    modalities: list[str] = []
+    ai_trends: list[str] = []
+    deployment_context: list[str] = []
+
 
 class RepoEnrichItem(BaseModel):
     readme_summary: str | None = None
@@ -169,6 +186,14 @@ class RepoEnrichItem(BaseModel):
     tags: list[str] | None = None
     ai_dev_skills: list[str] | None = None
     pm_skills: list[str] | None = None
+
+    # Dynamic taxonomy dimensions
+    skill_areas: list[str] | None = None
+    industries: list[str] | None = None
+    use_cases: list[str] | None = None
+    modalities: list[str] | None = None
+    ai_trends: list[str] | None = None
+    deployment_context: list[str] | None = None
 
 
 class IngestResponse(BaseModel):

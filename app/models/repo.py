@@ -1,3 +1,4 @@
+import uuid as _uuid_mod
 from datetime import datetime
 from uuid import UUID, uuid4
 
@@ -62,6 +63,9 @@ class Repo(Base):
     )
     github_updated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True))
 
+    # Enrichment extras
+    problem_solved: Mapped[str | None] = mapped_column(Text)
+
     # Relationships
     tags: Mapped[list["RepoTag"]] = relationship(
         back_populates="repo", cascade="all, delete-orphan"
@@ -86,6 +90,9 @@ class Repo(Base):
     )
     embedding: Mapped["RepoEmbedding | None"] = relationship(
         back_populates="repo", cascade="all, delete-orphan", uselist=False
+    )
+    taxonomy: Mapped[list["RepoTaxonomy"]] = relationship(
+        "RepoTaxonomy", lazy="select", cascade="all, delete-orphan"
     )
 
 
@@ -205,4 +212,36 @@ class SkillArea(Base):
     color: Mapped[str | None] = mapped_column(Text)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
     min_repos_to_display: Mapped[int] = mapped_column(Integer, default=1)
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
+class TaxonomyValue(Base):
+    __tablename__ = "taxonomy_values"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    dimension: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    description: Mapped[str | None] = mapped_column(Text)
+    # embedding_vec handled via raw SQL for pgvector compatibility
+    repo_count: Mapped[int] = mapped_column(Integer, default=0)
+    trending_score: Mapped[float] = mapped_column(Float, default=0.0)
+    first_seen_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+    last_active_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+
+
+class RepoTaxonomy(Base):
+    __tablename__ = "repo_taxonomy"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    repo_id: Mapped[_uuid_mod.UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("repos.id", ondelete="CASCADE"), nullable=False
+    )
+    dimension: Mapped[str] = mapped_column(Text, nullable=False)
+    raw_value: Mapped[str] = mapped_column(Text, nullable=False)
+    taxonomy_value_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("taxonomy_values.id", ondelete="SET NULL")
+    )
+    similarity_score: Mapped[float | None] = mapped_column(Float)
+    assigned_by: Mapped[str] = mapped_column(Text, default="enrichment")
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
