@@ -39,12 +39,51 @@ jobs:
           region: us-central1
           source: .
           flags: >-
-            --memory=1Gi
+            --memory=2Gi
             --cpu=1
             --min-instances=0
-            --max-instances=10
+            --max-instances=3
             --concurrency=20
             --timeout=60
+
+      - name: Prune old container images (keep latest 5)
+        if: success()
+        continue-on-error: true
+        run: |
+          # Delete untagged images first
+          gcloud container images list-tags gcr.io/perditio-platform/reporium-api \
+            --filter="NOT tags:*" --format="get(digest)" | \
+            while read digest; do
+              gcloud container images delete \
+                "gcr.io/perditio-platform/reporium-api@${digest}" \
+                --quiet --force-delete-tags 2>/dev/null || true
+            done
+          # Keep only the 5 most recent tagged images
+          gcloud container images list-tags gcr.io/perditio-platform/reporium-api \
+            --sort-by="~TIMESTAMP" --format="get(digest)" | tail -n +6 | \
+            while read digest; do
+              gcloud container images delete \
+                "gcr.io/perditio-platform/reporium-api@${digest}" \
+                --quiet --force-delete-tags 2>/dev/null || true
+            done
+
+      - name: Post-deploy taxonomy rebuild
+        if: success()
+        continue-on-error: true
+        env:
+          API_URL: https://reporium-api-573778300586.us-central1.run.app
+          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+        run: |
+          # Wait for Cloud Run to be healthy
+          sleep 15
+          # Rebuild taxonomy_values from repo_taxonomy (fast batch INSERT — no timeout risk)
+          curl -sf -X POST "${API_URL}/admin/taxonomy/rebuild" \
+            -H "Authorization: Bearer ${INGEST_API_KEY}" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            && echo "Taxonomy rebuild triggered" || echo "Taxonomy rebuild skipped (secrets not configured)"
 
       - name: Publish api.deployed event
         if: success()
