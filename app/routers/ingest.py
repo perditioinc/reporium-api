@@ -85,15 +85,12 @@ async def _rebuild_gap_analysis(db: AsyncSession) -> dict[str, int]:
         await db.execute(
             text(
                 """
-                SELECT sa.name AS skill,
-                       COUNT(DISTINCT ras.repo_id) AS repo_count,
+                SELECT tv.name AS skill,
+                       COALESCE(tv.repo_count, 0) AS repo_count,
                        COALESCE(tv.trending_score, 0) AS trending_score
-                FROM skill_areas sa
-                LEFT JOIN repo_ai_dev_skills ras ON ras.skill = sa.name
-                LEFT JOIN taxonomy_values tv
-                  ON tv.dimension = 'skill_area' AND tv.name = sa.name
-                GROUP BY sa.name, tv.trending_score
-                ORDER BY repo_count ASC, sa.name ASC
+                FROM taxonomy_values tv
+                WHERE tv.dimension = 'skill_area'
+                ORDER BY tv.repo_count ASC, tv.name ASC
                 """
             )
         )
