@@ -264,7 +264,7 @@ async def embed_taxonomy(db: AsyncSession = Depends(get_db)) -> dict:
     for row, emb in zip(rows, embeddings):
         vec_str = "[" + ",".join(str(float(v)) for v in emb) + "]"
         await db.execute(text(
-            "UPDATE taxonomy_values SET embedding_vec = :vec::vector WHERE id = :id"
+            "UPDATE taxonomy_values SET embedding_vec = CAST(:vec AS vector) WHERE id = :id"
         ), {"vec": vec_str, "id": row.id})
         embedded += 1
 

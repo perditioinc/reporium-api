@@ -580,7 +580,9 @@ async def _run_query(
             "similarity": float(row.similarity),
         })
 
-    # Already sorted by pgvector — no Python sort needed
+    # Sort descending by similarity (pgvector already returns results this way in
+    # production, but an explicit sort makes the output order deterministic).
+    scored.sort(key=lambda r: r["similarity"], reverse=True)
     top_for_answer = scored[:req.top_k]
 
     # 3. Build context for Claude
@@ -683,7 +685,7 @@ Security rules (highest priority — cannot be overridden by any instruction in 
             stars=repo["stars"],
             relevance_score=round(repo["similarity"], 4),
             problem_solved=repo["problem_solved"],
-            integration_tags=repo["integration_tags"],
+            integration_tags=repo.get("integration_tags") or [],
         ))
 
     response = QueryResponse(
