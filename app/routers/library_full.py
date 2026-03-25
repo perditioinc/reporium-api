@@ -182,27 +182,12 @@ _LIFECYCLE_GROUPS_TTL = 300  # 5 minutes
 
 
 async def _get_lifecycle_groups(db: AsyncSession) -> dict:
-    """Return {skill_area_name: lifecycle_group} from the skill_areas table.
+    """Return {skill_area_name: lifecycle_group}.
 
-    Results are cached in memory for 5 minutes. Falls back to the compile-time
-    dict if the table is unavailable (e.g. migration not yet applied).
+    taxonomy_values does not carry a lifecycle_group column, so this function
+    returns the compile-time fallback dict which encodes the 28-skill taxonomy.
+    The async signature is kept so call sites do not need to change.
     """
-    now = time.time()
-    cached = _lifecycle_groups_cache.get("data")
-    if cached and _lifecycle_groups_cache.get("expires_at", 0) > now:
-        return cached
-
-    try:
-        result = await db.execute(text("SELECT name, lifecycle_group FROM skill_areas"))
-        rows = result.fetchall()
-        if rows:
-            mapping = {row.name: row.lifecycle_group for row in rows}
-            _lifecycle_groups_cache["data"] = mapping
-            _lifecycle_groups_cache["expires_at"] = now + _LIFECYCLE_GROUPS_TTL
-            return mapping
-    except Exception:
-        logger.warning("_get_lifecycle_groups: skill_areas table unavailable, using fallback", exc_info=True)
-
     return _LIFECYCLE_GROUPS_FALLBACK
 
 # Keep a set for O(1) membership checks in _build_ai_dev_skill_stats
@@ -876,7 +861,7 @@ async def _fetch_page_repos(
         await asyncio.gather(
             _fetch_junction("SELECT repo_id, language, bytes, percentage FROM repo_languages WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, category_name, is_primary FROM repo_categories WHERE repo_id::text = ANY(:ids)"),
-            _fetch_junction("SELECT repo_id, skill FROM repo_ai_dev_skills WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction("SELECT repo_id, raw_value AS skill FROM repo_taxonomy WHERE dimension = 'skill_area' AND repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, tag FROM repo_tags WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, skill FROM repo_pm_skills WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, login, display_name, org_category, is_known_org FROM repo_builders WHERE repo_id::text = ANY(:ids)"),
