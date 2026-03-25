@@ -105,9 +105,17 @@ class _ScalarsResult:
 
 @pytest.mark.asyncio
 async def test_semantic_search_calls_distance_query_and_applies_limit():
+    """When embeddings exist, semantic search uses pgvector distance query."""
+    candidate_rows = [
+        SimpleNamespace(repo_id="00000000-0000-0000-0000-000000000001", similarity=0.87),
+    ]
+    repos = [
+        _fake_repo(repo_id="00000000-0000-0000-0000-000000000001", name="matched-repo", owner="perditioinc"),
+    ]
     db = AsyncMock()
     db.execute = AsyncMock(side_effect=[
-        _FetchAllResult([]),
+        _FetchAllResult(candidate_rows),
+        _ScalarsResult(repos),
     ])
     fake_model = MagicMock()
     fake_model.encode.return_value = MagicMock(tolist=lambda: [0.1, 0.2, 0.3])
@@ -115,11 +123,37 @@ async def test_semantic_search_calls_distance_query_and_applies_limit():
     with patch("app.routers.search.get_embedding_model", return_value=fake_model):
         results = await _semantic_search(db, query="vector databases", limit=7)
 
-    assert results == []
-    db.execute.assert_awaited_once()
-    stmt, params = db.execute.await_args.args
+    assert len(results) == 1
+    assert results[0].name == "matched-repo"
+    # First call is the vector distance query
+    first_call_args = db.execute.await_args_list[0].args
+    stmt, params = first_call_args
     assert "<=>" in str(stmt)
     assert params["limit"] == 7
+
+
+@pytest.mark.asyncio
+async def test_semantic_search_falls_back_to_full_text_when_no_embeddings():
+    """When repo_embeddings is empty, semantic search falls back to ILIKE full-text."""
+    fallback_repos = [
+        _fake_repo(repo_id="00000000-0000-0000-0000-000000000003", name="fallback-repo", owner="perditioinc"),
+    ]
+    db = AsyncMock()
+    db.execute = AsyncMock(side_effect=[
+        _FetchAllResult([]),          # vector query returns nothing
+        _ScalarsResult(fallback_repos),  # full-text fallback returns results
+    ])
+    fake_model = MagicMock()
+    fake_model.encode.return_value = MagicMock(tolist=lambda: [0.1, 0.2, 0.3])
+
+    with patch("app.routers.search.get_embedding_model", return_value=fake_model):
+        results = await _semantic_search(db, query="vector databases", limit=5)
+
+    assert len(results) == 1
+    assert results[0].name == "fallback-repo"
+    # similarity is 0.0 for full-text fallback results
+    assert results[0].similarity == 0.0
+    assert db.execute.await_count == 2
 
 
 @pytest.mark.asyncio
