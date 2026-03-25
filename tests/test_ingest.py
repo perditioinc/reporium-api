@@ -180,3 +180,35 @@ async def test_repo_ingested_event_decodes_pubsub_envelope(client: AsyncClient):
 
     assert response.status_code == 200
     assert response.json()["received"] == {"batch": "nightly", "repos": 25}
+
+
+@pytest.mark.asyncio
+async def test_repo_ingested_event_skips_embed_failure_and_still_returns_200(client: AsyncClient, monkeypatch):
+    monkeypatch.setenv("INGEST_API_KEY", "secret-ingest")
+
+    with patch("app.routers.ingest.rebuild_taxonomy", new=AsyncMock(return_value={"status": "ok", "upserted": 3})), \
+         patch("app.routers.ingest.embed_taxonomy", new=AsyncMock(side_effect=RuntimeError("model load failed"))), \
+         patch("app.routers.ingest.assign_taxonomy", new=AsyncMock(return_value={"status": "ok", "assigned": 11})), \
+         patch("app.routers.ingest._rebuild_gap_analysis", new=AsyncMock(return_value={"gap_rows": 8})), \
+         patch("app.routers.ingest._refresh_portfolio_intelligence", new=AsyncMock(return_value={"taxonomy_gap_count": 4, "stale_repo_count": 2, "velocity_leader_count": 3, "near_duplicate_cluster_count": 1})), \
+         patch("app.routers.ingest.cache.invalidate", new=AsyncMock()) as invalidate_cache, \
+         patch("app.routers.ingest.invalidate_library_cache") as invalidate_memory:
+        response = await client.post(
+            "/ingest/events/repo-ingested",
+            json={"source": "pubsub-test"},
+            headers={"X-Ingest-Key": "secret-ingest"},
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["status"] == "ok"
+    assert data["received"]["source"] == "pubsub-test"
+    assert data["taxonomy_rebuild"]["upserted"] == 3
+    assert data["taxonomy_embed"]["status"] == "skipped"
+    assert data["taxonomy_embed"]["embedded"] == 0
+    assert "model load failed" in data["taxonomy_embed"]["error"]
+    assert data["taxonomy_assign"]["assigned"] == 11
+    assert data["gap_rebuild"]["gap_rows"] == 8
+    assert data["portfolio_insights"]["taxonomy_gap_count"] == 4
+    assert invalidate_cache.await_count == 3
+    invalidate_memory.assert_called_once()

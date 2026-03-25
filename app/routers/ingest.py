@@ -384,8 +384,14 @@ async def repo_ingested_event(
     """Handle Pub/Sub repo-ingested pushes and refresh taxonomy, gaps, and insights."""
     payload = _parse_pubsub_payload(await request.json())
 
+    log = logging.getLogger(__name__)
+
     rebuild_result = await rebuild_taxonomy(RebuildBody(), db)
-    embed_result = await embed_taxonomy(db)
+    try:
+        embed_result = await embed_taxonomy(db)
+    except Exception as exc:
+        log.exception("embed_taxonomy failed during repo-ingested refresh")
+        embed_result = {"status": "skipped", "error": str(exc), "embedded": 0}
     assign_result = await assign_taxonomy(AssignBody(), db)
     gap_result = await _rebuild_gap_analysis(db)
 
