@@ -69,6 +69,10 @@ def _repo_to_summary(repo: Repo) -> RepoSummary:
             {"language": l.language, "bytes": l.bytes, "percentage": l.percentage}
             for l in repo.languages
         ],
+        taxonomy=[
+            {"dimension": t.dimension, "value": t.raw_value, "similarityScore": t.similarity_score, "assignedBy": t.assigned_by}
+            for t in repo.taxonomy
+        ],
     )
 
 
