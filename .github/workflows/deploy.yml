@@ -72,7 +72,7 @@ jobs:
         continue-on-error: true
         env:
           API_URL: https://reporium-api-573778300586.us-central1.run.app
-          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
+          INGEST_API_KEY: ${{ secrets.INGESTION_API_KEY }}
           ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
         run: |
           # Wait for Cloud Run to be healthy
