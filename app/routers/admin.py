@@ -514,6 +514,21 @@ async def list_runs(
     ]
 
 
+@router.post("/admin/enrichment/trigger", response_model=dict)
+async def trigger_enrichment(
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Mark unenriched repos and return count.
+    A cron/external process picks these up."""
+    result = await db.execute(text(
+        "SELECT COUNT(*) FROM repos WHERE quality_signals IS NULL"
+    ))
+    pending = result.scalar()
+    return {"pending_enrichment": pending, "message": f"{pending} repos need enrichment"}
+
+
 @router.post(
     "/admin/runs",
     summary="Record a completed ingestion run",
