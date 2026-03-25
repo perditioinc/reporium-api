@@ -240,6 +240,77 @@ async def rebuild_taxonomy(
     return {"status": "ok", "upserted": upserted, "dimensions": dimensions}
 
 
+@router.post("/admin/taxonomy/backfill", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
+async def backfill_taxonomy_from_repos(db: AsyncSession = Depends(get_db)) -> dict:
+    """
+    Backfill repo_taxonomy from JSONB columns on repos (skill_areas, industries,
+    use_cases, modalities, ai_trends, deployment_context).
+
+    Reads repos whose JSONB enrichment columns are non-null and non-empty, then
+    inserts rows into repo_taxonomy using ON CONFLICT DO NOTHING — safe to re-run.
+
+    Use this after running the AI enricher directly against the DB (which writes to
+    repos.skill_areas etc. but bypasses the ingest API and _upsert_repo_taxonomy).
+    """
+    dimension_columns = {
+        "skill_area": "skill_areas",
+        "industry": "industries",
+        "use_case": "use_cases",
+        "modality": "modalities",
+        "ai_trend": "ai_trends",
+        "deployment_context": "deployment_context",
+    }
+
+    total_inserted = 0
+    repos_processed = 0
+
+    result = await db.execute(text(
+        "SELECT id, skill_areas, industries, use_cases, modalities, ai_trends, deployment_context "
+        "FROM repos "
+        "WHERE skill_areas IS NOT NULL "
+        "   OR industries IS NOT NULL "
+        "   OR use_cases IS NOT NULL "
+        "   OR modalities IS NOT NULL "
+        "   OR ai_trends IS NOT NULL "
+        "   OR deployment_context IS NOT NULL"
+    ))
+    rows = result.fetchall()
+
+    for row in rows:
+        repo_id = str(row[0])
+        col_values = {
+            "skill_area":         row[1] or [],
+            "industry":           row[2] or [],
+            "use_case":           row[3] or [],
+            "modality":           row[4] or [],
+            "ai_trend":           row[5] or [],
+            "deployment_context": row[6] or [],
+        }
+        repo_had_data = False
+        for dimension, values in col_values.items():
+            if not isinstance(values, list):
+                continue
+            for raw_value in values:
+                if not raw_value or not isinstance(raw_value, str):
+                    continue
+                await db.execute(text(
+                    "INSERT INTO repo_taxonomy (repo_id, dimension, raw_value, assigned_by) "
+                    "VALUES (:repo_id, :dimension, :raw_value, 'enrichment') "
+                    "ON CONFLICT (repo_id, dimension, raw_value) DO NOTHING"
+                ), {"repo_id": repo_id, "dimension": dimension, "raw_value": raw_value.strip()})
+                total_inserted += 1
+                repo_had_data = True
+        if repo_had_data:
+            repos_processed += 1
+
+    await db.commit()
+    return {
+        "status": "ok",
+        "repos_processed": repos_processed,
+        "rows_inserted": total_inserted,
+    }
+
+
 @router.post("/admin/taxonomy/embed", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def embed_taxonomy(db: AsyncSession = Depends(get_db)) -> dict:
     """
