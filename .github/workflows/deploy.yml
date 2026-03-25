@@ -67,6 +67,24 @@ jobs:
                 --quiet --force-delete-tags 2>/dev/null || true
             done
 
+      - name: Post-deploy taxonomy rebuild
+        if: success()
+        continue-on-error: true
+        env:
+          API_URL: https://reporium-api-573778300586.us-central1.run.app
+          INGEST_API_KEY: ${{ secrets.INGEST_API_KEY }}
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+        run: |
+          # Wait for Cloud Run to be healthy
+          sleep 15
+          # Rebuild taxonomy_values from repo_taxonomy (fast batch INSERT — no timeout risk)
+          curl -sf -X POST "${API_URL}/admin/taxonomy/rebuild" \
+            -H "Authorization: Bearer ${INGEST_API_KEY}" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            && echo "Taxonomy rebuild triggered" || echo "Taxonomy rebuild skipped (secrets not configured)"
+
       - name: Publish api.deployed event
         if: success()
         continue-on-error: true
