@@ -1,0 +1,23 @@
+name: Keep Cloud Run warm
+
+on:
+  schedule:
+    # Every 10 minutes during active hours (06:00–02:00 UTC, covers US/EU daytime)
+    - cron: '*/10 6-23 * * *'
+    - cron: '*/10 0-2 * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://reporium-api-573778300586.us-central1.run.app/health" \
+            --max-time 10)
+          echo "Health status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "Warning: health returned $STATUS"
+            exit 1
+          fi
