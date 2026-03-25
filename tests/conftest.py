@@ -7,7 +7,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-os.environ["DATABASE_URL"] = "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test"
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test")
 os.environ["INGESTION_API_KEY"] = "test-api-key"
 os.environ["GH_USERNAME"] = "testuser"
 os.environ["REDIS_URL"] = ""  # disable Redis in tests
