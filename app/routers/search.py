@@ -46,6 +46,7 @@ async def search_repos(
             selectinload(Repo.ai_dev_skills),
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
+            selectinload(Repo.taxonomy),
         )
         .order_by(Repo.activity_score.desc())
         .limit(MAX_RESULTS)
@@ -103,6 +104,7 @@ async def _hydrate_semantic_results(
             selectinload(Repo.ai_dev_skills),
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
+            selectinload(Repo.taxonomy),
         )
     )
     result = await db.execute(stmt)
@@ -147,6 +149,7 @@ async def _full_text_fallback(
             selectinload(Repo.ai_dev_skills),
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
+            selectinload(Repo.taxonomy),
         )
         .order_by(Repo.activity_score.desc())
         .limit(limit)
