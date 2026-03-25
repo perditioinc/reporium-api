@@ -39,7 +39,7 @@ jobs:
           region: us-central1
           source: .
           flags: >-
-            --memory=1Gi
+            --memory=2Gi
             --cpu=1
             --min-instances=0
             --max-instances=3
