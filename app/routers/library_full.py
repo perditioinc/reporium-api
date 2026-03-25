@@ -12,7 +12,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -979,6 +979,7 @@ async def _fetch_aggregates(db: AsyncSession) -> dict:
 
 @router.get("/library/full", response_model=dict)
 async def library_full(
+    response: Response,
     db: AsyncSession = Depends(get_db),
     page: int = Query(default=1, ge=1, description="1-based page number"),
     page_size: int = Query(default=200, ge=1, le=500, description="Repos per page (max 500)"),
@@ -996,6 +997,8 @@ async def library_full(
     cache_key = f"page_{page}_{page_size}"
     redis_key = f"library:page:{page}:size:{page_size}"
     now = time.time()
+
+    response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=3600"
 
     # 1. Check Redis cache first (shared, survives restarts)
     redis_hit = await redis_cache.get(redis_key)
