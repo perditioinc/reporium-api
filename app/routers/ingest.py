@@ -384,6 +384,9 @@ async def repo_ingested_event(
     """Handle Pub/Sub repo-ingested pushes and refresh taxonomy, gaps, and insights."""
     payload = _parse_pubsub_payload(await request.json())
 
+    repo_name = payload.get("repo_name") or payload.get("name") or "unknown"
+    logger.info(f"Repo ingested: {repo_name}, enrichment pending")
+
     log = logging.getLogger(__name__)
 
     rebuild_result = await rebuild_taxonomy(RebuildBody(), db)
