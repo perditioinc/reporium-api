@@ -318,6 +318,7 @@ async def ingest_trend_snapshot(
         await db.refresh(row)
 
     await cache.invalidate("trends:latest")
+    await cache.invalidate("trends:report")
     return [TrendSnapshotOut.model_validate(r, from_attributes=True) for r in rows]
 
 
