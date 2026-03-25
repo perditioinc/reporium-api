@@ -89,7 +89,7 @@ jobs:
         if: success()
         continue-on-error: true
         run: |
-          pip install -q google-cloud-pubsub google-cloud-firestore
+          pip install -q google-cloud-pubsub google-cloud-firestore git+https://github.com/perditioinc/reporium-events.git
           python - <<'EOF'
           import asyncio, os, sys
           sys.path.insert(0, '.')
