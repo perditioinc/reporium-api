@@ -188,26 +188,32 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
 
     await db.flush()
 
-    # Replace child rows
-    await db.execute(RepoTag.__table__.delete().where(RepoTag.repo_id == repo.id))
-    await db.execute(RepoCategory.__table__.delete().where(RepoCategory.repo_id == repo.id))
-    await db.execute(RepoBuilder.__table__.delete().where(RepoBuilder.repo_id == repo.id))
-    await db.execute(RepoAIDevSkill.__table__.delete().where(RepoAIDevSkill.repo_id == repo.id))
-    await db.execute(RepoPMSkill.__table__.delete().where(RepoPMSkill.repo_id == repo.id))
-    await db.execute(RepoLanguage.__table__.delete().where(RepoLanguage.repo_id == repo.id))
-
-    for tag in item.tags:
-        db.add(RepoTag(repo_id=repo.id, tag=tag))
-    for cat in item.categories:
-        db.add(RepoCategory(repo_id=repo.id, **cat.model_dump()))
-    for builder in item.builders:
-        db.add(RepoBuilder(repo_id=repo.id, **builder.model_dump()))
-    for skill in item.ai_dev_skills:
-        db.add(RepoAIDevSkill(repo_id=repo.id, skill=skill))
-    for skill in item.pm_skills:
-        db.add(RepoPMSkill(repo_id=repo.id, skill=skill))
-    for lang in item.languages:
-        db.add(RepoLanguage(repo_id=repo.id, **lang.model_dump()))
+    # Replace child rows — skip-empty guard: only replace if incoming array is non-empty
+    # to prevent accidental data loss when payload omits or sends empty lists.
+    if item.tags:
+        await db.execute(RepoTag.__table__.delete().where(RepoTag.repo_id == repo.id))
+        for tag in item.tags:
+            db.add(RepoTag(repo_id=repo.id, tag=tag))
+    if item.categories:
+        await db.execute(RepoCategory.__table__.delete().where(RepoCategory.repo_id == repo.id))
+        for cat in item.categories:
+            db.add(RepoCategory(repo_id=repo.id, **cat.model_dump()))
+    if item.builders:
+        await db.execute(RepoBuilder.__table__.delete().where(RepoBuilder.repo_id == repo.id))
+        for builder in item.builders:
+            db.add(RepoBuilder(repo_id=repo.id, **builder.model_dump()))
+    if item.ai_dev_skills:
+        await db.execute(RepoAIDevSkill.__table__.delete().where(RepoAIDevSkill.repo_id == repo.id))
+        for skill in item.ai_dev_skills:
+            db.add(RepoAIDevSkill(repo_id=repo.id, skill=skill))
+    if item.pm_skills:
+        await db.execute(RepoPMSkill.__table__.delete().where(RepoPMSkill.repo_id == repo.id))
+        for skill in item.pm_skills:
+            db.add(RepoPMSkill(repo_id=repo.id, skill=skill))
+    if item.languages:
+        await db.execute(RepoLanguage.__table__.delete().where(RepoLanguage.repo_id == repo.id))
+        for lang in item.languages:
+            db.add(RepoLanguage(repo_id=repo.id, **lang.model_dump()))
 
     if item.commits:
         await db.execute(RepoCommit.__table__.delete().where(RepoCommit.repo_id == repo.id))
