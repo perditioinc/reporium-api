@@ -170,8 +170,7 @@ async def test_embed_taxonomy_uses_model(client):
     mock_model.encode.return_value = fake_embeddings
 
     with patch("app.embeddings.get_embedding_model", return_value=mock_model):
-        with patch("app.routers.taxonomy.get_embedding_model", return_value=mock_model):
-            resp = await client.post(
+        resp = await client.post(
                 "/taxonomy/admin/taxonomy/embed",
                 headers=AUTH_HEADERS,
             )
