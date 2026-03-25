@@ -154,6 +154,7 @@ class RebuildBody(BaseModel):
 class AssignBody(BaseModel):
     dimension: Optional[str] = None
     threshold: float = 0.65
+    limit: int = 500  # Max taxonomy values to process per call; use dimension filter for large runs
 
 
 @router.get("/dimensions", response_model=dict)
@@ -219,22 +220,18 @@ async def rebuild_taxonomy(
 
     upserted = 0
     for dim in dimensions:
-        raw_result = await db.execute(text(
-            "SELECT raw_value, COUNT(DISTINCT repo_id) AS repo_count "
+        # Single bulk INSERT…SELECT per dimension — turns O(n) round-trips into one query.
+        result = await db.execute(text(
+            "INSERT INTO taxonomy_values (dimension, name, repo_count, last_active_at) "
+            "SELECT :dim, raw_value, COUNT(DISTINCT repo_id), NOW() "
             "FROM repo_taxonomy "
             "WHERE dimension = :dim "
-            "GROUP BY raw_value"
+            "GROUP BY raw_value "
+            "ON CONFLICT (dimension, name) DO UPDATE "
+            "  SET repo_count = EXCLUDED.repo_count, "
+            "      last_active_at = NOW()"
         ), {"dim": dim})
-        for row in raw_result.fetchall():
-            raw_value = row.raw_value
-            repo_count = row.repo_count
-            await db.execute(text(
-                "INSERT INTO taxonomy_values (dimension, name, repo_count, last_active_at) "
-                "VALUES (:dim, :name, :repo_count, NOW()) "
-                "ON CONFLICT (dimension, name) DO UPDATE "
-                "SET repo_count = EXCLUDED.repo_count, last_active_at = NOW()"
-            ), {"dim": dim, "name": raw_value, "repo_count": repo_count})
-            upserted += 1
+        upserted += result.rowcount
 
     await db.commit()
     return {"status": "ok", "upserted": upserted, "dimensions": dimensions}
@@ -327,20 +324,36 @@ async def embed_taxonomy(db: AsyncSession = Depends(get_db)) -> dict:
     if not rows:
         return {"status": "ok", "embedded": 0}
 
+    _EMBED_WARN_THRESHOLD = 5000
+    warning: Optional[str] = None
+    if len(rows) > _EMBED_WARN_THRESHOLD:
+        warning = (
+            f"{len(rows)} rows need embedding — this may exceed Cloud Run's timeout. "
+            "Consider filtering by dimension and running in batches."
+        )
+        logger.warning("embed_taxonomy: %s", warning)
+
     model = get_embedding_model()
     texts = [f"{row.dimension}: {row.name}" for row in rows]
     embeddings = model.encode(texts, normalize_embeddings=True)
 
+    _CHUNK_SIZE = 500
     embedded = 0
-    for row, emb in zip(rows, embeddings):
-        vec_str = "[" + ",".join(str(float(v)) for v in emb) + "]"
-        await db.execute(text(
-            "UPDATE taxonomy_values SET embedding_vec = CAST(:vec AS vector) WHERE id = :id"
-        ), {"vec": vec_str, "id": row.id})
-        embedded += 1
+    pairs = list(zip(rows, embeddings))
+    for chunk_start in range(0, len(pairs), _CHUNK_SIZE):
+        chunk = pairs[chunk_start : chunk_start + _CHUNK_SIZE]
+        for row, emb in chunk:
+            vec_str = "[" + ",".join(str(float(v)) for v in emb) + "]"
+            await db.execute(text(
+                "UPDATE taxonomy_values SET embedding_vec = CAST(:vec AS vector) WHERE id = :id"
+            ), {"vec": vec_str, "id": row.id})
+            embedded += 1
+        await db.commit()
 
-    await db.commit()
-    return {"status": "ok", "embedded": embedded}
+    response: dict = {"status": "ok", "embedded": embedded}
+    if warning:
+        response["warning"] = warning
+    return response
 
 
 @router.post("/admin/taxonomy/assign", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
@@ -352,18 +365,26 @@ async def assign_taxonomy(
     For each taxonomy_value with an embedding_vec, find repos whose own embedding
     is within the similarity threshold and upsert repo_taxonomy rows with
     assigned_by='similarity'.
+
+    Because this performs one vector query per taxonomy value, large catalogues will
+    exceed Cloud Run's timeout if run all at once.  Use ``dimension`` to restrict to
+    a single dimension and ``limit`` (default 500) to process in manageable batches.
     """
     threshold = body.threshold
+    limit = body.limit
 
     if body.dimension:
         tv_result = await db.execute(text(
             "SELECT id, dimension, name FROM taxonomy_values "
-            "WHERE embedding_vec IS NOT NULL AND dimension = :dim"
-        ), {"dim": body.dimension})
+            "WHERE embedding_vec IS NOT NULL AND dimension = :dim "
+            "LIMIT :limit"
+        ), {"dim": body.dimension, "limit": limit})
     else:
         tv_result = await db.execute(text(
-            "SELECT id, dimension, name FROM taxonomy_values WHERE embedding_vec IS NOT NULL"
-        ))
+            "SELECT id, dimension, name FROM taxonomy_values "
+            "WHERE embedding_vec IS NOT NULL "
+            "LIMIT :limit"
+        ), {"limit": limit})
     taxonomy_values = tv_result.fetchall()
 
     assigned = 0
@@ -395,7 +416,12 @@ async def assign_taxonomy(
             assigned += 1
 
     await db.commit()
-    return {"status": "ok", "assigned": assigned}
+    return {
+        "status": "ok",
+        "assigned": assigned,
+        "taxonomy_values_processed": len(taxonomy_values),
+        "limit": limit,
+    }
 
 
 @router.post(

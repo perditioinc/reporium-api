@@ -167,11 +167,11 @@ CONTROLLED_ANSWER = (
 # ---------------------------------------------------------------------------
 
 def _patch_embedding_model():
-    """Patch _get_model() to return a dummy model that encodes to a zero vector."""
+    """Patch get_embedding_model() to return a dummy model that encodes to a zero vector."""
     import numpy as np
     mock_model = MagicMock()
     mock_model.encode.return_value = np.zeros(384)
-    return patch("app.routers.intelligence._get_model", return_value=mock_model)
+    return patch("app.routers.intelligence.get_embedding_model", return_value=mock_model)
 
 
 def _patch_anthropic(answer_text: str = CONTROLLED_ANSWER):

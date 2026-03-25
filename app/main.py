@@ -49,6 +49,14 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     await cache.connect()
     await check_db_connection()
+    # Pre-warm the sentence-transformers model so the first /search/semantic
+    # and /intelligence/ask requests don't pay a 3-5s cold-start penalty on
+    # Cloud Run. The model is ~90 MB and loads once per process.
+    import asyncio as _asyncio
+    from app.embeddings import get_embedding_model as _get_embedding_model
+    loop = _asyncio.get_event_loop()
+    await loop.run_in_executor(None, _get_embedding_model)
+    logger.info("Embedding model pre-warmed at startup")
     yield
     await cache.disconnect()
     await engine.dispose()

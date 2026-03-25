@@ -123,6 +123,42 @@ async def _hydrate_semantic_results(
     return ordered_results
 
 
+async def _full_text_fallback(
+    db: AsyncSession,
+    *,
+    query: str,
+    limit: int,
+) -> list[RepoSemanticResult]:
+    """ILIKE fallback used when repo_embeddings table has no vectors yet."""
+    search = f"%{query}%"
+    stmt = (
+        select(Repo)
+        .where(
+            or_(
+                Repo.name.ilike(search),
+                Repo.description.ilike(search),
+                Repo.readme_summary.ilike(search),
+            )
+        )
+        .options(
+            selectinload(Repo.tags),
+            selectinload(Repo.categories),
+            selectinload(Repo.builders),
+            selectinload(Repo.ai_dev_skills),
+            selectinload(Repo.pm_skills),
+            selectinload(Repo.languages),
+        )
+        .order_by(Repo.activity_score.desc())
+        .limit(limit)
+    )
+    result = await db.execute(stmt)
+    repos = result.scalars().all()
+    return [
+        RepoSemanticResult(**_repo_to_summary(r).model_dump(), similarity=0.0)
+        for r in repos
+    ]
+
+
 async def _semantic_search(
     db: AsyncSession,
     *,
@@ -136,6 +172,10 @@ async def _semantic_search(
         query_embedding=query_embedding,
         limit=limit,
     )
+    if not candidate_rows:
+        # No embeddings exist yet — fall back to full-text search so the
+        # endpoint is useful before the embedding pipeline has run.
+        return await _full_text_fallback(db, query=query, limit=limit)
     return await _hydrate_semantic_results(db, candidate_rows=candidate_rows)
 
 
