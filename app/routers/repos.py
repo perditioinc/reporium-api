@@ -83,6 +83,7 @@ async def list_repos(
             selectinload(Repo.ai_dev_skills),
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
+            selectinload(Repo.taxonomy),
         )
     )
 
