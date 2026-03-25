@@ -84,6 +84,12 @@ jobs:
             -H "Content-Type: application/json" \
             -d '{}' \
             && echo "Taxonomy rebuild triggered" || echo "Taxonomy rebuild skipped (secrets not configured)"
+          # Re-derive categories from current tags (idempotent, safe to repeat)
+          curl -sf -X POST "${API_URL}/admin/backfill/categories" \
+            -H "Authorization: Bearer ${INGEST_API_KEY}" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            && echo "Category backfill triggered" || echo "Category backfill skipped (secrets not configured)"
 
       - name: Publish api.deployed event
         if: success()

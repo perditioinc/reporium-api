@@ -8,8 +8,121 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import require_admin_key, verify_api_key
 from app.cache import cache
 from app.database import get_db
-from app.models.repo import IngestRun, Repo, RepoEmbedding, RepoTag
+from app.models.repo import IngestRun, Repo, RepoCategory, RepoEmbedding, RepoTag
 from app.routers.library_full import invalidate_library_cache
+
+# ── 21-category taxonomy (mirrors ingestion/enrichment/taxonomy.py) ──────────
+# Kept in-process so the API can re-derive categories without calling the
+# ingestion service.  Tags are case-insensitive prefix/substring matched.
+_CATEGORIES: list[dict] = [
+    {"id": "foundation-models", "name": "Foundation Models",
+     "tags": ["large language model", "transformer", "openai", "anthropic", "claude",
+               "google ai", "huggingface", "long context", "multimodal", "quantization",
+               "llama", "gguf", "gpt", "llm", "foundational model"]},
+    {"id": "ai-agents", "name": "AI Agents",
+     "tags": ["ai agent", "multi-agent", "autonomous", "agent memory", "planning",
+               "chain-of-thought", "tool use", "langchain", "langgraph", "crewai",
+               "autogen", "mcp", "prompt engineering", "context engineering",
+               "structured output", "function calling", "agentic"]},
+    {"id": "rag-retrieval", "name": "RAG & Retrieval",
+     "tags": ["rag", "vector database", "embedding", "knowledge graph",
+               "semantic search", "hybrid search", "reranking", "llamaindex",
+               "document processing", "chunking", "retrieval"]},
+    {"id": "model-training", "name": "Model Training",
+     "tags": ["fine-tuning", "reinforcement learning", "lora", "peft", "rlhf",
+               "synthetic data", "dataset", "training", "unsloth", "axolotl",
+               "trl", "deepspeed", "fsdp", "pytorch", "tensorflow", "keras", "jax"]},
+    {"id": "evals-benchmarking", "name": "Evals & Benchmarking",
+     "tags": ["eval", "benchmark", "model evaluation", "llm testing", "red teaming",
+               "safety evaluation", "mmlu", "humaneval", "code evaluation", "alignment"]},
+    {"id": "observability", "name": "Observability & Monitoring",
+     "tags": ["observability", "tracing", "monitoring", "llm monitoring", "logging",
+               "debugging", "langsmith", "phoenix", "mlflow", "weights & biases",
+               "experiment tracking"]},
+    {"id": "inference-serving", "name": "Inference & Serving",
+     "tags": ["inference", "llm serving", "model optimization", "vllm", "tensorrt",
+               "triton", "ollama", "tgi", "batching", "caching", "gpu", "cuda",
+               "real-time", "streaming", "deployment"]},
+    {"id": "generative-media", "name": "Generative Media",
+     "tags": ["image generation", "video generation", "text to speech", "speech to text",
+               "music", "audio", "comfyui", "diffusion", "controlnet", "stable diffusion",
+               "generative"]},
+    {"id": "computer-vision", "name": "Computer Vision",
+     "tags": ["computer vision", "point cloud", "3d vision", "object detection",
+               "segmentation", "depth estimation", "slam", "optical flow",
+               "3d reconstruction", "pose estimation", "vision"]},
+    {"id": "robotics", "name": "Robotics",
+     "tags": ["robotics", "robot", "humanoid", "simulation", "ros", "motion planning",
+               "grasping", "manipulation", "navigation", "control systems"]},
+    {"id": "nlp-text", "name": "NLP & Text",
+     "tags": ["nlp", "natural language", "text classification", "named entity",
+               "sentiment", "summarization", "translation", "question answering",
+               "information extraction", "parsing", "tokenization"]},
+    {"id": "ml-platform", "name": "ML Platform & Infrastructure",
+     "tags": ["ml platform", "mlops", "pipeline", "orchestration", "feature store",
+               "data pipeline", "kubeflow", "airflow", "prefect", "infrastructure",
+               "platform"]},
+    {"id": "safety-alignment", "name": "Safety & Alignment",
+     "tags": ["safety", "alignment", "fairness", "bias", "interpretability",
+               "explainability", "robustness", "adversarial", "toxicity", "guardrail"]},
+    {"id": "coding-devtools", "name": "Coding & Dev Tools",
+     "tags": ["code generation", "code completion", "copilot", "devin", "cursor",
+               "devtools", "ide", "coding assistant", "code review", "debugging tool",
+               "software engineering"]},
+    {"id": "data-science", "name": "Data Science & Analytics",
+     "tags": ["data science", "analytics", "visualization", "pandas", "numpy",
+               "scikit-learn", "sklearn", "statistical", "jupyter", "notebook"]},
+    {"id": "healthcare-bio", "name": "Healthcare & Biology",
+     "tags": ["healthcare", "medical", "clinical", "biology", "genomics", "protein",
+               "drug discovery", "bioinformatics", "radiology", "pathology"]},
+    {"id": "finance-legal", "name": "Finance & Legal",
+     "tags": ["finance", "trading", "quantitative", "legal", "contract", "compliance",
+               "risk", "fraud detection", "fintech"]},
+    {"id": "multimodal", "name": "Multimodal AI",
+     "tags": ["multimodal", "vision-language", "vlm", "clip", "image-text",
+               "audio-visual", "cross-modal"]},
+    {"id": "edge-mobile", "name": "Edge & Mobile AI",
+     "tags": ["edge", "mobile", "embedded", "iot", "on-device", "tflite",
+               "coreml", "onnx", "wasm", "webassembly"]},
+    {"id": "search-knowledge", "name": "Search & Knowledge",
+     "tags": ["search", "knowledge base", "wiki", "qa system", "question answering",
+               "information retrieval", "index", "elasticsearch", "opensearch"]},
+    {"id": "other", "name": "Other AI / ML",
+     "tags": ["machine learning", "deep learning", "neural network", "ai", "ml",
+               "artificial intelligence"]},
+]
+
+
+def _assign_categories_from_tags(tags: list[str]) -> list[dict]:
+    """Return list of {category_id, category_name, is_primary} dicts.
+
+    Matching is case-insensitive: a category wins when any keyword
+    appears as a substring in a tag (keyword-in-tag direction only).  The category with the most
+    keyword hits is marked is_primary.
+    """
+    tags_lower = [t.lower() for t in tags]
+    scores: dict[str, int] = {}
+    for cat in _CATEGORIES:
+        for kw in cat["tags"]:
+            kw_l = kw.lower()
+            if any(kw_l in tl for tl in tags_lower):
+                scores[cat["id"]] = scores.get(cat["id"], 0) + 1
+
+    if not scores:
+        return []
+
+    max_score = max(scores.values())
+    result = []
+    for cat in _CATEGORIES:
+        if cat["id"] in scores:
+            result.append({
+                "category_id": cat["id"],
+                "category_name": cat["name"],
+                "is_primary": scores[cat["id"]] == max_score and not any(
+                    r["is_primary"] for r in result  # only first max wins
+                ),
+            })
+    return result
 
 logger = logging.getLogger(__name__)
 
@@ -576,3 +689,81 @@ async def record_run(
     await db.commit()
     await db.refresh(run)
     return {"id": run.id, "status": "recorded"}
+
+
+@router.post("/admin/backfill/categories", response_model=dict)
+async def backfill_categories(
+    batch_size: int = Query(default=200, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """
+    Re-derive repo_categories for all repos from their current repo_tags.
+
+    Idempotent: uses INSERT … ON CONFLICT DO NOTHING so existing rows are
+    preserved and the endpoint can be called repeatedly without data loss.
+
+    Returns {processed, assigned, skipped}.
+    """
+    BATCH = batch_size
+    offset = 0
+    processed = 0
+    assigned = 0
+    skipped = 0
+
+    # Build full tag map once (tags are small, fits in memory for ~1 500 repos)
+    tags_result = await db.execute(text(
+        "SELECT repo_id::text, tag FROM repo_tags"
+    ))
+    tags_by_repo: dict[str, list[str]] = {}
+    for row in tags_result.fetchall():
+        tags_by_repo.setdefault(str(row.repo_id), []).append(row.tag)
+
+    while True:
+        repo_result = await db.execute(text(
+            "SELECT id::text FROM repos ORDER BY updated_at DESC LIMIT :lim OFFSET :off"
+        ), {"lim": BATCH, "off": offset})
+        repo_ids = [r[0] for r in repo_result.fetchall()]
+        if not repo_ids:
+            break
+
+        for repo_id in repo_ids:
+            processed += 1
+            tags = tags_by_repo.get(repo_id, [])
+            if not tags:
+                skipped += 1
+                continue
+
+            cats = _assign_categories_from_tags(tags)
+            for cat in cats:
+                try:
+                    await db.execute(text(
+                        """
+                        INSERT INTO repo_categories
+                            (repo_id, category_id, category_name, is_primary)
+                        VALUES
+                            (:repo_id, :cat_id, :cat_name, :is_primary)
+                        ON CONFLICT (repo_id, category_id) DO UPDATE
+                            SET category_name = EXCLUDED.category_name,
+                                is_primary     = EXCLUDED.is_primary
+                        """
+                    ), {
+                        "repo_id": repo_id,
+                        "cat_id":  cat["category_id"],
+                        "cat_name": cat["category_name"],
+                        "is_primary": cat["is_primary"],
+                    })
+                    assigned += 1
+                except Exception as exc:
+                    logger.warning("Category insert failed for %s / %s: %s",
+                                   repo_id, cat["category_id"], exc)
+
+        await db.commit()
+        offset += BATCH
+
+    await cache.invalidate("library:full*")
+    await cache.invalidate("repos:list:*")
+    invalidate_library_cache()
+
+    return {"processed": processed, "assigned": assigned, "skipped": skipped}
