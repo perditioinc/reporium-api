@@ -112,17 +112,28 @@ async def get_library(
     total_result = await db.execute(total_stmt)
     total = total_result.scalar_one()
 
-    # Build stats
+    # Build per-page stats (language distribution uses the current page only)
     lang_counts: dict[str, int] = {}
-    tag_commit_map: dict[str, dict] = {}
+    page_tag_commit_map: dict[str, dict] = {}
     for repo in repos:
         if repo.primary_language:
             lang_counts[repo.primary_language] = lang_counts.get(repo.primary_language, 0) + 1
         for t in repo.tags:
-            if t.tag not in tag_commit_map:
-                tag_commit_map[t.tag] = {"count": 0, "commits": 0}
-            tag_commit_map[t.tag]["count"] += 1
-            tag_commit_map[t.tag]["commits"] += repo.commits_last_7_days
+            if t.tag not in page_tag_commit_map:
+                page_tag_commit_map[t.tag] = {"count": 0, "commits": 0}
+            page_tag_commit_map[t.tag]["count"] += 1
+            page_tag_commit_map[t.tag]["commits"] += repo.commits_last_7_days
+
+    # Top tags — query across ALL repo_tags so the tag cloud reflects the
+    # full corpus, not just the current page's 100 repos.
+    global_tags_stmt = (
+        select(RepoTag.tag, func.count(RepoTag.repo_id).label("cnt"))
+        .group_by(RepoTag.tag)
+        .order_by(func.count(RepoTag.repo_id).desc())
+        .limit(50)
+    )
+    global_tags_result = await db.execute(global_tags_stmt)
+    global_top_tags = [row.tag for row in global_tags_result.all()]
 
     # Categories
     cat_stmt = (
@@ -142,7 +153,7 @@ async def get_library(
             count=data["count"],
             commit_velocity=data["commits"] / max(data["count"], 1),
         )
-        for tag, data in sorted(tag_commit_map.items(), key=lambda x: x[1]["count"], reverse=True)
+        for tag, data in sorted(page_tag_commit_map.items(), key=lambda x: x[1]["count"], reverse=True)
     ]
 
     stats = LibraryStats(
@@ -150,7 +161,7 @@ async def get_library(
         total_forks=sum(1 for r in repos if r.is_fork),
         total_non_forks=sum(1 for r in repos if not r.is_fork),
         languages=lang_counts,
-        top_tags=[t.tag for t in sorted(tag_metrics, key=lambda x: x.count, reverse=True)][:20],
+        top_tags=global_top_tags,
     )
 
     response = LibraryResponse(

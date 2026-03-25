@@ -2,9 +2,27 @@ steps:
   - name: 'gcr.io/cloud-builders/docker'
     args:
       - 'build'
+      - '--cache-from'
+      - 'gcr.io/$PROJECT_ID/reporium-api:deps-cache'
+      - '--build-arg'
+      - 'BUILDKIT_INLINE_CACHE=1'
       - '-t'
-      - 'gcr.io/$PROJECT_ID/reporium-api'
+      - 'gcr.io/$PROJECT_ID/reporium-api:deps-cache'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/reporium-api:$COMMIT_SHA'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/reporium-api:latest'
       - '.'
+    env:
+      - 'DOCKER_BUILDKIT=1'
 
 images:
-  - 'gcr.io/$PROJECT_ID/reporium-api'
+  - 'gcr.io/$PROJECT_ID/reporium-api:$COMMIT_SHA'
+  - 'gcr.io/$PROJECT_ID/reporium-api:latest'
+  - 'gcr.io/$PROJECT_ID/reporium-api:deps-cache'
+
+# sentence-transformers pulls in PyTorch (~2 GB); cold pip installs take
+# 15-20+ minutes and exceed the default 10-minute Cloud Build timeout.
+# 30 minutes is sufficient even on a cold build, and cached builds finish
+# in under 2 minutes.
+timeout: 1800s
