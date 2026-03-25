@@ -384,8 +384,19 @@ async def repo_ingested_event(
     """Handle Pub/Sub repo-ingested pushes and refresh taxonomy, gaps, and insights."""
     payload = _parse_pubsub_payload(await request.json())
 
+    log = logging.getLogger(__name__)
+
     rebuild_result = await rebuild_taxonomy(RebuildBody(), db)
-    embed_result = await embed_taxonomy(db)
+
+    # embed_taxonomy loads a sentence-transformer model (~90 MB) at runtime.
+    # Wrap in try/except so a model-load failure (OOM, network policy on Cloud Run)
+    # does not 500 the entire event handler — taxonomy rebuild and assign still run.
+    try:
+        embed_result = await embed_taxonomy(db)
+    except Exception as exc:
+        log.error("embed_taxonomy failed (non-fatal): %s", exc)
+        embed_result = {"status": "skipped", "error": str(exc), "embedded": 0}
+
     assign_result = await assign_taxonomy(AssignBody(), db)
     gap_result = await _rebuild_gap_analysis(db)
 
