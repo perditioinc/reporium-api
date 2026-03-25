@@ -16,6 +16,7 @@ from app.models.repo import (
     RepoCommit,
     RepoLanguage,
     RepoTag,
+    RepoTaxonomy,
 )
 from app.routers.library import _repo_to_summary
 from app.schemas.repo import RepoDetail, RepoSummary
@@ -82,6 +83,7 @@ async def list_repos(
             selectinload(Repo.ai_dev_skills),
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
+            selectinload(Repo.taxonomy),
         )
     )
 
@@ -174,6 +176,7 @@ async def get_repo(name: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
             selectinload(Repo.commits),
+            selectinload(Repo.taxonomy),
         )
     )
     result = await db.execute(stmt)
@@ -200,6 +203,7 @@ async def get_repo_by_owner(owner: str, repo: str, db: AsyncSession = Depends(ge
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
             selectinload(Repo.commits),
+            selectinload(Repo.taxonomy),
         )
     )
     result = await db.execute(stmt)

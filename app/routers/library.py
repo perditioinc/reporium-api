@@ -69,6 +69,10 @@ def _repo_to_summary(repo: Repo) -> RepoSummary:
             {"language": l.language, "bytes": l.bytes, "percentage": l.percentage}
             for l in repo.languages
         ],
+        taxonomy=[
+            {"dimension": t.dimension, "value": t.raw_value, "similarityScore": t.similarity_score, "assignedBy": t.assigned_by}
+            for t in getattr(repo, "taxonomy", [])
+        ],
     )
 
 
@@ -95,6 +99,7 @@ async def get_library(
             selectinload(Repo.ai_dev_skills),
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
+            selectinload(Repo.taxonomy),
         )
         .order_by(Repo.updated_at.desc())
         .offset(offset)
