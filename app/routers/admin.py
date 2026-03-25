@@ -379,6 +379,104 @@ async def bootstrap_taxonomy(
 
 
 # ---------------------------------------------------------------------------
+# Data integrity health check
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/health/data", response_model=dict)
+async def data_integrity_health(
+    db: AsyncSession = Depends(get_db),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """
+    Monitor junction table row counts and coverage ratios to detect data
+    regressions immediately after ingestion runs.
+
+    Status thresholds:
+    - ``critical``  — repo_tags has < 100 rows total
+    - ``degraded``  — repo_tags coverage < 50 % of repos
+    - ``healthy``   — all checks pass
+    """
+    # --- raw counts (fast COUNT queries, no JOINs) ---
+    tables = [
+        "repos",
+        "repo_tags",
+        "repo_categories",
+        "repo_taxonomy",
+        "taxonomy_values",
+        "repo_ai_dev_skills",
+        "repo_pm_skills",
+        "repo_languages",
+    ]
+    counts: dict[str, int] = {}
+    for table in tables:
+        row = await db.execute(text(f"SELECT COUNT(*) FROM {table}"))  # noqa: S608
+        counts[table] = row.scalar() or 0
+
+    total_repos = counts["repos"]
+
+    # --- coverage: repos that have at least 1 row in each junction table ---
+    def _pct(n: int) -> float:
+        if total_repos == 0:
+            return 0.0
+        return round(n / total_repos * 100, 1)
+
+    tags_covered = (
+        await db.execute(
+            text("SELECT COUNT(DISTINCT repo_id) FROM repo_tags")
+        )
+    ).scalar() or 0
+
+    cats_covered = (
+        await db.execute(
+            text("SELECT COUNT(DISTINCT repo_id) FROM repo_categories")
+        )
+    ).scalar() or 0
+
+    langs_covered = (
+        await db.execute(
+            text("SELECT COUNT(DISTINCT repo_id) FROM repo_languages")
+        )
+    ).scalar() or 0
+
+    coverage = {
+        "tags_pct": _pct(tags_covered),
+        "categories_pct": _pct(cats_covered),
+        "languages_pct": _pct(langs_covered),
+    }
+
+    # --- alerts & status ---
+    alerts: list[str] = []
+    status = "healthy"
+
+    tag_total = counts["repo_tags"]
+    tags_pct = coverage["tags_pct"]
+
+    if tag_total < 100:
+        status = "critical"
+        alerts.append(
+            f"repo_tags critically low: {tag_total} rows for {total_repos} repos"
+        )
+    elif tags_pct < 50.0:
+        status = "degraded"
+        alerts.append(
+            f"repo_tags coverage degraded: {tags_pct}% of repos have a tag"
+        )
+
+    thresholds = {
+        "repo_tags_min_rows": 100,
+        "tags_coverage_min_pct": 50.0,
+    }
+
+    return {
+        "status": status,
+        "counts": counts,
+        "coverage": coverage,
+        "thresholds": thresholds,
+        "alerts": alerts,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Run history
 # ---------------------------------------------------------------------------
 
