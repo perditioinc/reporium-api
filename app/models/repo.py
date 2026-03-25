@@ -227,11 +227,15 @@ class TaxonomyValue(Base):
     name: Mapped[str] = mapped_column(Text, nullable=False)
     description: Mapped[str | None] = mapped_column(Text)
     # embedding_vec handled via raw SQL for pgvector compatibility
-    repo_count: Mapped[int] = mapped_column(Integer, default=0)
-    trending_score: Mapped[float] = mapped_column(Float, default=0.0)
+    repo_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    trending_score: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")
     first_seen_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
     last_active_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
     created_at: Mapped[datetime] = mapped_column(TIMESTAMP(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("dimension", "name", name="uq_taxonomy_values_dim_name"),
+    )
 
 
 class RepoTaxonomy(Base):

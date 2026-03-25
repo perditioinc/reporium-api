@@ -837,13 +837,13 @@ async def _fetch_page_repos(
 
     # Main repos query — paginated
     result = await db.execute(text("""
-        SELECT id, name, owner, full_name, description, is_fork, forked_from, primary_language,
+        SELECT id, name, owner, (owner || '/' || name) AS full_name, description, is_fork, forked_from, primary_language,
                github_url, fork_sync_state, behind_by, ahead_by,
                github_created_at, upstream_created_at, forked_at, your_last_push_at, upstream_last_push_at,
                parent_stars, parent_forks, parent_is_archived, stargazers_count, open_issues_count,
                commits_last_7_days, commits_last_30_days, commits_last_90_days,
                readme_summary, activity_score, ingested_at, updated_at, github_updated_at,
-               problem_solved
+               problem_solved, license_spdx, quality_signals, has_tests, has_ci
         FROM repos
         WHERE is_private = false
         ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
