@@ -73,6 +73,7 @@ def _repo_to_summary(repo: Repo) -> RepoSummary:
             {"dimension": t.dimension, "value": t.raw_value, "similarityScore": t.similarity_score, "assignedBy": t.assigned_by}
             for t in getattr(repo, "taxonomy", [])
         ],
+        security_signals=repo.security_signals,
     )
 
 
