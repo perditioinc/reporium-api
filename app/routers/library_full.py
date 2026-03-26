@@ -704,17 +704,44 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
             "url": f"https://github.com/{forked_from}",
         }
 
-    # Fork sync status
+    # Fork sync status — behind_by/ahead_by are often stale (0) in the DB,
+    # so cross-check with dates: if upstream pushed after our last sync,
+    # the fork is behind regardless of what the commit counts say.
     fork_sync = None
     if repo.get("is_fork"):
         behind = repo.get("behind_by") or 0
         ahead = repo.get("ahead_by") or 0
-        if behind == 0 and ahead == 0:
+
+        # Date-based override: compare your_last_push_at vs upstream_last_push_at
+        your_push = repo.get("your_last_push_at")
+        upstream_push = repo.get("upstream_last_push_at")
+        date_says_behind = False
+        if your_push and upstream_push:
+            from datetime import datetime, timezone
+            def _parse_dt(v):
+                if isinstance(v, datetime):
+                    return v
+                if isinstance(v, str):
+                    try:
+                        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+                    except Exception:
+                        return None
+                return None
+            yp = _parse_dt(your_push)
+            up = _parse_dt(upstream_push)
+            if yp and up and up > yp:
+                date_says_behind = True
+
+        if behind == 0 and ahead == 0 and not date_says_behind:
             state = "up-to-date"
-        elif behind > 0 and ahead > 0:
-            state = "diverged"
-        elif behind > 0:
-            state = "behind"
+        elif date_says_behind or behind > 0:
+            if behind > 0 and ahead > 0:
+                state = "diverged"
+            else:
+                state = "behind"
+                # If commit count is 0 but dates say behind, estimate ~1
+                if behind == 0:
+                    behind = 1
         elif ahead > 0:
             state = "ahead"
         else:
