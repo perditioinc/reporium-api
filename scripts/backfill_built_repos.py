@@ -90,6 +90,11 @@ async def main():
                     continue
 
                 # Update repo metadata
+                def _parse_dt(s):
+                    if not s:
+                        return None
+                    return datetime.fromisoformat(s.replace("Z", "+00:00"))
+
                 await db.execute(text("""
                     UPDATE repos SET
                         stargazers_count = :stars,
@@ -101,8 +106,8 @@ async def main():
                 """), {
                     "stars": data["stars"],
                     "open_issues": data["open_issues"],
-                    "updated_at": data["updated_at"],
-                    "pushed_at": data["pushed_at"],
+                    "updated_at": _parse_dt(data["updated_at"]),
+                    "pushed_at": _parse_dt(data["pushed_at"]),
                     "repo_id": str(repo_id),
                 })
 
@@ -162,7 +167,7 @@ async def main():
                             "sha": sha,
                             "message": message,
                             "author": author,
-                            "date": date_str,
+                            "date": _parse_dt(date_str),
                             "url": url,
                         })
 
