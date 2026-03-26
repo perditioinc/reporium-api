@@ -777,13 +777,17 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         "stars": repo.get("parent_stars") if repo.get("is_fork") else (repo.get("stargazers_count") or 0),
         "forks": repo.get("parent_forks") if repo.get("is_fork") else (repo.get("fork_count") or 0),
         "openIssuesCount": repo.get("open_issues_count") or 0,
-        "lastUpdated": _iso(repo.get("github_updated_at") or repo.get("updated_at")),
+        "lastUpdated": _iso(repo.get("updated_at") or repo.get("github_updated_at")),
         "url": repo.get("github_url") or f"https://github.com/{owner}/{name}",
         "isArchived": repo.get("parent_is_archived") or False,
         "readmeSummary": repo.get("readme_summary"),
         "parentStats": parent_stats,
         "recentCommits": all_commit_data[:10],
-        "createdAt": _iso(repo.get("upstream_created_at") if repo.get("forked_from") else repo.get("github_created_at")),
+        "createdAt": _iso(
+            repo.get("upstream_created_at")
+            if repo.get("forked_from")
+            else (repo.get("ingested_at") or repo.get("github_updated_at"))
+        ),
         "forkedAt": _iso(repo.get("forked_at")),
         "yourLastPushAt": _iso(repo.get("your_last_push_at")),
         "upstreamLastPushAt": _iso(repo.get("upstream_last_push_at")),
