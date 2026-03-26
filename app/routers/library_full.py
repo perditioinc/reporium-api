@@ -796,6 +796,8 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         ],
         "problemSolved": repo.get("problem_solved"),
         "licenseSpdx": repo.get("license_spdx"),
+        "qualitySignals": repo.get("quality_signals"),
+        "securitySignals": repo.get("security_signals"),
         "builders": [
             {
                 "login": b["login"],
@@ -1102,7 +1104,7 @@ async def _fetch_page_repos(
                parent_stars, parent_forks, parent_is_archived, stargazers_count, open_issues_count,
                commits_last_7_days, commits_last_30_days, commits_last_90_days,
                readme_summary, activity_score, ingested_at, updated_at, github_updated_at,
-               problem_solved, license_spdx, quality_signals, has_tests, has_ci
+               problem_solved, license_spdx, quality_signals, has_tests, has_ci, security_signals
         FROM repos
         WHERE is_private = false
         ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
