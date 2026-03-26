@@ -60,6 +60,8 @@ KNOWN_ORG_CATEGORIES: dict = {
     'google':          ('big-tech',  'Google'),
     'google-deepmind': ('ai-lab',    'Google DeepMind'),
     'google-gemini':   ('big-tech',  'Google Gemini'),
+    'googlecloudplatform': ('big-tech', 'Google Cloud'),
+    'googleapis':      ('big-tech',  'Google APIs'),
     'microsoft':       ('big-tech',  'Microsoft'),
     'meta-llama':      ('big-tech',  'Meta'),
     'facebookresearch':('ai-lab',    'Meta Research'),
@@ -1142,7 +1144,7 @@ def _build_builder_stats(repos: list) -> list:
             "topRepos": bd["topRepos"][:5],
             "avatarUrl": bd["avatarUrl"],
         })
-    return stats[:50]  # Top 50 builders by repo count
+    return stats[:200]  # Top 200 builders by repo count
 
 
 async def _fetch_page_repos(
