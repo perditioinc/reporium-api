@@ -672,7 +672,8 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
                          ai_skills: list, tags: list, pm_skills: list,
                          builders: list = None, industries: list = None,
                          lifecycle_groups: dict = None,
-                         taxonomy: list = None) -> dict:
+                         taxonomy: list = None,
+                         commits: list = None) -> dict:
     """Transform a DB repo row + junction data into the frontend EnrichedRepo shape."""
     forked_from = repo.get("forked_from")
     owner = repo.get("owner", "perditioinc")
@@ -729,6 +730,33 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
     c30 = repo.get("commits_last_30_days") or 0
     c90 = repo.get("commits_last_90_days") or 0
 
+    # Bin commit history from repo_commits table into time buckets
+    all_commit_data = commits or []
+    now = datetime.now(tz=None)  # naive UTC-ish for comparison
+    commits_7d = []
+    commits_30d = []
+    commits_90d = []
+    for cmt in all_commit_data:
+        date_str = cmt.get("date", "")
+        if not date_str:
+            continue
+        try:
+            cdate = datetime.fromisoformat(date_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        except (ValueError, TypeError):
+            continue
+        days_ago = (now - cdate).days
+        if days_ago <= 7:
+            commits_7d.append(cmt)
+        if days_ago <= 30:
+            commits_30d.append(cmt)
+        if days_ago <= 90:
+            commits_90d.append(cmt)
+
+    # Use actual commit counts when DB scalars are 0 but we have commit rows
+    effective_c7 = max(c7, len(commits_7d))
+    effective_c30 = max(c30, len(commits_30d))
+    effective_c90 = max(c90, len(commits_90d))
+
     all_cats = list(dict.fromkeys(_normalize_category(c["category_name"]) for c in categories))
     primary_cat = all_cats[0] if all_cats else "Dev Tools & Automation"
 
@@ -747,35 +775,35 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         "topics": [t["tag"] for t in tags],
         "enrichedTags": list(dict.fromkeys([s["skill"] for s in ai_skills] + [t["tag"] for t in tags])),
         "stars": repo.get("parent_stars") if repo.get("is_fork") else (repo.get("stargazers_count") or 0),
-        "forks": repo.get("parent_forks") if repo.get("is_fork") else 0,
+        "forks": repo.get("parent_forks") if repo.get("is_fork") else (repo.get("fork_count") or 0),
         "openIssuesCount": repo.get("open_issues_count") or 0,
         "lastUpdated": _iso(repo.get("github_updated_at") or repo.get("updated_at")),
         "url": repo.get("github_url") or f"https://github.com/{owner}/{name}",
         "isArchived": repo.get("parent_is_archived") or False,
         "readmeSummary": repo.get("readme_summary"),
         "parentStats": parent_stats,
-        "recentCommits": [],
+        "recentCommits": all_commit_data[:10],
         "createdAt": _iso(repo.get("upstream_created_at") if repo.get("forked_from") else repo.get("github_created_at")),
         "forkedAt": _iso(repo.get("forked_at")),
         "yourLastPushAt": _iso(repo.get("your_last_push_at")),
         "upstreamLastPushAt": _iso(repo.get("upstream_last_push_at")),
         "upstreamCreatedAt": _iso(repo.get("upstream_created_at")),
         "forkSync": fork_sync,
-        "weeklyCommitCount": c7,
+        "weeklyCommitCount": effective_c7,
         "languageBreakdown": lang_breakdown,
         "languagePercentages": lang_percentages,
-        "commitsLast7Days": [],
-        "commitsLast30Days": [],
-        "commitsLast90Days": [],
-        "totalCommitsFetched": 0,
+        "commitsLast7Days": commits_7d,
+        "commitsLast30Days": commits_30d,
+        "commitsLast90Days": commits_90d,
+        "totalCommitsFetched": len(all_commit_data),
         "primaryCategory": primary_cat,
         "allCategories": all_cats,
         "commitStats": {
-            "today": 0,
-            "last7Days": c7,
-            "last30Days": c30,
-            "last90Days": c90,
-            "recentCommits": [],
+            "today": len([c for c in commits_7d if c.get("date") and (now - datetime.fromisoformat(c["date"].replace("Z", "+00:00")).replace(tzinfo=None)).days == 0]),
+            "last7Days": effective_c7,
+            "last30Days": effective_c30,
+            "last90Days": effective_c90,
+            "recentCommits": all_commit_data[:5],
         },
         "latestRelease": None,
         "aiDevSkills": [
@@ -1133,7 +1161,7 @@ async def _fetch_page_repos(
         r = await db.execute(text(q), {"ids": page_ids})
         return r.fetchall()
 
-    lang_rows, cat_rows, skill_rows, tag_rows, pm_rows, builder_rows, taxonomy_rows = (
+    lang_rows, cat_rows, skill_rows, tag_rows, pm_rows, builder_rows, taxonomy_rows, commit_rows = (
         await asyncio.gather(
             _fetch_junction("SELECT repo_id, language, bytes, percentage FROM repo_languages WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, category_name, is_primary FROM repo_categories WHERE repo_id::text = ANY(:ids)"),
@@ -1142,6 +1170,10 @@ async def _fetch_page_repos(
             _fetch_junction("SELECT repo_id, skill FROM repo_pm_skills WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, login, display_name, org_category, is_known_org FROM repo_builders WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, dimension, raw_value, similarity_score, assigned_by FROM repo_taxonomy WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction(
+                "SELECT repo_id, sha, message, author, committed_at, url FROM repo_commits "
+                "WHERE repo_id::text = ANY(:ids) ORDER BY committed_at DESC"
+            ),
         )
     )
 
@@ -1181,6 +1213,16 @@ async def _fetch_page_repos(
             "assigned_by": r.assigned_by,
         })
 
+    all_commits: dict = defaultdict(list)
+    for r in commit_rows:
+        all_commits[str(r.repo_id)].append({
+            "sha": r.sha,
+            "message": r.message,
+            "author": r.author,
+            "date": r.committed_at.isoformat() if r.committed_at else "",
+            "url": r.url or "",
+        })
+
     lifecycle_groups = await _get_lifecycle_groups(db)
 
     enriched = []
@@ -1197,6 +1239,7 @@ async def _fetch_page_repos(
             industries=[],
             lifecycle_groups=lifecycle_groups,
             taxonomy=all_taxonomy.get(rid, []),
+            commits=all_commits.get(rid, []),
         )))
 
     return enriched, total
