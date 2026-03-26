@@ -720,17 +720,21 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         date_says_behind = False
         if your_push and upstream_push:
             import datetime as _dt_mod
-            def _parse_dt(v):
+            def _to_naive_utc(v):
+                """Convert to naive UTC datetime for safe comparison."""
                 if isinstance(v, _dt_mod.datetime):
+                    if v.tzinfo is not None:
+                        return v.replace(tzinfo=None)
                     return v
                 if isinstance(v, str):
                     try:
-                        return _dt_mod.datetime.fromisoformat(v.replace("Z", "+00:00"))
+                        dt = _dt_mod.datetime.fromisoformat(v.replace("Z", "+00:00"))
+                        return dt.replace(tzinfo=None)
                     except Exception:
                         return None
                 return None
-            yp = _parse_dt(your_push)
-            up = _parse_dt(upstream_push)
+            yp = _to_naive_utc(your_push)
+            up = _to_naive_utc(upstream_push)
             if yp and up and up > yp:
                 date_says_behind = True
 
