@@ -1,7 +1,8 @@
 import json
 import logging
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -767,3 +768,86 @@ async def backfill_categories(
     invalidate_library_cache()
 
     return {"processed": processed, "assigned": assigned, "skipped": skipped}
+
+
+# ── Security signal models ──────────────────────────────────────────────────
+
+class SecuritySignalsPatch(BaseModel):
+    """Payload for manually setting a repo's security risk signals."""
+    risk_level: str | None = None        # 'critical' | 'high' | 'medium' | 'low'
+    incident_reported: bool = False
+    incident_date: str | None = None     # ISO date, e.g. "2024-05-20"
+    incident_url: str | None = None      # link to advisory / blog post / CVE
+    incident_summary: str | None = None  # one-sentence human-readable summary
+
+
+@router.patch(
+    "/admin/repos/{repo_name}/security",
+    dependencies=[Depends(require_admin_key)],
+    summary="Set security risk signals for a repo",
+)
+async def set_repo_security_signals(
+    repo_name: str,
+    payload: SecuritySignalsPatch,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Manually mark a repo with security risk metadata.
+    Creates or replaces the security_signals JSONB on the matching repo row.
+
+    Example body for LiteLLM-style supply-chain incident:
+        {
+          "risk_level": "critical",
+          "incident_reported": true,
+          "incident_date": "2024-05-20",
+          "incident_url": "https://github.com/BerriAI/litellm/issues/3668",
+          "incident_summary": "Malicious PyPI package published; credentials at risk"
+        }
+    """
+    result = await db.execute(
+        select(Repo).where(Repo.name == repo_name)
+    )
+    repo = result.scalar_one_or_none()
+    if repo is None:
+        raise HTTPException(status_code=404, detail=f"Repo '{repo_name}' not found")
+
+    repo.security_signals = {
+        "risk_level": payload.risk_level,
+        "incident_reported": payload.incident_reported,
+        "incident_date": payload.incident_date,
+        "incident_url": payload.incident_url,
+        "incident_summary": payload.incident_summary,
+    }
+    await db.commit()
+
+    # Bust all library caches so the next page load reflects the update
+    await cache.invalidate("library:full*")
+    await cache.invalidate("repos:list:*")
+    invalidate_library_cache()
+
+    return {
+        "repo": repo_name,
+        "security_signals": repo.security_signals,
+    }
+
+
+@router.delete(
+    "/admin/repos/{repo_name}/security",
+    dependencies=[Depends(require_admin_key)],
+    summary="Clear security risk signals for a repo",
+)
+async def clear_repo_security_signals(
+    repo_name: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove all security signals from a repo (set to NULL)."""
+    result = await db.execute(select(Repo).where(Repo.name == repo_name))
+    repo = result.scalar_one_or_none()
+    if repo is None:
+        raise HTTPException(status_code=404, detail=f"Repo '{repo_name}' not found")
+
+    repo.security_signals = None
+    await db.commit()
+    invalidate_library_cache()
+
+    return {"repo": repo_name, "security_signals": None}

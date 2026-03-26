@@ -70,6 +70,10 @@ class Repo(Base):
     has_tests: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     has_ci: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
+    # Security risk — curated manually or via admin API
+    # Structure: {risk_level, incident_reported, incident_date, incident_url, incident_summary}
+    security_signals: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
     # Relationships
     tags: Mapped[list["RepoTag"]] = relationship(
         back_populates="repo", cascade="all, delete-orphan"
