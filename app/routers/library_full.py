@@ -719,13 +719,13 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         upstream_push = repo.get("upstream_last_push_at")
         date_says_behind = False
         if your_push and upstream_push:
-            from datetime import datetime, timezone
+            import datetime as _dt_mod
             def _parse_dt(v):
-                if isinstance(v, datetime):
+                if isinstance(v, _dt_mod.datetime):
                     return v
                 if isinstance(v, str):
                     try:
-                        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+                        return _dt_mod.datetime.fromisoformat(v.replace("Z", "+00:00"))
                     except Exception:
                         return None
                 return None
