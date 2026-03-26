@@ -126,12 +126,11 @@ async def get_library(
 
     # Top tags — query across ALL repo_tags so the tag cloud reflects the
     # full corpus, not just the current page's 100 repos.
-    # 200 tags gives a rich cloud; the frontend can truncate if desired.
+    # No LIMIT: return every unique tag; the frontend can truncate as desired.
     global_tags_stmt = (
         select(RepoTag.tag, func.count(RepoTag.repo_id).label("cnt"))
         .group_by(RepoTag.tag)
         .order_by(func.count(RepoTag.repo_id).desc())
-        .limit(200)
     )
     global_tags_result = await db.execute(global_tags_stmt)
     global_top_tags = [row.tag for row in global_tags_result.all()]
@@ -169,7 +168,7 @@ async def get_library(
         repos=[_repo_to_summary(r) for r in repos],
         stats=stats,
         categories=categories,
-        tag_metrics=tag_metrics[:200],
+        tag_metrics=tag_metrics,
         total=total,
         page=page,
         limit=limit,
