@@ -93,6 +93,7 @@ async def get_library(
     # Load repos with all relationships
     stmt = (
         select(Repo)
+        .where(Repo.is_private == False)  # noqa: E712 — SECURITY: never expose private repos
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -109,7 +110,7 @@ async def get_library(
     result = await db.execute(stmt)
     repos = result.scalars().all()
 
-    total_stmt = select(func.count(Repo.id))
+    total_stmt = select(func.count(Repo.id)).where(Repo.is_private == False)  # noqa: E712
     total_result = await db.execute(total_stmt)
     total = total_result.scalar_one()
 
