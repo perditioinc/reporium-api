@@ -76,6 +76,7 @@ async def list_repos(
 
     stmt = (
         select(Repo)
+        .where(Repo.is_private == False)  # noqa: E712 — SECURITY: never expose private repos
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -167,7 +168,7 @@ async def get_repo(name: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
 
     stmt = (
         select(Repo)
-        .where(Repo.name == name)
+        .where(Repo.name == name, Repo.is_private == False)  # noqa: E712
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -194,7 +195,7 @@ async def get_repo_by_owner(owner: str, repo: str, db: AsyncSession = Depends(ge
     """Get a single repo by owner/name."""
     stmt = (
         select(Repo)
-        .where(Repo.owner == owner, Repo.name == repo)
+        .where(Repo.owner == owner, Repo.name == repo, Repo.is_private == False)  # noqa: E712
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
