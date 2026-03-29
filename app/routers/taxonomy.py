@@ -109,7 +109,7 @@ async def get_repos_for_skill_area(name: str, db: AsyncSession = Depends(get_db)
         "       r.stargazers_count, r.parent_stars, r.activity_score, r.readme_summary "
         "FROM repos r "
         "JOIN repo_ai_dev_skills s ON s.repo_id = r.id "
-        "WHERE s.skill = :skill "
+        "WHERE s.skill = :skill AND r.is_private = false "
         "ORDER BY COALESCE(r.stargazers_count, r.parent_stars, 0) DESC"
     )
     repos_result = await db.execute(repos_stmt, {"skill": name})
