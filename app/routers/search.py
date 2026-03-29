@@ -33,11 +33,12 @@ async def search_repos(
     stmt = (
         select(Repo)
         .where(
+            Repo.is_private == False,  # noqa: E712 — SQLAlchemy requires == not `is`
             or_(
                 Repo.name.ilike(search),
                 Repo.description.ilike(search),
                 Repo.readme_summary.ilike(search),
-            )
+            ),
         )
         .options(
             selectinload(Repo.tags),
