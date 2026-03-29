@@ -1148,7 +1148,7 @@ def _build_builder_stats(repos: list) -> list:
             "topRepos": bd["topRepos"][:5],
             "avatarUrl": bd["avatarUrl"],
         })
-    return stats[:200]  # Top 200 builders by repo count
+    return stats[:50]  # Top 50 builders by repo count
 
 
 async def _fetch_page_repos(
