@@ -74,6 +74,10 @@ class Repo(Base):
     # Structure: {risk_level, incident_reported, incident_date, incident_url, incident_summary}
     security_signals: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
+    # KAN-41 16-category taxonomy (backfilled by backfill_primary_category.py)
+    primary_category: Mapped[str | None] = mapped_column(Text, nullable=True)
+    secondary_categories: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
     # Relationships
     tags: Mapped[list["RepoTag"]] = relationship(
         back_populates="repo", cascade="all, delete-orphan"
