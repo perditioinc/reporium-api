@@ -15,7 +15,7 @@ from slowapi.util import get_remote_address
 
 from app.cache import cache
 from app.database import async_session_factory, check_db_connection, engine
-from app.routers import admin, analytics, ingest, intelligence, library, library_full, platform, repos, search, taxonomy, trends, webhooks, wiki
+from app.routers import admin, analytics, graph, ingest, intelligence, library, library_full, platform, repos, search, taxonomy, trends, webhooks, wiki
 
 
 class _JsonFormatter(logging.Formatter):
@@ -225,6 +225,7 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 app.include_router(library.router)
+app.include_router(graph.router)
 app.include_router(repos.router)
 app.include_router(search.router)
 app.include_router(analytics.router)
