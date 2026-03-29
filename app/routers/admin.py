@@ -511,19 +511,20 @@ async def data_integrity_health(
     - ``healthy``   — all checks pass
     """
     # --- raw counts (fast COUNT queries, no JOINs) ---
-    tables = [
-        "repos",
-        "repo_tags",
-        "repo_categories",
-        "repo_taxonomy",
-        "taxonomy_values",
-        "repo_ai_dev_skills",
-        "repo_pm_skills",
-        "repo_languages",
-    ]
+    # Use explicit SQL strings (not f-strings) to avoid dynamic table name injection.
+    _table_count_sql: dict[str, str] = {
+        "repos":             "SELECT COUNT(*) FROM repos",
+        "repo_tags":         "SELECT COUNT(*) FROM repo_tags",
+        "repo_categories":   "SELECT COUNT(*) FROM repo_categories",
+        "repo_taxonomy":     "SELECT COUNT(*) FROM repo_taxonomy",
+        "taxonomy_values":   "SELECT COUNT(*) FROM taxonomy_values",
+        "repo_ai_dev_skills":"SELECT COUNT(*) FROM repo_ai_dev_skills",
+        "repo_pm_skills":    "SELECT COUNT(*) FROM repo_pm_skills",
+        "repo_languages":    "SELECT COUNT(*) FROM repo_languages",
+    }
     counts: dict[str, int] = {}
-    for table in tables:
-        row = await db.execute(text(f"SELECT COUNT(*) FROM {table}"))  # noqa: S608
+    for table, sql in _table_count_sql.items():
+        row = await db.execute(text(sql))
         counts[table] = row.scalar() or 0
 
     total_repos = counts["repos"]
