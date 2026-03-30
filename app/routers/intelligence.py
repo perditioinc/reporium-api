@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import anthropic
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -764,6 +765,240 @@ async def intelligence_ask(
     the repo knowledge base. Rate limited to 10/minute and 100/day per IP.
     """
     return await _run_query(req, db, client_ip=get_remote_address(request))
+
+
+@router.post("/ask/stream")
+@_limiter.limit("10/minute;100/day")
+async def intelligence_ask_stream(
+    request: Request,
+    req: QueryRequest,
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """
+    Public streaming endpoint — no auth required.
+    Streams the answer as SSE events:
+      data: {"type": "sources", "sources": [...]}   (sent immediately before generation)
+      data: {"type": "token", "text": "..."}         (one per Claude streaming chunk)
+      data: {"type": "done", "tokens": {...}}         (final event with usage stats)
+      data: {"type": "error", "message": "..."}       (on failure)
+
+    Rate limited to 10/minute and 100/day per IP (same as /ask).
+    """
+    client_ip = get_remote_address(request)
+
+    async def event_generator():
+        _started_at = time.monotonic()
+        model = get_embedding_model()
+
+        try:
+            # 1. Embed the question
+            query_embedding = model.encode(req.question)
+
+            # 2. Check semantic cache — if hit, stream the cached answer token-by-token
+            cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
+            if cached is not None:
+                cached_answer, cached_sources, cached_model = cached
+                # Emit sources
+                yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in cached_sources], 'cache_hit': True})}\n\n"
+                # Stream answer word-by-word (simulate streaming for cache hits)
+                words = cached_answer.split(" ")
+                for i, word in enumerate(words):
+                    chunk = word + (" " if i < len(words) - 1 else "")
+                    yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
+                    await asyncio.sleep(0)  # yield control
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'cache_hit': True})}\n\n"
+                asyncio.create_task(_log_query(
+                    question=req.question, answer=cached_answer,
+                    sources=[s.model_dump() for s in cached_sources],
+                    tokens_prompt=0, tokens_completion=0,
+                    hashed_ip=_hash_ip(client_ip),
+                    latency_ms=int((time.monotonic() - _started_at) * 1000),
+                    model=cached_model or "semantic-cache",
+                    question_embedding=query_embedding, cache_hit=True,
+                ))
+                return
+
+            vec_str = _vec_to_pg(query_embedding)
+
+            # 3. Semantic search
+            fetch_k = req.top_k + 10
+            result = await db.execute(
+                text("""
+                    SELECT r.id, r.name, r.owner, r.forked_from, r.description,
+                           r.parent_stars, r.readme_summary, r.problem_solved,
+                           1 - (e.embedding_vec <=> CAST(:vec AS vector)) AS similarity
+                    FROM repo_embeddings e
+                    JOIN repos r ON r.id = e.repo_id
+                    WHERE r.is_private = false
+                      AND e.embedding_vec IS NOT NULL
+                    ORDER BY e.embedding_vec <=> CAST(:vec AS vector)
+                    LIMIT :fetch_k
+                """),
+                {"vec": vec_str, "fetch_k": fetch_k},
+            )
+            rows = result.fetchall()
+
+            scored = []
+            for row in rows:
+                scored.append({
+                    "id": row.id, "name": row.name, "owner": row.owner,
+                    "forked_from": row.forked_from, "description": row.description,
+                    "stars": row.parent_stars, "readme_summary": row.readme_summary,
+                    "problem_solved": row.problem_solved, "similarity": row.similarity,
+                })
+            top_for_answer = scored[:req.top_k]
+
+            # 4. Emit sources before generation starts
+            source_list = [
+                SourceRepo(
+                    name=r["name"], owner=r["owner"], forked_from=r["forked_from"],
+                    description=r["description"], stars=r["stars"],
+                    relevance_score=round(r["similarity"], 4),
+                    problem_solved=r["problem_solved"],
+                    integration_tags=[],
+                )
+                for r in top_for_answer
+            ]
+            yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in source_list], 'cache_hit': False})}\n\n"
+
+            # 5. Build context
+            context_parts = []
+            for i, repo in enumerate(top_for_answer, 1):
+                upstream = repo["forked_from"] or f"{repo['owner']}/{repo['name']}"
+                context_parts.append(
+                    f"<repo index=\"{i}\">\n"
+                    f"name: {upstream}\n"
+                    f"stars: {repo['stars'] or 0}\n"
+                    f"description: {_truncate(repo['description'])}\n"
+                    f"summary: {_truncate(repo['readme_summary'])}\n"
+                    f"problem_solved: {_truncate(repo['problem_solved'])}\n"
+                    f"relevance_score: {repo['similarity']:.4f}\n"
+                    f"</repo>"
+                )
+            context = "\n\n".join(context_parts)
+
+            # Knowledge graph edges
+            if top_for_answer:
+                top_ids = [str(r["id"]) for r in top_for_answer[:5]]
+                edge_result = await db.execute(
+                    text("""
+                        SELECT e.edge_type, r1.forked_from as source_upstream, r1.name as source_name,
+                               r2.forked_from as target_upstream, r2.name as target_name
+                        FROM repo_edges e
+                        JOIN repos r1 ON r1.id = e.source_repo_id
+                        JOIN repos r2 ON r2.id = e.target_repo_id
+                        WHERE e.source_repo_id::text = ANY(:ids) OR e.target_repo_id::text = ANY(:ids)
+                        LIMIT 20
+                    """),
+                    {"ids": top_ids},
+                )
+                edge_rows = edge_result.fetchall()
+                if edge_rows:
+                    edge_context = "\n\nKnowledge graph relationships:\n"
+                    for er in edge_rows:
+                        src = er.source_upstream or er.source_name
+                        tgt = er.target_upstream or er.target_name
+                        edge_context += f"- {src} {er.edge_type} {tgt}\n"
+                    context += edge_context
+
+            # 6. Stream from Claude
+            api_key = _get_anthropic_key()
+            anthropic_client = anthropic.Anthropic(api_key=api_key)
+
+            system_prompt = """You are the Reporium Intelligence assistant. You answer questions about AI development tools and GitHub repositories tracked in the Reporium platform.
+
+Rules:
+- Answer concisely and directly.
+- Cite repos by their upstream name (owner/repo format) when referencing them.
+- If the context is insufficient, say so honestly.
+- Do not make up repos or data not in the context.
+- Keep answers to 2-3 paragraphs maximum."""
+
+            user_prompt = (
+                f"Here are the most relevant repos from the library:\n\n{context}\n\n"
+                f"Question: {req.question}\n\n"
+                "Please answer the question based on the repos above."
+            )
+
+            full_answer = ""
+            input_tokens = 0
+            output_tokens = 0
+
+            def _stream_claude():
+                with anthropic_breaker:
+                    return anthropic_client.messages.stream(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=1024,
+                        system=system_prompt,
+                        messages=[{"role": "user", "content": user_prompt}],
+                    )
+
+            loop = asyncio.get_event_loop()
+
+            # Use a queue to bridge the sync streaming iterator to async
+            import queue
+            token_queue: queue.Queue = queue.Queue()
+
+            def _run_stream():
+                try:
+                    with _stream_claude() as stream:
+                        for text_chunk in stream.text_stream:
+                            token_queue.put(("token", text_chunk))
+                        msg = stream.get_final_message()
+                        token_queue.put(("done", msg))
+                except Exception as e:
+                    token_queue.put(("error", str(e)))
+
+            # Run the blocking streamer in a thread
+            future = loop.run_in_executor(None, _run_stream)
+
+            while True:
+                try:
+                    item = await loop.run_in_executor(
+                        None,
+                        lambda: token_queue.get(timeout=35),
+                    )
+                except queue.Empty:
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Stream timed out'})}\n\n"
+                    break
+
+                event_type, payload = item
+                if event_type == "token":
+                    full_answer += payload
+                    yield f"data: {json.dumps({'type': 'token', 'text': payload})}\n\n"
+                elif event_type == "done":
+                    input_tokens = payload.usage.input_tokens
+                    output_tokens = payload.usage.output_tokens
+                    yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': input_tokens, 'output': output_tokens, 'total': input_tokens + output_tokens}})}\n\n"
+                    # Fire-and-forget log
+                    asyncio.create_task(_log_query(
+                        question=req.question, answer=full_answer,
+                        sources=[s.model_dump() for s in source_list],
+                        tokens_prompt=input_tokens, tokens_completion=output_tokens,
+                        hashed_ip=_hash_ip(client_ip),
+                        latency_ms=int((time.monotonic() - _started_at) * 1000),
+                        model="claude-sonnet-4-20250514",
+                        question_embedding=query_embedding,
+                    ))
+                    break
+                elif event_type == "error":
+                    yield f"data: {json.dumps({'type': 'error', 'message': payload})}\n\n"
+                    break
+
+            await future  # ensure thread cleanup
+
+        except Exception as e:
+            logger.error("Streaming ask error: %s", str(e), exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Internal server error. Please try again.'})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable Nginx buffering
+        },
+    )
 
 
 @router.get("/portfolio-insights", response_model=PortfolioInsightsResponse)
