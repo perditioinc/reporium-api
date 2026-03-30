@@ -52,6 +52,35 @@ async def test_ingest_is_idempotent(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_ingest_empty_arrays_preserve_existing_junction_data(client: AsyncClient):
+    """Regression test for KAN-123: empty arrays in payload must not wipe existing junction rows."""
+    # First ingest with full data
+    r1 = await client.post("/ingest/repos", json=[TEST_REPO_FIXTURE], headers=AUTH_HEADERS)
+    assert r1.status_code == 200
+
+    # Second ingest with all junction arrays emptied — existing data must be preserved
+    sparse_payload = {
+        **TEST_REPO_FIXTURE,
+        "tags": [],
+        "categories": [],
+        "builders": [],
+        "ai_dev_skills": [],
+        "pm_skills": [],
+        "languages": [],
+        "commits": [],
+    }
+    r2 = await client.post("/ingest/repos", json=[sparse_payload], headers=AUTH_HEADERS)
+    assert r2.status_code == 200
+
+    # Fetch the repo and confirm junction data is intact
+    detail = await client.get("/repos/test-repo")
+    assert detail.status_code == 200
+    data = detail.json()
+    assert len(data["tags"]) > 0, "tags were wiped by empty-array payload"
+    assert len(data["builders"]) > 0, "builders were wiped by empty-array payload"
+
+
+@pytest.mark.asyncio
 async def test_ingest_batch_limit(client: AsyncClient):
     items = [
         {**TEST_REPO_FIXTURE, "name": f"batch-repo-{i}", "github_url": f"https://github.com/u/r{i}"}
