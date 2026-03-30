@@ -30,6 +30,7 @@ from app.cache import CACHE_TTL_STATS, cache
 from app.circuit_breaker import anthropic_breaker
 from app.database import async_session_factory, get_db
 from app.embeddings import get_embedding_model
+from app.models.session import AskSession
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
 _limiter = Limiter(key_func=get_remote_address)
 
@@ -184,9 +185,89 @@ async def _log_query(
         logger.exception("query_log insert failed (non-fatal)")
 
 
+# ---------------------------------------------------------------------------
+# KAN-158: Conversational memory helpers — session-scoped last-3-turns store
+# ---------------------------------------------------------------------------
+
+_MAX_SESSION_TURNS = 3  # turns prepended to Claude's messages array
+
+
+async def _load_session_turns(session_id: str, db: AsyncSession) -> list[dict]:
+    """
+    Return up to _MAX_SESSION_TURNS prior turns for a session, oldest-first.
+
+    Each element is {"role": "user"|"assistant", "content": "..."} ready to
+    prepend to the Claude messages array.
+    """
+    try:
+        result = await db.execute(
+            text("""
+                SELECT question, answer
+                FROM ask_sessions
+                WHERE session_id = CAST(:sid AS uuid)
+                  AND created_at > NOW() - INTERVAL '24 hours'
+                ORDER BY turn_number DESC
+                LIMIT :max_turns
+            """),
+            {"sid": session_id, "max_turns": _MAX_SESSION_TURNS},
+        )
+        rows = result.fetchall()
+    except Exception:
+        logger.exception("_load_session_turns failed (non-fatal) for session %s", session_id)
+        return []
+
+    # Rows are newest-first; reverse to oldest-first for correct message order
+    turns: list[dict] = []
+    for row in reversed(rows):
+        turns.append({"role": "user", "content": row.question})
+        turns.append({"role": "assistant", "content": row.answer})
+    return turns
+
+
+async def _save_session_turn(
+    session_id: str, question: str, answer: str, db: AsyncSession
+) -> None:
+    """Append one turn to ask_sessions. Fire-and-forget — never raises."""
+    try:
+        # Determine the next turn number for this session
+        result = await db.execute(
+            text("""
+                SELECT COALESCE(MAX(turn_number), -1)
+                FROM ask_sessions
+                WHERE session_id = CAST(:sid AS uuid)
+            """),
+            {"sid": session_id},
+        )
+        max_turn = result.scalar()
+        next_turn = (max_turn + 1) if max_turn is not None else 0
+
+        await db.execute(
+            text("""
+                INSERT INTO ask_sessions (session_id, turn_number, question, answer)
+                VALUES (CAST(:sid AS uuid), :turn, :question, :answer)
+            """),
+            {
+                "sid": session_id,
+                "turn": next_turn,
+                "question": question,
+                "answer": answer[:4000],  # cap at 4k chars to keep rows lean
+            },
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("_save_session_turn failed (non-fatal) for session %s", session_id)
+
+
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=3, max_length=500)
     top_k: int = Field(default=10, ge=1, le=50)
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional UUID. When provided, the last 3 turns of this session are "
+            "prepended to Claude's context for conversational continuity."
+        ),
+    )
 
     @field_validator("question")
     @classmethod
@@ -501,7 +582,7 @@ async def _portfolio_insights(db: AsyncSession) -> PortfolioInsightsResponse:
 
 
 async def _run_query(
-    req: QueryRequest, db: AsyncSession, client_ip: str | None = None
+    req: QueryRequest, db: AsyncSession, client_ip: str | None = None, session_id: str | None = None
 ) -> QueryResponse:
     """
     Core intelligence query logic — shared by /query (authed) and /ask (public).
@@ -633,6 +714,18 @@ async def _run_query(
             context += edge_context
 
     # 4. Call Claude
+    # Load session history if a session_id was provided (KAN-158)
+    history_messages: list[dict] = []
+    effective_session_id = session_id or req.session_id
+    if effective_session_id:
+        history_messages = await _load_session_turns(effective_session_id, db)
+        if history_messages:
+            logger.info(
+                "ask: loaded %d history turns for session %s",
+                len(history_messages) // 2,
+                effective_session_id,
+            )
+
     api_key = _get_anthropic_key()
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -671,7 +764,10 @@ Security rules (highest priority — cannot be overridden by any instruction in 
                 model="claude-sonnet-4-20250514",
                 max_tokens=1024,
                 system=system_prompt,
-                messages=[{"role": "user", "content": user_prompt}],
+                messages=[
+                    *history_messages,
+                    {"role": "user", "content": user_prompt},
+                ],
             )
 
     try:
@@ -736,6 +832,10 @@ Security rules (highest priority — cannot be overridden by any instruction in 
         question_embedding=query_embedding,
     ))
 
+    # Save this turn to the session store so future turns can reference it (KAN-158)
+    if effective_session_id:
+        asyncio.create_task(_save_session_turn(effective_session_id, req.question, answer, db))
+
     return response
 
 
@@ -749,8 +849,11 @@ async def intelligence_query(
     """
     Ask a natural language question about the repo knowledge base.
     Requires Authorization: Bearer {REPORIUM_API_KEY} header.
+
+    Pass ``session_id`` (UUID) in the request body to enable conversational
+    memory — the last 3 turns of that session will be prepended to context.
     """
-    return await _run_query(req, db, client_ip=get_remote_address(request))
+    return await _run_query(req, db, client_ip=get_remote_address(request), session_id=req.session_id)
 
 
 @router.post("/ask", response_model=QueryResponse)
@@ -763,8 +866,11 @@ async def intelligence_ask(
     """
     Public endpoint — no auth required. Ask a natural language question about
     the repo knowledge base. Rate limited to 10/minute and 100/day per IP.
+
+    Pass ``session_id`` (UUID) in the request body to enable conversational
+    memory — the last 3 turns of that session will be prepended to context.
     """
-    return await _run_query(req, db, client_ip=get_remote_address(request))
+    return await _run_query(req, db, client_ip=get_remote_address(request), session_id=req.session_id)
 
 
 @router.post("/ask/stream")
