@@ -177,9 +177,14 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
         db.add(repo)
     else:
         for key, val in repo_fields.items():
-            if val is not None or key in {"description", "forked_from", "primary_language",
-                                           "fork_sync_state", "readme_summary", "github_updated_at",
-                                           "github_created_at"}:
+            # readme_summary and quality_signals are written by the AI enricher —
+            # never overwrite them with NULL during a bulk ingest upsert.
+            if key in {"readme_summary", "quality_signals", "problem_solved", "integration_tags"}:
+                if val is not None:
+                    setattr(repo, key, val)
+            elif val is not None or key in {"description", "forked_from", "primary_language",
+                                             "fork_sync_state", "github_updated_at",
+                                             "github_created_at"}:
                 setattr(repo, key, val)
         repo.updated_at = datetime.now(timezone.utc)
 
