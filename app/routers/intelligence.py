@@ -49,7 +49,7 @@ _INJECTION_PATTERNS = re.compile(
 )
 
 _MAX_CONTENT_LEN = 400  # max chars per repo field in context
-_SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.15
+_SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.08  # cosine distance ≤ 0.08 ≈ similarity ≥ 0.92
 
 
 def _sanitize_question(question: str) -> str:
