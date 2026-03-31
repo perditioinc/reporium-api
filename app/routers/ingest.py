@@ -1,13 +1,18 @@
+import asyncio
 import base64
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
+import anthropic as _anthropic_lib
 from fastapi import APIRouter, Depends, HTTPException, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy import select
+
+from app.circuit_breaker import anthropic_breaker
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -58,6 +63,128 @@ _TAXONOMY_DIMENSION_MAP = {
     "deployment_context": "deployment_context",
     "dependencies": "dependency",
 }
+
+
+# ---------------------------------------------------------------------------
+# KAN-157: Auto-enrichment helpers (Haiku, ~$0.0004/repo)
+# ---------------------------------------------------------------------------
+
+_AUTO_ENRICH_PROMPT = """Analyze this AI/ML GitHub repository and return a JSON object.
+
+Repository information:
+{repo_context}
+
+{{
+  "readme_summary": "2-3 sentence plain language description of what this repo does and who uses it",
+  "problem_solved": "1 sentence: what specific problem does this solve",
+  "quality_assessment": "high|medium|low — based on documentation quality, activity, and stars",
+  "maturity_level": "research|prototype|beta|production",
+  "skill_areas": ["AI/ML expertise domains — e.g. 'Retrieval-Augmented Generation', 'LoRA Fine-tuning'"],
+  "industries": ["industry verticals — e.g. 'Healthcare', 'FinTech' — omit if general-purpose"],
+  "use_cases": ["specific problems solved — e.g. 'Document Question Answering', 'Code Review Automation'"],
+  "modalities": ["data types — e.g. 'Text', 'Code', 'Image', 'Audio'"],
+  "ai_trends": ["AI paradigms — e.g. 'Agentic AI', 'Small Language Models', 'AI Safety'"],
+  "deployment_context": ["where it runs — e.g. 'Cloud API', 'Self-hosted', 'Edge/Mobile'"],
+  "integration_tags": ["specific frameworks/tools — lowercase — e.g. 'langchain', 'pytorch', 'fastapi'"]
+}}
+
+Rules:
+- Base all values on the description/context — no speculation
+- integration_tags: lowercase, specific library names only
+- Return ONLY valid JSON, no markdown, no explanation"""
+
+_ENRICH_TAXONOMY_DIMENSIONS = {
+    "skill_areas":        "skill_area",
+    "industries":         "industry",
+    "use_cases":          "use_case",
+    "modalities":         "modality",
+    "ai_trends":          "ai_trend",
+    "deployment_context": "deployment_context",
+}
+
+
+def _get_anthropic_key() -> str:
+    """Retrieve Anthropic API key from env or GCP Secret Manager."""
+    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    if key:
+        return key
+    try:
+        from google.cloud import secretmanager
+        client = secretmanager.SecretManagerServiceClient()
+        project = os.getenv("GCP_PROJECT", "perditio-platform")
+        name = f"projects/{project}/secrets/anthropic-api-key/versions/latest"
+        response = client.access_secret_version(request={"name": name})
+        return response.payload.data.decode("UTF-8").strip()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"ANTHROPIC_API_KEY not configured: {exc}")
+
+
+async def _enrich_repo_with_haiku(repo: Repo, db: AsyncSession) -> dict:
+    """
+    Call Claude Haiku to enrich a single repo with readme_summary, quality_signals,
+    and taxonomy dimensions. Returns a dict with enrichment outcome stats.
+
+    Uses asyncio.to_thread so the synchronous Anthropic SDK call doesn't block the loop.
+    """
+    parts = [
+        f"Name: {repo.owner}/{repo.name}",
+        f"Description: {repo.description or 'None'}",
+        f"Primary Language: {repo.primary_language or 'Unknown'}",
+    ]
+    if repo.forked_from:
+        parts.append(f"Forked from: {repo.forked_from}")
+    repo_context = "\n".join(parts)
+    prompt = _AUTO_ENRICH_PROMPT.format(repo_context=repo_context)
+
+    api_key = _get_anthropic_key()
+
+    def _call_haiku():
+        client = _anthropic_lib.Anthropic(api_key=api_key)
+        return client.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=800,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+    with anthropic_breaker:
+        response = await asyncio.to_thread(_call_haiku)
+
+    raw = response.content[0].text.strip()
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+    data = json.loads(raw)
+
+    # Validate quality/maturity
+    quality = data.get("quality_assessment", "medium")
+    if quality not in ("high", "medium", "low"):
+        quality = "medium"
+    maturity = data.get("maturity_level", "")
+    if maturity not in ("research", "prototype", "beta", "production"):
+        maturity = None
+
+    # Write enrichment columns
+    repo.readme_summary = data.get("readme_summary") or repo.readme_summary
+    repo.problem_solved = data.get("problem_solved") or repo.problem_solved
+    repo.integration_tags = [
+        t.lower().strip() for t in data.get("integration_tags", []) if t and isinstance(t, str)
+    ] or repo.integration_tags
+    repo.quality_signals = {"quality": quality, "maturity": maturity}
+    repo.updated_at = datetime.now(timezone.utc)
+
+    # Write taxonomy dimensions via the shared helper
+    taxonomy_dict = {k: data.get(k, []) for k in _ENRICH_TAXONOMY_DIMENSIONS}
+    await _upsert_repo_taxonomy(db, repo.id, taxonomy_dict)
+
+    await db.commit()
+
+    return {
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+        "quality": quality,
+        "maturity": maturity,
+    }
 
 
 def _severity_for_repo_count(repo_count: int) -> str:
@@ -422,4 +549,90 @@ async def repo_ingested_event(
         "taxonomy_assign": assign_result,
         "gap_rebuild": gap_result,
         "portfolio_insights": insights_result,
+    }
+
+
+# ---------------------------------------------------------------------------
+# KAN-157: POST /ingest/events/repo-added
+# Triggered by Pub/Sub REPO_ADDED events when a new repo enters the platform.
+# ---------------------------------------------------------------------------
+
+@events_router.post("/repo-added", response_model=dict)
+async def repo_added_event(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """
+    Handle Pub/Sub REPO_ADDED push notifications.
+
+    When forksync or the ingestion pipeline adds a new repo, it publishes a
+    ``repo.added`` event with ``name_with_owner`` in the payload.  This handler:
+
+    1. Resolves the repo by name from the DB.
+    2. Skips if already enriched (idempotent).
+    3. Calls Claude Haiku to generate readme_summary, quality_signals, and
+       taxonomy dimensions — ~$0.0004 per repo.
+    4. Invalidates relevant caches.
+
+    Always returns HTTP 200 so Pub/Sub does not retry on transient enrichment
+    failures (errors are logged instead).
+    """
+    payload = _parse_pubsub_payload(await request.json())
+
+    # REPO_ADDED schema: {"name_with_owner": "owner/name", "stars": N, "language": "..."}
+    name_with_owner = (
+        payload.get("name_with_owner")
+        or payload.get("repo_name")
+        or payload.get("name")
+        or ""
+    )
+    # Extract bare repo name (the "name" column in repos table uses owner/name or just name)
+    # The repos table uses bare name as the unique key; strip owner prefix if present.
+    repo_name = name_with_owner.split("/")[-1] if name_with_owner else ""
+    if not repo_name:
+        logger.warning("repo-added event: no repo name in payload — skipping")
+        return {"status": "skipped", "reason": "no repo name in payload"}
+
+    result = await db.execute(select(Repo).where(Repo.name == repo_name))
+    repo = result.scalar_one_or_none()
+
+    if repo is None:
+        logger.warning("repo-added event: repo '%s' not found in DB — may not be ingested yet", repo_name)
+        return {"status": "skipped", "reason": f"repo '{repo_name}' not found in DB"}
+
+    if repo.quality_signals is not None:
+        logger.info("repo-added event: '%s' already enriched — skipping", repo_name)
+        return {"status": "skipped", "reason": "already enriched", "repo": repo_name}
+
+    logger.info("repo-added event: enriching '%s' with Haiku", repo_name)
+    try:
+        enrich_result = await _enrich_repo_with_haiku(repo, db)
+    except json.JSONDecodeError as exc:
+        logger.error("repo-added event: Haiku JSON parse error for '%s': %s", repo_name, exc)
+        return {"status": "error", "repo": repo_name, "reason": "json_parse_error"}
+    except HTTPException as exc:
+        logger.error("repo-added event: HTTP error for '%s': %s", repo_name, exc.detail)
+        return {"status": "error", "repo": repo_name, "reason": exc.detail}
+    except Exception as exc:
+        logger.error("repo-added event: unexpected error for '%s': %s", repo_name, exc)
+        return {"status": "error", "repo": repo_name, "reason": str(exc)}
+
+    # Invalidate caches so the enriched data appears immediately
+    await cache.invalidate(f"repos:detail:{repo_name}")
+    await cache.invalidate("library:full*")
+    await cache.invalidate(f"similar:{repo_name}:*")
+    invalidate_library_cache()
+
+    logger.info(
+        "repo-added event: '%s' enriched — quality=%s maturity=%s tokens=%d+%d",
+        repo_name,
+        enrich_result.get("quality"),
+        enrich_result.get("maturity"),
+        enrich_result.get("input_tokens", 0),
+        enrich_result.get("output_tokens", 0),
+    )
+    return {
+        "status": "ok",
+        "repo": repo_name,
+        "enrichment": enrich_result,
     }
