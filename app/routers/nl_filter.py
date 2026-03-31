@@ -18,6 +18,7 @@ Example output: {
 The structured output maps directly to existing query params on GET /repos.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -154,7 +155,8 @@ async def nl_filter(request: Request, body: NLFilterRequest) -> NLFilterResponse
                 messages=[{"role": "user", "content": prompt}],
             )
 
-        response = anthropic_breaker.call(_call_haiku)
+        with anthropic_breaker:
+            response = await asyncio.to_thread(_call_haiku)
         raw = response.content[0].text.strip()
 
         # Strip markdown fences if present
