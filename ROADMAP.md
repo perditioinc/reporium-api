@@ -30,8 +30,14 @@
 - Quality signal computation from stored repo metadata
 - Ingest run recording for dashboard and operator visibility
 
+## Recently Completed
+
+- **Eliminated cold starts** via `min-instances=1` on Cloud Run (ADR-006). Monthly cost: $51.80.
+
 ## What Is Next
 
+- Evaluate 3-year CUD commitment for Cloud Run ($28/month vs $52)
+- Evaluate local inference via Ollama for bulk enrichment ($0 inference cost)
 - Cloud deployment hardening for the ingestion pipeline that feeds this API
 - Nightly enrichment and maintenance jobs running without manual triggers
 - Scale the full platform from the current corpus to 10K repos

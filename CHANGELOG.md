@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased] - 2026-03-31
+
+### Infrastructure
+- **min-instances=1** on Cloud Run — eliminates cold start latency (~1.6 s for `/health`).
+  Monthly cost: $51.80. See ADR-006 for rationale and benchmark data.
+
 ## [Unreleased] - 2026-03-24
 
 ### Added
