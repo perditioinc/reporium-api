@@ -45,6 +45,7 @@ jobs:
             --max-instances=3
             --concurrency=20
             --timeout=60
+            --clear-vpc-connector
 
       - name: Prune old container images (keep latest 5)
         if: success()
