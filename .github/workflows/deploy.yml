@@ -91,6 +91,13 @@ jobs:
             -H "X-Admin-Key: ${ADMIN_API_KEY}" \
             -H "Content-Type: application/json" \
             && echo "Category backfill triggered" || echo "Category backfill skipped (secrets not configured)"
+          # Backfill embeddings for any repos missing them (needed for knowledge graph)
+          curl -sf -X POST "${API_URL}/admin/embeddings/backfill" \
+            -H "Authorization: Bearer ${INGEST_API_KEY}" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            --max-time 120 \
+            && echo "Embeddings backfill triggered" || echo "Embeddings backfill skipped"
 
       - name: Publish api.deployed event
         if: success()
