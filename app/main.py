@@ -180,11 +180,13 @@ _ALLOWED_ORIGINS = [
     "https://reporium.com",
     "https://www.reporium.com",
     "https://perditioinc.github.io",
+    "http://localhost:3000",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://reporium.*\.vercel\.app",
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
