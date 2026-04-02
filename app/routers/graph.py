@@ -21,7 +21,7 @@ router = APIRouter(tags=["Graph"])
 
 @router.get("/graph/edges")
 async def get_graph_edges(
-    limit: int = Query(default=500, ge=1, le=5000),
+    limit: int = Query(default=500, ge=1, le=10000),
     min_similarity: float = Query(default=0.55, ge=0.0, le=1.0,
                                   description="Minimum cosine similarity threshold"),
     neighbours: int = Query(default=8, ge=1, le=30,
@@ -111,9 +111,23 @@ async def get_graph_edges(
         repo_ids.add(row.source_name)
         repo_ids.add(row.target_name)
 
+    # Count repos with and without embeddings for diagnostics
+    counts = await db.execute(text("""
+        SELECT
+            (SELECT COUNT(*) FROM repos WHERE is_private = false) AS total_public,
+            (SELECT COUNT(DISTINCT re.repo_id)
+             FROM repo_embeddings re
+             JOIN repos r ON r.id = re.repo_id
+             WHERE r.is_private = false
+               AND re.embedding_vec IS NOT NULL) AS with_embeddings
+    """))
+    count_row = counts.fetchone()
+
     return {
         "total": len(edges),
         "total_repos": len(repo_ids),
+        "total_public_repos": count_row.total_public if count_row else 0,
+        "repos_with_embeddings": count_row.with_embeddings if count_row else 0,
         "edgeTypes": ["SIMILAR_TO"],
         "edges": edges,
     }
