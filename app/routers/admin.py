@@ -369,30 +369,36 @@ async def backfill_embeddings(
     for row, emb in zip(rows, embeddings):
         try:
             vec_json = json.dumps([float(v) for v in emb])
-            await db.execute(text(
-                """
-                INSERT INTO repo_embeddings (repo_id, embedding, model, generated_at, embedding_vec)
-                VALUES (:repo_id, :embedding, 'nomic-embed-text', NOW(), CAST(:embedding AS vector))
-                ON CONFLICT (repo_id) DO UPDATE
-                    SET embedding = EXCLUDED.embedding,
-                        embedding_vec = EXCLUDED.embedding_vec,
-                        generated_at = NOW()
-                """
-            ), {"repo_id": str(row.id), "embedding": vec_json})
+            async with db.begin_nested():  # savepoint per row
+                await db.execute(text(
+                    """
+                    INSERT INTO repo_embeddings (repo_id, embedding, model, generated_at, embedding_vec)
+                    VALUES (:repo_id, :embedding, 'nomic-embed-text', NOW(), CAST(:embedding AS vector))
+                    ON CONFLICT (repo_id) DO UPDATE
+                        SET embedding = EXCLUDED.embedding,
+                            embedding_vec = EXCLUDED.embedding_vec,
+                            generated_at = NOW()
+                    """
+                ), {"repo_id": str(row.id), "embedding": vec_json})
             backfilled += 1
         except Exception as exc:
             errors.append(f"{row.name}: {exc}")
             logger.warning("Embedding insert failed for %s: %s", row.name, exc)
 
     # Also backfill embedding_vec for any rows that have embedding but no vec
-    sync_result = await db.execute(text(
-        """
-        UPDATE repo_embeddings
-        SET embedding_vec = embedding::vector
-        WHERE embedding_vec IS NULL AND embedding IS NOT NULL
-        """
-    ))
-    synced = sync_result.rowcount
+    try:
+        async with db.begin_nested():
+            sync_result = await db.execute(text(
+                """
+                UPDATE repo_embeddings
+                SET embedding_vec = embedding::vector
+                WHERE embedding_vec IS NULL AND embedding IS NOT NULL
+                """
+            ))
+            synced = sync_result.rowcount
+    except Exception as exc:
+        logger.warning("Vec sync failed: %s", exc)
+        synced = 0
 
     await db.commit()
     return {"backfilled": backfilled, "vec_synced": synced, "errors": errors}
