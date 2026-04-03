@@ -373,13 +373,13 @@ async def backfill_embeddings(
                 await db.execute(text(
                     """
                     INSERT INTO repo_embeddings (repo_id, embedding, model, generated_at, embedding_vec)
-                    VALUES (:repo_id, :embedding, 'nomic-embed-text', NOW(), CAST(:embedding AS vector))
+                    VALUES (:repo_id, :embedding, 'nomic-embed-text', NOW(), CAST(:embedding_vec AS vector))
                     ON CONFLICT (repo_id) DO UPDATE
                         SET embedding = EXCLUDED.embedding,
                             embedding_vec = EXCLUDED.embedding_vec,
                             generated_at = NOW()
                     """
-                ), {"repo_id": str(row.id), "embedding": vec_json})
+                ), {"repo_id": str(row.id), "embedding": vec_json, "embedding_vec": vec_json})
             backfilled += 1
         except Exception as exc:
             errors.append(f"{row.name}: {exc}")
