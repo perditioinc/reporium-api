@@ -59,9 +59,36 @@ async def get_graph_edges(
             FROM ranked
             ORDER BY LEAST(source_id, target_id), GREATEST(source_id, target_id),
                      similarity DESC
+        ),
+        -- Orphan rescue: repos with embeddings but no edges above threshold
+        orphan_edges AS (
+            SELECT DISTINCT ON (LEAST(e1.repo_id, e2.repo_id), GREATEST(e1.repo_id, e2.repo_id))
+                e1.repo_id AS source_id,
+                e2.repo_id AS target_id,
+                1 - (e1.embedding_vec <=> e2.embedding_vec) AS similarity
+            FROM repo_embeddings e1
+            CROSS JOIN LATERAL (
+                SELECT e2_inner.repo_id,
+                       e2_inner.embedding_vec
+                FROM repo_embeddings e2_inner
+                WHERE e2_inner.repo_id != e1.repo_id
+                ORDER BY e1.embedding_vec <=> e2_inner.embedding_vec
+                LIMIT 1
+            ) e2
+            WHERE NOT EXISTS (
+                SELECT 1 FROM deduped d
+                WHERE d.source_id = e1.repo_id OR d.target_id = e1.repo_id
+            )
+            ORDER BY LEAST(e1.repo_id, e2.repo_id), GREATEST(e1.repo_id, e2.repo_id),
+                     similarity DESC
+        ),
+        all_edges AS (
+            SELECT source_id, target_id, similarity FROM deduped
+            UNION
+            SELECT source_id, target_id, similarity FROM orphan_edges
         )
         SELECT
-            d.similarity,
+            ae.similarity,
             r1.name        AS source_name,
             r1.description AS source_description,
             r1.primary_category AS source_category,
@@ -70,10 +97,10 @@ async def get_graph_edges(
             r2.description AS target_description,
             r2.primary_category AS target_category,
             r2.owner       AS target_owner
-        FROM deduped d
-        JOIN repos r1 ON r1.id = d.source_id AND r1.is_private = false
-        JOIN repos r2 ON r2.id = d.target_id AND r2.is_private = false
-        ORDER BY d.similarity DESC
+        FROM all_edges ae
+        JOIN repos r1 ON r1.id = ae.source_id AND r1.is_private = false
+        JOIN repos r2 ON r2.id = ae.target_id AND r2.is_private = false
+        ORDER BY ae.similarity DESC
         LIMIT :limit
     """)
 

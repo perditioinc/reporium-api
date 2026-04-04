@@ -404,6 +404,91 @@ async def backfill_embeddings(
     return {"backfilled": backfilled, "vec_synced": synced, "errors": errors}
 
 
+# ── AI agent protocol tagging ─────────────────────────────────────────────────
+# Detects CLI, MCP, and A2A protocol indicators from repo name, description,
+# tags, and readme_summary. Zero LLM cost — pure keyword matching.
+
+_PROTOCOL_RULES: list[tuple[str, list[str]]] = [
+    ("MCP", [
+        "mcp", "model context protocol", "mcp-server", "mcp server",
+        "model-context-protocol", "mcp-client", "mcp plugin",
+    ]),
+    ("CLI", [
+        "cli tool", "command-line", "command line interface",
+        "cli interface", "terminal tool", "cli app", "cli utility",
+        "command line tool",
+    ]),
+    ("A2A", [
+        "a2a", "agent-to-agent", "agent to agent", "a2a protocol",
+        "inter-agent", "multi-agent communication",
+    ]),
+]
+
+
+@router.post("/admin/tags/protocols", response_model=dict)
+async def tag_protocols(
+    dry_run: bool = Query(default=False, description="Preview without writing"),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """
+    Scan all public repos and tag with protocol indicators (MCP, CLI, A2A)
+    based on keyword matching in name, description, readme_summary, and tags.
+    Zero LLM cost — pure keyword matching.
+    """
+    # Fetch repos with their text fields and existing tags
+    result = await db.execute(text("""
+        SELECT r.id, r.name, r.description, r.readme_summary,
+               COALESCE(
+                   (SELECT string_agg(t.tag, ' ') FROM repo_tags t WHERE t.repo_id = r.id),
+                   ''
+               ) AS all_tags
+        FROM repos r
+        WHERE r.is_private = false
+    """))
+    rows = result.fetchall()
+
+    tagged: dict[str, list[str]] = {}  # protocol → list of repo names
+    inserts = 0
+    skipped = 0
+
+    for row in rows:
+        # Build searchable text (lowercase)
+        search_text = " ".join(filter(None, [
+            row.name, row.description, row.readme_summary, row.all_tags,
+        ])).lower()
+
+        for protocol, keywords in _PROTOCOL_RULES:
+            if any(kw in search_text for kw in keywords):
+                if dry_run:
+                    tagged.setdefault(protocol, []).append(row.name)
+                    continue
+                try:
+                    async with db.begin_nested():
+                        await db.execute(text("""
+                            INSERT INTO repo_tags (repo_id, tag)
+                            VALUES (:repo_id, :tag)
+                            ON CONFLICT (repo_id, tag) DO NOTHING
+                        """), {"repo_id": str(row.id), "tag": protocol})
+                    inserts += 1
+                    tagged.setdefault(protocol, []).append(row.name)
+                except Exception:
+                    skipped += 1
+
+    if not dry_run and inserts > 0:
+        await db.commit()
+        await invalidate_library_cache()
+
+    return {
+        "dry_run": dry_run,
+        "tagged_count": sum(len(v) for v in tagged.values()),
+        "inserts": inserts,
+        "skipped": skipped,
+        "protocols": {k: {"count": len(v), "repos": sorted(v)} for k, v in tagged.items()},
+    }
+
+
 @router.post("/admin/taxonomy/bootstrap", response_model=dict)
 async def bootstrap_taxonomy(
     limit: int = Query(default=100, ge=1, le=500),
