@@ -15,21 +15,23 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from uuid import UUID
 
 import anthropic
 import numpy as np
 from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from sentence_transformers import SentenceTransformer
-
 from app.auth import verify_api_key
 from app.cache import CACHE_TTL_STATS, cache
 from app.circuit_breaker import anthropic_breaker
 from app.database import async_session_factory, get_db
+from app.embeddings import get_embedding_model
+from app.models.session import AskSession
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
 _limiter = Limiter(key_func=get_remote_address)
 
@@ -49,7 +51,377 @@ _INJECTION_PATTERNS = re.compile(
 )
 
 _MAX_CONTENT_LEN = 400  # max chars per repo field in context
-_SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.15
+_SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.08  # cosine distance ≤ 0.08 ≈ similarity ≥ 0.92
+
+# ---------------------------------------------------------------------------
+# KAN-124: Smart routing — answer questions with SQL when possible, skip LLM
+# ---------------------------------------------------------------------------
+# Question patterns that can be answered without calling Claude.
+# Each rule: (compiled regex, handler function name, route label)
+# Handler functions receive (question: str, match: re.Match, db: AsyncSession)
+# and return (answer: str, sources: list[dict]) or None to fall through to LLM.
+
+_ROUTE_COUNT = re.compile(
+    r"^how many (repos?|repositories|tools?|projects?|libraries?)(\s.*)?\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_COUNT_CATEGORY = re.compile(
+    r"^how many (repos?|repositories|tools?|projects?|libraries?)\s+(are |in |for |about |with |use |have )?(the )?(category\s+)?(?P<category>.+?)(\s+category)?\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_LIST_CATEGORIES = re.compile(
+    r"^(what|list|show|which)\s+(are\s+)?(the\s+)?(categories|topics|groups)(\s+available)?\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_TOP_STARRED = re.compile(
+    r"^(what|which|show|list)\s+(are\s+)?(the\s+)?(?:top|most[- ]starred|popular|best)\s+(\d+\s+)?(repos?|repositories|tools?|projects?)?\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_REPO_INFO = re.compile(
+    r"^(what is|tell me about|describe|info about|explain)\s+(?:the\s+)?(?:repo(?:sitory)?\s+)?(?P<name>[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)?)\s*\?*$",
+    re.IGNORECASE,
+)
+# Words that look like repo names but aren't — prevent false repo lookups
+_REPO_INFO_BLACKLIST = {
+    "stats", "statistics", "categories", "languages", "tags", "reporium",
+    "this", "that", "it", "everything", "all", "nothing", "the",
+}
+_ROUTE_COUNT_LANGUAGE = re.compile(
+    r"^how many\s+(?:repos?|repositories|tools?|projects?)\s+(?:are\s+)?(?:written\s+)?(?:in|use|using)\s+(?P<lang>[a-zA-Z0-9#+]+)\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_LIST_LANGUAGES = re.compile(
+    r"^(what|which|list|show)\s+(?:are\s+)?(?:the\s+)?(?:programming\s+)?languages?\s+(?:are\s+)?(?:used|available|supported|represented)\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_COUNT_TAGS = re.compile(
+    r"^how many\s+(?:repos?|repositories|tools?|projects?)\s+(?:are\s+)?(?:tagged\s+(?:with\s+)?|have\s+(?:the\s+)?tag\s+)(?P<tag>[a-zA-Z0-9_-]+)\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_LIST_BY_LANGUAGE = re.compile(
+    r"^(?:what|which|list|show)\s+(?:are\s+)?(?:the\s+)?(?:repos?|repositories|tools?|projects?)\s+(?:written\s+)?(?:in|using|that use)\s+(?P<lang>[a-zA-Z0-9#+]+)\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_MOST_ADJECTIVE = re.compile(
+    r"^(?:what|which|show)\s+(?:is|are)\s+(?:the\s+)?(?:most\s+)?(?P<adj>active|recent|newest|oldest|forked|starred|popular)\s+(?:\d+\s+)?(?:repos?|repositories|tools?|projects?)?\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_CATEGORY_REPOS = re.compile(
+    r"^(?:what|which|list|show)\s+(?:are\s+)?(?:the\s+)?(?:repos?|repositories|tools?|projects?)\s+(?:in|for|about|under)\s+(?:the\s+)?(?:category\s+)?(?P<cat>.+?)\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_STATS = re.compile(
+    r"^(what are|show|give me|tell me|get)\s+(?:me\s+)?(?:the\s+)?(?:overall\s+)?(?:library\s+)?(?:repo(?:sitory)?\s+)?stats(?:istics)?\s*\?*$",
+    re.IGNORECASE,
+)
+
+
+async def _try_smart_route(question: str, db: AsyncSession) -> dict | None:
+    """
+    Attempt to answer the question with a pure SQL query.
+    Returns a dict with {"answer": str, "sources": list, "route": str} or None.
+    """
+    q = question.strip()
+
+    # --- Total count ---
+    m = _ROUTE_COUNT.match(q)
+    if m and not _ROUTE_COUNT_CATEGORY.match(q) and not _ROUTE_COUNT_LANGUAGE.match(q) and not _ROUTE_COUNT_TAGS.match(q):
+        result = await db.execute(text(
+            "SELECT COUNT(*) FROM repos WHERE is_private = false"
+        ))
+        count = result.scalar()
+        return {
+            "answer": f"There are **{count:,}** public repositories tracked in Reporium.",
+            "sources": [],
+            "route": "count_total",
+        }
+
+    # --- Count by category ---
+    m = _ROUTE_COUNT_CATEGORY.match(q)
+    if m:
+        cat_query = m.group("category").strip().lower()
+        result = await db.execute(text("""
+            SELECT primary_category, COUNT(*) as cnt
+            FROM repos
+            WHERE is_private = false
+              AND LOWER(primary_category) LIKE :cat
+            GROUP BY primary_category
+            ORDER BY cnt DESC
+        """), {"cat": f"%{cat_query}%"})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{row.primary_category}**: {row.cnt} repos" for row in rows]
+            total = sum(row.cnt for row in rows)
+            return {
+                "answer": f"Found **{total:,}** repos matching \"{cat_query}\":\n\n" + "\n".join(parts),
+                "sources": [],
+                "route": "count_category",
+            }
+        return {
+            "answer": f"No repos found with a category matching \"{cat_query}\". Try browsing categories on the home page.",
+            "sources": [],
+            "route": "count_category",
+        }
+
+    # --- List categories ---
+    m = _ROUTE_LIST_CATEGORIES.match(q)
+    if m:
+        result = await db.execute(text("""
+            SELECT primary_category, COUNT(*) as cnt
+            FROM repos
+            WHERE is_private = false AND primary_category IS NOT NULL
+            GROUP BY primary_category
+            ORDER BY cnt DESC
+        """))
+        rows = result.fetchall()
+        parts = [f"- **{row.primary_category}** ({row.cnt} repos)" for row in rows]
+        return {
+            "answer": f"Reporium tracks repos across **{len(rows)}** categories:\n\n" + "\n".join(parts),
+            "sources": [],
+            "route": "list_categories",
+        }
+
+    # --- Top starred repos ---
+    m = _ROUTE_TOP_STARRED.match(q)
+    if m:
+        limit = int(m.group(4).strip()) if m.group(4) else 10
+        limit = min(limit, 25)  # cap
+        result = await db.execute(text("""
+            SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   primary_category, description
+            FROM repos
+            WHERE is_private = false
+            ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+            LIMIT :limit
+        """), {"limit": limit})
+        rows = result.fetchall()
+        parts = []
+        sources = []
+        for row in rows:
+            stars_str = f"{row.stars:,}" if row.stars else "0"
+            cat_str = f" ({row.primary_category})" if row.primary_category else ""
+            parts.append(f"- **{row.owner}/{row.name}**{cat_str} — {stars_str} stars")
+            sources.append({
+                "name": row.name, "owner": row.owner,
+                "stars": row.stars, "relevance_score": 1.0,
+                "description": row.description,
+                "forked_from": None, "problem_solved": None,
+                "integration_tags": [],
+            })
+        return {
+            "answer": f"Top {limit} most-starred repos in Reporium:\n\n" + "\n".join(parts),
+            "sources": sources,
+            "route": "top_starred",
+        }
+
+    # --- Specific repo info ---
+    m = _ROUTE_REPO_INFO.match(q)
+    if m:
+        name = m.group("name").strip()
+        if name.lower() not in _REPO_INFO_BLACKLIST:
+            result = await db.execute(text("""
+                SELECT name, owner, description, primary_category,
+                       COALESCE(parent_stars, stargazers_count, 0) as stars,
+                       language, forked_from, readme_summary, problem_solved,
+                       license_spdx
+                FROM repos
+                WHERE is_private = false
+                  AND (LOWER(name) = LOWER(:name) OR LOWER(name) LIKE LOWER(:like_name))
+                ORDER BY CASE WHEN LOWER(name) = LOWER(:name) THEN 0 ELSE 1 END,
+                         COALESCE(parent_stars, stargazers_count, 0) DESC
+                LIMIT 1
+            """), {"name": name, "like_name": f"%{name}%"})
+            row = result.first()
+            if row:
+                parts = [f"**{row.owner}/{row.name}**"]
+                if row.primary_category:
+                    parts.append(f"Category: {row.primary_category}")
+                if row.language:
+                    parts.append(f"Language: {row.language}")
+                parts.append(f"Stars: {row.stars:,}")
+                if row.license_spdx:
+                    parts.append(f"License: {row.license_spdx}")
+                if row.description:
+                    parts.append(f"\n{row.description}")
+                if row.problem_solved:
+                    parts.append(f"\n**What it solves:** {row.problem_solved}")
+                if row.readme_summary:
+                    parts.append(f"\n**Summary:** {row.readme_summary[:300]}")
+                return {
+                    "answer": "\n".join(parts),
+                    "sources": [{
+                        "name": row.name, "owner": row.owner,
+                        "stars": row.stars, "relevance_score": 1.0,
+                        "description": row.description, "forked_from": row.forked_from,
+                        "problem_solved": row.problem_solved, "integration_tags": [],
+                    }],
+                    "route": "repo_info",
+                }
+        # Fall through to LLM if no match
+        return None
+
+    # --- Count by language ---
+    m = _ROUTE_COUNT_LANGUAGE.match(q)
+    if m:
+        lang = m.group("lang").strip()
+        result = await db.execute(text("""
+            SELECT COUNT(*) FROM repos
+            WHERE is_private = false AND LOWER(language) = LOWER(:lang)
+        """), {"lang": lang})
+        count = result.scalar()
+        return {
+            "answer": f"There are **{count:,}** repos written in {lang} tracked in Reporium.",
+            "sources": [],
+            "route": "count_language",
+        }
+
+    # --- List languages ---
+    m = _ROUTE_LIST_LANGUAGES.match(q)
+    if m:
+        result = await db.execute(text("""
+            SELECT language, COUNT(*) as cnt
+            FROM repos
+            WHERE is_private = false AND language IS NOT NULL
+            GROUP BY language
+            ORDER BY cnt DESC
+            LIMIT 20
+        """))
+        rows = result.fetchall()
+        parts = [f"- **{row.language}** ({row.cnt} repos)" for row in rows]
+        return {
+            "answer": f"Top programming languages across Reporium:\n\n" + "\n".join(parts),
+            "sources": [],
+            "route": "list_languages",
+        }
+
+    # --- Count by tag ---
+    m = _ROUTE_COUNT_TAGS.match(q)
+    if m:
+        tag = m.group("tag").strip().lower()
+        result = await db.execute(text("""
+            SELECT COUNT(*) FROM repos
+            WHERE is_private = false
+              AND EXISTS (
+                SELECT 1 FROM unnest(enriched_tags) t WHERE LOWER(t) = :tag
+              )
+        """), {"tag": tag})
+        count = result.scalar()
+        return {
+            "answer": f"There are **{count:,}** repos tagged with \"{tag}\" in Reporium.",
+            "sources": [],
+            "route": "count_tag",
+        }
+
+    # --- List repos by language ---
+    m = _ROUTE_LIST_BY_LANGUAGE.match(q)
+    if m:
+        lang = m.group("lang").strip()
+        result = await db.execute(text("""
+            SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   primary_category, description
+            FROM repos
+            WHERE is_private = false AND LOWER(language) = LOWER(:lang)
+            ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+            LIMIT 15
+        """), {"lang": lang})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            return {
+                "answer": f"Top {lang} repos in Reporium ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "list_by_language",
+            }
+        return {
+            "answer": f"No repos found written in {lang}.",
+            "sources": [],
+            "route": "list_by_language",
+        }
+
+    # --- Most [adjective] repos ---
+    m = _ROUTE_MOST_ADJECTIVE.match(q)
+    if m:
+        adj = m.group("adj").strip().lower()
+        order_map = {
+            "active": "activity_score DESC NULLS LAST",
+            "recent": "COALESCE(your_last_push_at, upstream_last_push_at, github_updated_at, updated_at) DESC NULLS LAST",
+            "newest": "created_at DESC NULLS LAST",
+            "oldest": "created_at ASC NULLS LAST",
+            "forked": "COALESCE(forks_count, 0) DESC",
+            "starred": "COALESCE(parent_stars, stargazers_count, 0) DESC",
+            "popular": "COALESCE(parent_stars, stargazers_count, 0) DESC",
+        }
+        # KAN-124 (#4): Explicit allowlist guard — even if the regex is loosened
+        # later, only known adjectives can reach the f-string SQL interpolation.
+        if adj not in order_map:
+            return None
+        order_clause = order_map[adj]
+        result = await db.execute(text(f"""
+            SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   primary_category, activity_score
+            FROM repos
+            WHERE is_private = false
+            ORDER BY {order_clause}
+            LIMIT 10
+        """))
+        rows = result.fetchall()
+        parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars, activity: {r.activity_score or 0}" for r in rows]
+        return {
+            "answer": f"Most {adj} repos in Reporium:\n\n" + "\n".join(parts),
+            "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": None, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+            "route": f"most_{adj}",
+        }
+
+    # --- Repos in category ---
+    m = _ROUTE_CATEGORY_REPOS.match(q)
+    if m:
+        cat = m.group("cat").strip().lower()
+        result = await db.execute(text("""
+            SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   primary_category, description
+            FROM repos
+            WHERE is_private = false AND LOWER(primary_category) LIKE :cat
+            ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+            LIMIT 15
+        """), {"cat": f"%{cat}%"})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" for r in rows]
+            return {
+                "answer": f"Top repos in \"{cat}\" ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "category_repos",
+            }
+
+    # --- Overall stats ---
+    m = _ROUTE_STATS.match(q)
+    if m:
+        result = await db.execute(text("""
+            SELECT
+                COUNT(*) as total,
+                COUNT(DISTINCT primary_category) as categories,
+                COUNT(DISTINCT language) FILTER (WHERE language IS NOT NULL) as languages,
+                SUM(COALESCE(parent_stars, stargazers_count, 0)) as total_stars,
+                COUNT(*) FILTER (WHERE forked_from IS NOT NULL) as forked,
+                COUNT(*) FILTER (WHERE forked_from IS NULL) as original
+            FROM repos WHERE is_private = false
+        """))
+        row = result.first()
+        if row:
+            return {
+                "answer": (
+                    f"**Reporium Library Stats:**\n\n"
+                    f"- **{row.total:,}** total public repos\n"
+                    f"- **{row.categories}** categories\n"
+                    f"- **{row.languages}** programming languages\n"
+                    f"- **{row.total_stars:,}** total stars\n"
+                    f"- **{row.original:,}** original repos, **{row.forked:,}** forks"
+                ),
+                "sources": [],
+                "route": "stats_overview",
+            }
+
+    return None  # No smart route matched — fall through to LLM
 
 
 def _sanitize_question(question: str) -> str:
@@ -69,16 +441,10 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/intelligence", tags=["Intelligence"])
 
-# Load embedding model once at startup
-_model = None
-
-def _get_model() -> SentenceTransformer:
-    global _model
-    if _model is None:
-        logger.info("Loading sentence-transformers model...")
-        _model = SentenceTransformer("all-MiniLM-L6-v2")
-        logger.info("Model loaded")
-    return _model
+# Timeout (seconds) for the synchronous Anthropic API call.
+# Cloud Run has a 60s request timeout; 30s gives enough headroom for embedding
+# generation, vector search, and response serialisation on top of the LLM call.
+_CLAUDE_TIMEOUT_S = 30
 
 
 def _get_anthropic_key() -> str:
@@ -138,6 +504,9 @@ async def _log_query(
     cache_hit: bool = False,
 ) -> None:
     """Fire-and-forget: write one row to query_log. Never raises."""
+    # KAN-124 (#2): query_log stores user questions in plaintext. A periodic
+    # cleanup job should purge old rows to limit data-retention exposure, e.g.:
+    #   DELETE FROM query_log WHERE created_at < NOW() - INTERVAL '90 days';
     try:
         async with async_session_factory() as session:
             await session.execute(
@@ -190,9 +559,103 @@ async def _log_query(
         logger.exception("query_log insert failed (non-fatal)")
 
 
+# ---------------------------------------------------------------------------
+# KAN-158: Conversational memory helpers — session-scoped last-3-turns store
+# ---------------------------------------------------------------------------
+
+_MAX_SESSION_TURNS = 3  # turns prepended to Claude's messages array
+
+
+async def _load_session_turns(session_id: str, db: AsyncSession) -> list[dict]:
+    """
+    Return up to _MAX_SESSION_TURNS prior turns for a session, oldest-first.
+
+    Each element is {"role": "user"|"assistant", "content": "..."} ready to
+    prepend to the Claude messages array.
+    """
+    try:
+        result = await db.execute(
+            text("""
+                SELECT question, answer
+                FROM ask_sessions
+                WHERE session_id = CAST(:sid AS uuid)
+                  AND created_at > NOW() - INTERVAL '24 hours'
+                ORDER BY turn_number DESC
+                LIMIT :max_turns
+            """),
+            {"sid": session_id, "max_turns": _MAX_SESSION_TURNS},
+        )
+        rows = result.fetchall()
+    except Exception:
+        logger.exception("_load_session_turns failed (non-fatal) for session %s", session_id)
+        return []
+
+    # Rows are newest-first; reverse to oldest-first for correct message order
+    turns: list[dict] = []
+    for row in reversed(rows):
+        turns.append({"role": "user", "content": row.question})
+        turns.append({"role": "assistant", "content": row.answer})
+    return turns
+
+
+async def _save_session_turn(
+    session_id: str, question: str, answer: str, db: AsyncSession
+) -> None:
+    """Append one turn to ask_sessions. Fire-and-forget — never raises."""
+    # KAN-124 (#2): ask_sessions stores user questions and answers in plaintext.
+    # Like query_log, it needs a periodic TTL cleanup job, e.g.:
+    #   DELETE FROM ask_sessions WHERE created_at < NOW() - INTERVAL '90 days';
+    try:
+        # Determine the next turn number for this session
+        result = await db.execute(
+            text("""
+                SELECT COALESCE(MAX(turn_number), -1)
+                FROM ask_sessions
+                WHERE session_id = CAST(:sid AS uuid)
+            """),
+            {"sid": session_id},
+        )
+        max_turn = result.scalar()
+        next_turn = (max_turn + 1) if max_turn is not None else 0
+
+        await db.execute(
+            text("""
+                INSERT INTO ask_sessions (session_id, turn_number, question, answer)
+                VALUES (CAST(:sid AS uuid), :turn, :question, :answer)
+            """),
+            {
+                "sid": session_id,
+                "turn": next_turn,
+                "question": question,
+                "answer": answer[:4000],  # cap at 4k chars to keep rows lean
+            },
+        )
+        await db.commit()
+    except Exception:
+        logger.exception("_save_session_turn failed (non-fatal) for session %s", session_id)
+
+
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=3, max_length=500)
     top_k: int = Field(default=10, ge=1, le=50)
+    session_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional UUID. When provided, the last 3 turns of this session are "
+            "prepended to Claude's context for conversational continuity."
+        ),
+    )
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        try:
+            UUID(v)
+        except (ValueError, AttributeError):
+            raise ValueError("session_id must be a valid UUID")
+        return v
 
     @field_validator("question")
     @classmethod
@@ -476,12 +939,18 @@ async def _portfolio_insights(db: AsyncSession) -> PortfolioInsightsResponse:
     if cached:
         return PortfolioInsightsResponse(**cached)
 
-    taxonomy_gaps, stale_repos, velocity_leaders, near_duplicate_clusters = await asyncio.gather(
+    results = await asyncio.gather(
         _taxonomy_gap_signals(db),
         _stale_repo_signals(db),
         _velocity_leader_signals(db),
         _near_duplicate_signals(db),
+        return_exceptions=True,
     )
+    logger = logging.getLogger(__name__)
+    taxonomy_gaps = results[0] if not isinstance(results[0], Exception) else (logger.error("_taxonomy_gap_signals failed: %s", results[0]) or [])
+    stale_repos = results[1] if not isinstance(results[1], Exception) else (logger.error("_stale_repo_signals failed: %s", results[1]) or [])
+    velocity_leaders = results[2] if not isinstance(results[2], Exception) else (logger.error("_velocity_leader_signals failed: %s", results[2]) or [])
+    near_duplicate_clusters = results[3] if not isinstance(results[3], Exception) else (logger.error("_near_duplicate_signals failed: %s", results[3]) or [])
 
     response = PortfolioInsightsResponse(
         generated_at=datetime.now(timezone.utc).isoformat(),
@@ -501,7 +970,7 @@ async def _portfolio_insights(db: AsyncSession) -> PortfolioInsightsResponse:
 
 
 async def _run_query(
-    req: QueryRequest, db: AsyncSession, client_ip: str | None = None
+    req: QueryRequest, db: AsyncSession, client_ip: str | None = None, session_id: str | None = None
 ) -> QueryResponse:
     """
     Core intelligence query logic — shared by /query (authed) and /ask (public).
@@ -512,9 +981,38 @@ async def _run_query(
     4. Return answer with source repos and relevance scores
     """
     _started_at = time.monotonic()
-    model = _get_model()
 
-    # 1. Embed the question
+    # 0. Smart routing — answer simple questions with SQL, no LLM call needed
+    smart_result = await _try_smart_route(req.question, db)
+    if smart_result is not None:
+        logger.info("ask: smart-routed via %s (no LLM)", smart_result["route"])
+        sources = _coerce_cached_sources(smart_result["sources"])
+        response = QueryResponse(
+            answer=smart_result["answer"],
+            sources=sources,
+            question=req.question,
+            model=f"smart-route:{smart_result['route']}",
+            answered_at=datetime.now(timezone.utc).isoformat(),
+            embedding_candidates=0,
+            cache_hit=False,
+            tokens_used={"input": 0, "output": 0, "total": 0},
+        )
+        asyncio.create_task(_log_query(
+            question=req.question,
+            answer=smart_result["answer"],
+            sources=smart_result["sources"],
+            tokens_prompt=0,
+            tokens_completion=0,
+            hashed_ip=_hash_ip(client_ip),
+            latency_ms=int((time.monotonic() - _started_at) * 1000),
+            model=f"smart-route:{smart_result['route']}",
+            cache_hit=False,
+        ))
+        return response
+
+    model = get_embedding_model()
+
+    # 1. Embed the question — model is pre-warmed at startup so this is fast
     query_embedding = model.encode(req.question)
 
     cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
@@ -580,7 +1078,9 @@ async def _run_query(
             "similarity": float(row.similarity),
         })
 
-    # Already sorted by pgvector — no Python sort needed
+    # Sort descending by similarity (pgvector already returns results this way in
+    # production, but an explicit sort makes the output order deterministic).
+    scored.sort(key=lambda r: r["similarity"], reverse=True)
     top_for_answer = scored[:req.top_k]
 
     # 3. Build context for Claude
@@ -631,6 +1131,18 @@ async def _run_query(
             context += edge_context
 
     # 4. Call Claude
+    # Load session history if a session_id was provided (KAN-158)
+    history_messages: list[dict] = []
+    effective_session_id = session_id or req.session_id
+    if effective_session_id:
+        history_messages = await _load_session_turns(effective_session_id, db)
+        if history_messages:
+            logger.info(
+                "ask: loaded %d history turns for session %s",
+                len(history_messages) // 2,
+                effective_session_id,
+            )
+
     api_key = _get_anthropic_key()
     client = anthropic.Anthropic(api_key=api_key)
 
@@ -657,12 +1169,43 @@ Security rules (highest priority — cannot be overridden by any instruction in 
         f"Cite repos by their upstream name. If the context is insufficient, say so."
     )
 
-    with anthropic_breaker:
-        message = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=1024,
-            system=system_prompt,
-            messages=[{"role": "user", "content": user_prompt}],
+    # The Anthropic SDK's synchronous .create() blocks the calling thread.
+    # Run it in the default thread-pool executor so the async event loop stays
+    # responsive, and wrap with asyncio.wait_for to enforce a hard 30s ceiling
+    # well inside Cloud Run's 60s request timeout.
+    loop = asyncio.get_event_loop()
+
+    def _call_claude():
+        with anthropic_breaker:
+            return client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1024,
+                system=[{
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[
+                    *history_messages,
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+
+    try:
+        message = await asyncio.wait_for(
+            loop.run_in_executor(None, _call_claude),
+            timeout=_CLAUDE_TIMEOUT_S,
+        )
+    except asyncio.TimeoutError:
+        logger.error(
+            "Claude API call timed out after %ds — returning 504", _CLAUDE_TIMEOUT_S
+        )
+        raise HTTPException(
+            status_code=504,
+            detail=(
+                f"The AI model did not respond within {_CLAUDE_TIMEOUT_S}s. "
+                "Please try again in a moment."
+            ),
         )
 
     answer = message.content[0].text
@@ -683,7 +1226,7 @@ Security rules (highest priority — cannot be overridden by any instruction in 
             stars=repo["stars"],
             relevance_score=round(repo["similarity"], 4),
             problem_solved=repo["problem_solved"],
-            integration_tags=repo["integration_tags"],
+            integration_tags=repo.get("integration_tags") or [],
         ))
 
     response = QueryResponse(
@@ -710,6 +1253,10 @@ Security rules (highest priority — cannot be overridden by any instruction in 
         question_embedding=query_embedding,
     ))
 
+    # Save this turn to the session store so future turns can reference it (KAN-158)
+    if effective_session_id:
+        asyncio.create_task(_save_session_turn(effective_session_id, req.question, answer, db))
+
     return response
 
 
@@ -723,8 +1270,11 @@ async def intelligence_query(
     """
     Ask a natural language question about the repo knowledge base.
     Requires Authorization: Bearer {REPORIUM_API_KEY} header.
+
+    Pass ``session_id`` (UUID) in the request body to enable conversational
+    memory — the last 3 turns of that session will be prepended to context.
     """
-    return await _run_query(req, db, client_ip=get_remote_address(request))
+    return await _run_query(req, db, client_ip=get_remote_address(request), session_id=req.session_id)
 
 
 @router.post("/ask", response_model=QueryResponse)
@@ -737,8 +1287,325 @@ async def intelligence_ask(
     """
     Public endpoint — no auth required. Ask a natural language question about
     the repo knowledge base. Rate limited to 10/minute and 100/day per IP.
+
+    Pass ``session_id`` (UUID) in the request body to enable conversational
+    memory — the last 3 turns of that session will be prepended to context.
     """
-    return await _run_query(req, db, client_ip=get_remote_address(request))
+    return await _run_query(req, db, client_ip=get_remote_address(request), session_id=req.session_id)
+
+
+@router.post("/ask/stream")
+@_limiter.limit("10/minute;100/day")
+async def intelligence_ask_stream(
+    request: Request,
+    req: QueryRequest,
+    db: AsyncSession = Depends(get_db),
+) -> StreamingResponse:
+    """
+    Public streaming endpoint — no auth required.
+    Streams the answer as SSE events:
+      data: {"type": "sources", "sources": [...]}   (sent immediately before generation)
+      data: {"type": "token", "text": "..."}         (one per Claude streaming chunk)
+      data: {"type": "done", "tokens": {...}}         (final event with usage stats)
+      data: {"type": "error", "message": "..."}       (on failure)
+
+    Rate limited to 10/minute and 100/day per IP (same as /ask).
+    """
+    client_ip = get_remote_address(request)
+
+    async def event_generator():
+        _started_at = time.monotonic()
+
+        try:
+            # 0. Smart routing — answer simple questions with SQL, skip LLM entirely
+            smart_result = await _try_smart_route(req.question, db)
+            if smart_result is not None:
+                logger.info("ask/stream: smart-routed via %s (no LLM)", smart_result["route"])
+                sources = _coerce_cached_sources(smart_result["sources"])
+                yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in sources], 'cache_hit': False, 'route': smart_result['route']})}\n\n"
+                # Stream answer word-by-word
+                words = smart_result["answer"].split(" ")
+                for i, word in enumerate(words):
+                    chunk = word + (" " if i < len(words) - 1 else "")
+                    yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
+                    await asyncio.sleep(0)
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'route': smart_result['route']})}\n\n"
+                asyncio.create_task(_log_query(
+                    question=req.question, answer=smart_result["answer"],
+                    sources=smart_result["sources"],
+                    tokens_prompt=0, tokens_completion=0,
+                    hashed_ip=_hash_ip(client_ip),
+                    latency_ms=int((time.monotonic() - _started_at) * 1000),
+                    model=f"smart-route:{smart_result['route']}",
+                    cache_hit=False,
+                ))
+                return
+
+            model = get_embedding_model()
+
+            # 1. Embed the question
+            query_embedding = model.encode(req.question)
+
+            # 2. Check semantic cache — if hit, stream the cached answer token-by-token
+            cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
+            if cached is not None:
+                cached_answer, cached_sources, cached_model = cached
+                # Emit sources
+                yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in cached_sources], 'cache_hit': True})}\n\n"
+                # Stream answer word-by-word (simulate streaming for cache hits)
+                words = cached_answer.split(" ")
+                for i, word in enumerate(words):
+                    chunk = word + (" " if i < len(words) - 1 else "")
+                    yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
+                    await asyncio.sleep(0)  # yield control
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'cache_hit': True})}\n\n"
+                asyncio.create_task(_log_query(
+                    question=req.question, answer=cached_answer,
+                    sources=[s.model_dump() for s in cached_sources],
+                    tokens_prompt=0, tokens_completion=0,
+                    hashed_ip=_hash_ip(client_ip),
+                    latency_ms=int((time.monotonic() - _started_at) * 1000),
+                    model=cached_model or "semantic-cache",
+                    question_embedding=query_embedding, cache_hit=True,
+                ))
+                return
+
+            vec_str = _vec_to_pg(query_embedding)
+
+            # 3. Semantic search
+            fetch_k = req.top_k + 10
+            result = await db.execute(
+                text("""
+                    SELECT r.id, r.name, r.owner, r.forked_from, r.description,
+                           r.parent_stars, r.readme_summary, r.problem_solved,
+                           1 - (e.embedding_vec <=> CAST(:vec AS vector)) AS similarity
+                    FROM repo_embeddings e
+                    JOIN repos r ON r.id = e.repo_id
+                    WHERE r.is_private = false
+                      AND e.embedding_vec IS NOT NULL
+                    ORDER BY e.embedding_vec <=> CAST(:vec AS vector)
+                    LIMIT :fetch_k
+                """),
+                {"vec": vec_str, "fetch_k": fetch_k},
+            )
+            rows = result.fetchall()
+
+            scored = []
+            for row in rows:
+                scored.append({
+                    "id": row.id, "name": row.name, "owner": row.owner,
+                    "forked_from": row.forked_from, "description": row.description,
+                    "stars": row.parent_stars, "readme_summary": row.readme_summary,
+                    "problem_solved": row.problem_solved, "similarity": row.similarity,
+                })
+            top_for_answer = scored[:req.top_k]
+
+            # 4. Emit sources before generation starts
+            source_list = [
+                SourceRepo(
+                    name=r["name"], owner=r["owner"], forked_from=r["forked_from"],
+                    description=r["description"], stars=r["stars"],
+                    relevance_score=round(r["similarity"], 4),
+                    problem_solved=r["problem_solved"],
+                    integration_tags=[],
+                )
+                for r in top_for_answer
+            ]
+            yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in source_list], 'cache_hit': False})}\n\n"
+
+            # 5. Build context
+            context_parts = []
+            for i, repo in enumerate(top_for_answer, 1):
+                upstream = repo["forked_from"] or f"{repo['owner']}/{repo['name']}"
+                context_parts.append(
+                    f"<repo index=\"{i}\">\n"
+                    f"name: {upstream}\n"
+                    f"stars: {repo['stars'] or 0}\n"
+                    f"description: {_truncate(repo['description'])}\n"
+                    f"summary: {_truncate(repo['readme_summary'])}\n"
+                    f"problem_solved: {_truncate(repo['problem_solved'])}\n"
+                    f"relevance_score: {repo['similarity']:.4f}\n"
+                    f"</repo>"
+                )
+            context = "\n\n".join(context_parts)
+
+            # Knowledge graph edges
+            if top_for_answer:
+                top_ids = [str(r["id"]) for r in top_for_answer[:5]]
+                edge_result = await db.execute(
+                    text("""
+                        SELECT e.edge_type, r1.forked_from as source_upstream, r1.name as source_name,
+                               r2.forked_from as target_upstream, r2.name as target_name
+                        FROM repo_edges e
+                        JOIN repos r1 ON r1.id = e.source_repo_id
+                        JOIN repos r2 ON r2.id = e.target_repo_id
+                        WHERE e.source_repo_id::text = ANY(:ids) OR e.target_repo_id::text = ANY(:ids)
+                        LIMIT 20
+                    """),
+                    {"ids": top_ids},
+                )
+                edge_rows = edge_result.fetchall()
+                if edge_rows:
+                    edge_context = "\n\nKnowledge graph relationships:\n"
+                    for er in edge_rows:
+                        src = er.source_upstream or er.source_name
+                        tgt = er.target_upstream or er.target_name
+                        edge_context += f"- {src} {er.edge_type} {tgt}\n"
+                    context += edge_context
+
+            # 5b. Load session history for multi-turn (KAN-158)
+            stream_history: list[dict] = []
+            if req.session_id:
+                stream_history = await _load_session_turns(req.session_id, db)
+
+            # 6. Stream from Claude
+            api_key = _get_anthropic_key()
+            anthropic_client = anthropic.Anthropic(api_key=api_key)
+
+            system_prompt = """You are the Reporium Intelligence assistant. You answer questions about AI development tools and GitHub repositories tracked in the Reporium platform.
+
+Rules:
+- Answer concisely and directly.
+- Cite repos by their upstream name (owner/repo format) when referencing them.
+- If the context is insufficient, say so honestly.
+- Do not make up repos or data not in the context.
+- Keep answers to 2-3 paragraphs maximum."""
+
+            user_prompt = (
+                f"Here are the most relevant repos from the library:\n\n{context}\n\n"
+                f"Question: {req.question}\n\n"
+                "Please answer the question based on the repos above."
+            )
+
+            full_answer = ""
+            input_tokens = 0
+            output_tokens = 0
+
+            def _stream_claude():
+                with anthropic_breaker:
+                    return anthropic_client.messages.stream(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=1024,
+                        system=[{
+                            "type": "text",
+                            "text": system_prompt,
+                            "cache_control": {"type": "ephemeral"},
+                        }],
+                        messages=[
+                            *stream_history,
+                            {"role": "user", "content": user_prompt},
+                        ],
+                    )
+
+            loop = asyncio.get_event_loop()
+
+            # Use a queue to bridge the sync streaming iterator to async
+            import queue
+            token_queue: queue.Queue = queue.Queue()
+
+            def _run_stream():
+                try:
+                    with _stream_claude() as stream:
+                        for text_chunk in stream.text_stream:
+                            token_queue.put(("token", text_chunk))
+                        msg = stream.get_final_message()
+                        token_queue.put(("done", msg))
+                except Exception as e:
+                    token_queue.put(("error", str(e)))
+
+            # Run the blocking streamer in a thread
+            future = loop.run_in_executor(None, _run_stream)
+
+            while True:
+                try:
+                    item = await loop.run_in_executor(
+                        None,
+                        lambda: token_queue.get(timeout=35),
+                    )
+                except queue.Empty:
+                    yield f"data: {json.dumps({'type': 'error', 'message': 'Stream timed out'})}\n\n"
+                    break
+
+                event_type, payload = item
+                if event_type == "token":
+                    full_answer += payload
+                    yield f"data: {json.dumps({'type': 'token', 'text': payload})}\n\n"
+                elif event_type == "done":
+                    input_tokens = payload.usage.input_tokens
+                    output_tokens = payload.usage.output_tokens
+                    yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': input_tokens, 'output': output_tokens, 'total': input_tokens + output_tokens}})}\n\n"
+                    # Fire-and-forget log
+                    asyncio.create_task(_log_query(
+                        question=req.question, answer=full_answer,
+                        sources=[s.model_dump() for s in source_list],
+                        tokens_prompt=input_tokens, tokens_completion=output_tokens,
+                        hashed_ip=_hash_ip(client_ip),
+                        latency_ms=int((time.monotonic() - _started_at) * 1000),
+                        model="claude-sonnet-4-20250514",
+                        question_embedding=query_embedding,
+                    ))
+                    # Save turn to session for multi-turn continuity (KAN-158)
+                    if req.session_id and full_answer:
+                        asyncio.create_task(_save_session_turn(req.session_id, req.question, full_answer, db))
+                    break
+                elif event_type == "error":
+                    yield f"data: {json.dumps({'type': 'error', 'message': payload})}\n\n"
+                    break
+
+            await future  # ensure thread cleanup
+
+        except Exception as e:
+            logger.error("Streaming ask error: %s", str(e), exc_info=True)
+            yield f"data: {json.dumps({'type': 'error', 'message': 'Internal server error. Please try again.'})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",  # disable Nginx buffering
+        },
+    )
+
+
+@router.get("/suggestions")
+@_limiter.limit("30/minute")
+async def suggested_questions(
+    request: Request,
+):
+    """
+    Return curated example questions for the ask bar.
+    Uses a static list — never exposes real user queries (privacy).
+    """
+    import random
+
+    # Curated questions showcasing platform capabilities.
+    # NEVER pull from query_log — that leaks real user questions publicly.
+    _CURATED_SUGGESTIONS = [
+        # Discovery
+        "What are the most starred AI repos?",
+        "Which repos support MCP?",
+        "Show me RAG tools with the most stars",
+        "What are the best LLM inference frameworks?",
+        # Category exploration
+        "Which repos focus on retrieval-augmented generation?",
+        "What agent frameworks are available?",
+        "Show me repos for fine-tuning LLMs",
+        "What evaluation and benchmarking tools exist?",
+        # Stats / smart-routed (showcase $0 instant answers)
+        "How many repos are tracked?",
+        "What categories are available?",
+        "How many Python repos are there?",
+        "What are the most forked repos?",
+        # Comparisons
+        "Compare LangChain and LlamaIndex",
+        "What's the difference between vLLM and TGI?",
+        "Compare CrewAI and AutoGen for multi-agent systems",
+    ]
+
+    # Return a random subset of 6 so the UI feels fresh on each visit
+    selected = random.sample(_CURATED_SUGGESTIONS, min(6, len(_CURATED_SUGGESTIONS)))
+    return {"suggestions": selected}
 
 
 @router.get("/portfolio-insights", response_model=PortfolioInsightsResponse)

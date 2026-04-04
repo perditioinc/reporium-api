@@ -1,15 +1,130 @@
 import json
 import logging
+from dataclasses import dataclass, field as dc_field
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_admin_key, verify_api_key
 from app.cache import cache
 from app.database import get_db
-from app.models.repo import IngestRun, Repo, RepoEmbedding, RepoTag
+from app.models.repo import IngestRun, Repo, RepoCategory, RepoEmbedding, RepoTag
 from app.routers.library_full import invalidate_library_cache
+
+# ── 21-category taxonomy (mirrors ingestion/enrichment/taxonomy.py) ──────────
+# Kept in-process so the API can re-derive categories without calling the
+# ingestion service.  Tags are case-insensitive prefix/substring matched.
+_CATEGORIES: list[dict] = [
+    {"id": "foundation-models", "name": "Foundation Models",
+     "tags": ["large language model", "transformer", "openai", "anthropic", "claude",
+               "google ai", "huggingface", "long context", "multimodal", "quantization",
+               "llama", "gguf", "gpt", "llm", "foundational model"]},
+    {"id": "ai-agents", "name": "AI Agents",
+     "tags": ["ai agent", "multi-agent", "autonomous", "agent memory", "planning",
+               "chain-of-thought", "tool use", "langchain", "langgraph", "crewai",
+               "autogen", "mcp", "prompt engineering", "context engineering",
+               "structured output", "function calling", "agentic"]},
+    {"id": "rag-retrieval", "name": "RAG & Retrieval",
+     "tags": ["rag", "vector database", "embedding", "knowledge graph",
+               "semantic search", "hybrid search", "reranking", "llamaindex",
+               "document processing", "chunking", "retrieval"]},
+    {"id": "model-training", "name": "Model Training",
+     "tags": ["fine-tuning", "reinforcement learning", "lora", "peft", "rlhf",
+               "synthetic data", "dataset", "training", "unsloth", "axolotl",
+               "trl", "deepspeed", "fsdp", "pytorch", "tensorflow", "keras", "jax"]},
+    {"id": "evals-benchmarking", "name": "Evals & Benchmarking",
+     "tags": ["eval", "benchmark", "model evaluation", "llm testing", "red teaming",
+               "safety evaluation", "mmlu", "humaneval", "code evaluation", "alignment"]},
+    {"id": "observability", "name": "Observability & Monitoring",
+     "tags": ["observability", "tracing", "monitoring", "llm monitoring", "logging",
+               "debugging", "langsmith", "phoenix", "mlflow", "weights & biases",
+               "experiment tracking"]},
+    {"id": "inference-serving", "name": "Inference & Serving",
+     "tags": ["inference", "llm serving", "model optimization", "vllm", "tensorrt",
+               "triton", "ollama", "tgi", "batching", "caching", "gpu", "cuda",
+               "real-time", "streaming", "deployment"]},
+    {"id": "generative-media", "name": "Generative Media",
+     "tags": ["image generation", "video generation", "text to speech", "speech to text",
+               "music", "audio", "comfyui", "diffusion", "controlnet", "stable diffusion",
+               "generative"]},
+    {"id": "computer-vision", "name": "Computer Vision",
+     "tags": ["computer vision", "point cloud", "3d vision", "object detection",
+               "segmentation", "depth estimation", "slam", "optical flow",
+               "3d reconstruction", "pose estimation", "vision"]},
+    {"id": "robotics", "name": "Robotics",
+     "tags": ["robotics", "robot", "humanoid", "simulation", "ros", "motion planning",
+               "grasping", "manipulation", "navigation", "control systems"]},
+    {"id": "nlp-text", "name": "NLP & Text",
+     "tags": ["nlp", "natural language", "text classification", "named entity",
+               "sentiment", "summarization", "translation", "question answering",
+               "information extraction", "parsing", "tokenization"]},
+    {"id": "ml-platform", "name": "ML Platform & Infrastructure",
+     "tags": ["ml platform", "mlops", "pipeline", "orchestration", "feature store",
+               "data pipeline", "kubeflow", "airflow", "prefect", "infrastructure",
+               "platform"]},
+    {"id": "safety-alignment", "name": "Safety & Alignment",
+     "tags": ["safety", "alignment", "fairness", "bias", "interpretability",
+               "explainability", "robustness", "adversarial", "toxicity", "guardrail"]},
+    {"id": "coding-devtools", "name": "Coding & Dev Tools",
+     "tags": ["code generation", "code completion", "copilot", "devin", "cursor",
+               "devtools", "ide", "coding assistant", "code review", "debugging tool",
+               "software engineering"]},
+    {"id": "data-science", "name": "Data Science & Analytics",
+     "tags": ["data science", "analytics", "visualization", "pandas", "numpy",
+               "scikit-learn", "sklearn", "statistical", "jupyter", "notebook"]},
+    {"id": "healthcare-bio", "name": "Healthcare & Biology",
+     "tags": ["healthcare", "medical", "clinical", "biology", "genomics", "protein",
+               "drug discovery", "bioinformatics", "radiology", "pathology"]},
+    {"id": "finance-legal", "name": "Finance & Legal",
+     "tags": ["finance", "trading", "quantitative", "legal", "contract", "compliance",
+               "risk", "fraud detection", "fintech"]},
+    {"id": "multimodal", "name": "Multimodal AI",
+     "tags": ["multimodal", "vision-language", "vlm", "clip", "image-text",
+               "audio-visual", "cross-modal"]},
+    {"id": "edge-mobile", "name": "Edge & Mobile AI",
+     "tags": ["edge", "mobile", "embedded", "iot", "on-device", "tflite",
+               "coreml", "onnx", "wasm", "webassembly"]},
+    {"id": "search-knowledge", "name": "Search & Knowledge",
+     "tags": ["search", "knowledge base", "wiki", "qa system", "question answering",
+               "information retrieval", "index", "elasticsearch", "opensearch"]},
+    {"id": "other", "name": "Other AI / ML",
+     "tags": ["machine learning", "deep learning", "neural network", "ai", "ml",
+               "artificial intelligence"]},
+]
+
+
+def _assign_categories_from_tags(tags: list[str]) -> list[dict]:
+    """Return list of {category_id, category_name, is_primary} dicts.
+
+    Matching is case-insensitive: a category wins when any keyword
+    appears as a substring in a tag (keyword-in-tag direction only).  The category with the most
+    keyword hits is marked is_primary.
+    """
+    tags_lower = [t.lower() for t in tags]
+    scores: dict[str, int] = {}
+    for cat in _CATEGORIES:
+        for kw in cat["tags"]:
+            kw_l = kw.lower()
+            if any(kw_l in tl for tl in tags_lower):
+                scores[cat["id"]] = scores.get(cat["id"], 0) + 1
+
+    if not scores:
+        return []
+
+    max_score = max(scores.values())
+    result = []
+    for cat in _CATEGORIES:
+        if cat["id"] in scores:
+            result.append({
+                "category_id": cat["id"],
+                "category_name": cat["name"],
+                "is_primary": scores[cat["id"]] == max_score and not any(
+                    r["is_primary"] for r in result  # only first max wins
+                ),
+            })
+    return result
 
 logger = logging.getLogger(__name__)
 
@@ -255,20 +370,289 @@ async def backfill_embeddings(
     for row, emb in zip(rows, embeddings):
         try:
             vec_json = json.dumps([float(v) for v in emb])
-            await db.execute(text(
-                """
-                INSERT INTO repo_embeddings (repo_id, embedding, model, generated_at)
-                VALUES (:repo_id, :embedding, 'nomic-embed-text', NOW())
-                ON CONFLICT (repo_id) DO NOTHING
-                """
-            ), {"repo_id": str(row.id), "embedding": vec_json})
+            async with db.begin_nested():  # savepoint per row
+                await db.execute(text(
+                    """
+                    INSERT INTO repo_embeddings (repo_id, embedding, model, generated_at, embedding_vec)
+                    VALUES (:repo_id, :embedding, 'nomic-embed-text', NOW(), CAST(:embedding_vec AS vector))
+                    ON CONFLICT (repo_id) DO UPDATE
+                        SET embedding = EXCLUDED.embedding,
+                            embedding_vec = EXCLUDED.embedding_vec,
+                            generated_at = NOW()
+                    """
+                ), {"repo_id": str(row.id), "embedding": vec_json, "embedding_vec": vec_json})
             backfilled += 1
         except Exception as exc:
             errors.append(f"{row.name}: {exc}")
             logger.warning("Embedding insert failed for %s: %s", row.name, exc)
 
+    # Also backfill embedding_vec for any rows that have embedding but no vec
+    try:
+        async with db.begin_nested():
+            sync_result = await db.execute(text(
+                """
+                UPDATE repo_embeddings
+                SET embedding_vec = embedding::vector
+                WHERE embedding_vec IS NULL AND embedding IS NOT NULL
+                """
+            ))
+            synced = sync_result.rowcount
+    except Exception as exc:
+        logger.warning("Vec sync failed: %s", exc)
+        synced = 0
+
     await db.commit()
-    return {"backfilled": backfilled, "errors": errors}
+    return {"backfilled": backfilled, "vec_synced": synced, "errors": errors}
+
+
+# ── AI agent protocol & framework tagging ────────────────────────────────────
+# Detects protocols, AI frameworks, and SDK indicators from repo name,
+# description, readme_summary, and tags. Zero LLM cost — pure keyword matching.
+#
+# Keywords are split into two confidence tiers:
+#   "strong"  — Unambiguous identifiers. One match is enough to tag.
+#               e.g. "langchain", "crewai", "mcp-server"
+#   "weak"    — Generic words that ALSO happen to be library/concept names.
+#               e.g. "transformers", "datasets", "eval", "adapter"
+#               A weak keyword only fires when CORROBORATED by:
+#                 • at least ONE strong keyword for the same tag, OR
+#                 • at least TWO weak keywords for the same tag
+#
+# This eliminates false positives like tagging a generic CSV-parsing repo
+# "HuggingFace" just because its description mentions "datasets".
+
+@dataclass
+class TagRule:
+    """One tagging rule with confidence-tiered keywords."""
+    tag: str
+    strong: list[str] = dc_field(default_factory=list)  # one match → tag
+    weak: list[str] = dc_field(default_factory=list)    # needs corroboration
+
+
+_TAG_RULES: list[TagRule] = [
+    # ── Protocols ──
+    TagRule("MCP", strong=[
+        "mcp", "model context protocol", "mcp-server", "mcp server",
+        "model-context-protocol", "mcp-client", "mcp plugin",
+        "mcp-tool", "modelcontextprotocol",
+    ]),
+    TagRule("CLI", strong=[
+        "cli tool", "command-line tool", "command line interface",
+        "cli interface", "cli app", "cli utility", "cli framework",
+        "cli library",
+    ], weak=[
+        "command-line", "terminal tool",
+    ]),
+    TagRule("A2A", strong=[
+        "a2a", "agent-to-agent", "agent to agent", "a2a protocol",
+        "inter-agent",
+    ], weak=[
+        "multi-agent communication", "agent communication", "agent protocol",
+    ]),
+    # ── AI Frameworks & SDKs ──
+    TagRule("LangChain", strong=[
+        "langchain", "lang-chain", "langchain-community", "langserve",
+        "langsmith", "langgraph",
+    ]),
+    TagRule("LlamaIndex", strong=[
+        "llamaindex", "llama-index", "llama_index", "gpt-index",
+    ]),
+    TagRule("CrewAI", strong=[
+        "crewai", "crew-ai", "crew ai",
+    ]),
+    TagRule("AutoGen", strong=[
+        "autogen", "pyautogen",
+    ], weak=[
+        "auto-gen", "ag2",
+    ]),
+    TagRule("Ollama", strong=[
+        "ollama",
+    ]),
+    TagRule("vLLM", strong=[
+        "vllm",
+    ], weak=[
+        "v-llm",
+    ]),
+    TagRule("HuggingFace", strong=[
+        "huggingface", "hugging face", "huggingface.co",
+        "from_pretrained",  # unmistakable HF API call
+    ], weak=[
+        "transformers", "diffusers", "datasets", "accelerate",
+        "peft", "trl", "tokenizer",
+    ]),
+    TagRule("OpenAI", strong=[
+        "openai", "openai api", "openai-python",
+    ], weak=[
+        "gpt-4", "gpt-3", "chatgpt", "whisper", "dall-e",
+    ]),
+    TagRule("Anthropic", strong=[
+        "anthropic", "anthropic api", "claude-api",
+    ], weak=[
+        "claude",
+    ]),
+    TagRule("Vercel AI SDK", strong=[
+        "ai sdk", "vercel ai", "@ai-sdk",
+    ]),
+    TagRule("Streamlit", strong=[
+        "streamlit",
+    ]),
+    TagRule("Gradio", strong=[
+        "gradio",
+    ]),
+    TagRule("FastAPI", strong=[
+        "fastapi",
+    ], weak=[
+        "fast-api",
+    ]),
+    TagRule("Docker", strong=[
+        "dockerfile", "docker-compose", "docker compose",
+    ], weak=[
+        "docker", "containerized",
+    ]),
+    TagRule("Kubernetes", strong=[
+        "kubernetes", "k8s",
+    ], weak=[
+        "helm chart",
+    ]),
+    # ── AI Patterns ──
+    TagRule("RAG", strong=[
+        "rag pipeline", "retrieval augmented", "retrieval-augmented",
+        "chromadb", "pinecone", "weaviate", "qdrant", "milvus",
+    ], weak=[
+        "vector search", "vector database", "vector store", "chroma",
+    ]),
+    TagRule("Fine-Tuning", strong=[
+        "fine-tune", "fine-tuning", "finetuning", "finetune",
+        "lora", "qlora", "rlhf", "dpo",
+    ], weak=[
+        "adapter", "sft",
+    ]),
+    TagRule("Agents", strong=[
+        "ai agent", "autonomous agent", "agent framework", "agentic",
+        "agent orchestration",
+    ], weak=[
+        "tool-use", "tool use", "function calling", "tool calling",
+        "multi-agent",
+    ]),
+    TagRule("Evaluation", strong=[
+        "llm eval", "llm evaluation", "llm benchmark", "llm judge",
+        "model evaluation", "red teaming", "evals framework",
+    ], weak=[
+        "eval", "evaluation", "benchmark", "leaderboard", "scoring",
+        "red team",
+    ]),
+    TagRule("Prompt Engineering", strong=[
+        "prompt engineering", "prompt template", "prompt management",
+        "prompt optimization", "dspy",
+    ], weak=[
+        "prompt chain",
+    ]),
+]
+
+
+def _match_tag_rule(rule: TagRule, search_text: str) -> bool:
+    """
+    Return True if the repo text qualifies for this tag.
+
+    Logic:
+      • Any strong keyword match → True immediately
+      • Weak keywords alone need corroboration:
+        – 2+ weak matches → True
+        – 1 weak match alone → False (too noisy)
+    """
+    strong_hits = sum(1 for kw in rule.strong if kw in search_text)
+    if strong_hits > 0:
+        return True
+
+    weak_hits = sum(1 for kw in rule.weak if kw in search_text)
+    return weak_hits >= 2
+
+
+@router.post("/admin/tags/protocols", response_model=dict)
+async def tag_protocols(
+    dry_run: bool = Query(default=False, description="Preview without writing"),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """
+    Scan all public repos and tag with protocol indicators (MCP, CLI, A2A)
+    and AI framework/SDK tags (LangChain, LlamaIndex, CrewAI, AutoGen,
+    Ollama, vLLM, HuggingFace, OpenAI, Anthropic, etc.) using confidence-
+    tiered keyword matching.
+
+    Strong keywords (e.g. "langchain", "crewai") tag on a single match.
+    Weak keywords (e.g. "transformers", "datasets", "eval") require 2+
+    matches to tag — prevents false positives on generic terms.
+
+    Zero LLM cost — pure keyword matching with noise filtering.
+    """
+    # Fetch repos with their text fields and existing tags
+    result = await db.execute(text("""
+        SELECT r.id, r.name, r.description, r.readme_summary,
+               COALESCE(
+                   (SELECT string_agg(t.tag, ' ') FROM repo_tags t WHERE t.repo_id = r.id),
+                   ''
+               ) AS all_tags
+        FROM repos r
+        WHERE r.is_private = false
+    """))
+    rows = result.fetchall()
+
+    tagged: dict[str, list[str]] = {}  # tag → list of repo names
+    matched_by: dict[str, dict[str, str]] = {}  # tag → {repo: match_type}
+    inserts = 0
+    skipped = 0
+
+    for row in rows:
+        # Build searchable text (lowercase)
+        search_text = " ".join(filter(None, [
+            row.name, row.description, row.readme_summary, row.all_tags,
+        ])).lower()
+
+        for rule in _TAG_RULES:
+            if _match_tag_rule(rule, search_text):
+                # Determine which tier matched for diagnostics
+                strong_hit = any(kw in search_text for kw in rule.strong)
+                match_type = "strong" if strong_hit else "weak×2+"
+                if dry_run:
+                    tagged.setdefault(rule.tag, []).append(row.name)
+                    matched_by.setdefault(rule.tag, {})[row.name] = match_type
+                    continue
+                try:
+                    async with db.begin_nested():
+                        await db.execute(text("""
+                            INSERT INTO repo_tags (repo_id, tag)
+                            VALUES (:repo_id, :tag)
+                            ON CONFLICT (repo_id, tag) DO NOTHING
+                        """), {"repo_id": str(row.id), "tag": rule.tag})
+                    inserts += 1
+                    tagged.setdefault(rule.tag, []).append(row.name)
+                    matched_by.setdefault(rule.tag, {})[row.name] = match_type
+                except Exception:
+                    skipped += 1
+
+    if not dry_run and inserts > 0:
+        await db.commit()
+        invalidate_library_cache()
+
+    return {
+        "dry_run": dry_run,
+        "tagged_count": sum(len(v) for v in tagged.values()),
+        "inserts": inserts,
+        "skipped": skipped,
+        "tags": {
+            k: {
+                "count": len(v),
+                "repos": sorted(v),
+                "match_breakdown": {
+                    "strong": sum(1 for r in v if matched_by.get(k, {}).get(r) == "strong"),
+                    "weak_corroborated": sum(1 for r in v if matched_by.get(k, {}).get(r) == "weak×2+"),
+                },
+            }
+            for k, v in tagged.items()
+        },
+    }
 
 
 @router.post("/admin/taxonomy/bootstrap", response_model=dict)
@@ -379,13 +763,113 @@ async def bootstrap_taxonomy(
 
 
 # ---------------------------------------------------------------------------
+# Data integrity health check
+# ---------------------------------------------------------------------------
+
+@router.get("/admin/health/data", response_model=dict)
+async def data_integrity_health(
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """
+    Monitor junction table row counts and coverage ratios to detect data
+    regressions immediately after ingestion runs.
+
+    Status thresholds:
+    - ``critical``  — repo_tags has < 100 rows total
+    - ``degraded``  — repo_tags coverage < 50 % of repos
+    - ``healthy``   — all checks pass
+    """
+    # --- raw counts (fast COUNT queries, no JOINs) ---
+    # Use explicit SQL strings (not f-strings) to avoid dynamic table name injection.
+    _table_count_sql: dict[str, str] = {
+        "repos":             "SELECT COUNT(*) FROM repos",
+        "repo_tags":         "SELECT COUNT(*) FROM repo_tags",
+        "repo_categories":   "SELECT COUNT(*) FROM repo_categories",
+        "repo_taxonomy":     "SELECT COUNT(*) FROM repo_taxonomy",
+        "taxonomy_values":   "SELECT COUNT(*) FROM taxonomy_values",
+        "repo_ai_dev_skills":"SELECT COUNT(*) FROM repo_ai_dev_skills",
+        "repo_pm_skills":    "SELECT COUNT(*) FROM repo_pm_skills",
+        "repo_languages":    "SELECT COUNT(*) FROM repo_languages",
+    }
+    counts: dict[str, int] = {}
+    for table, sql in _table_count_sql.items():
+        row = await db.execute(text(sql))
+        counts[table] = row.scalar() or 0
+
+    total_repos = counts["repos"]
+
+    # --- coverage: repos that have at least 1 row in each junction table ---
+    def _pct(n: int) -> float:
+        if total_repos == 0:
+            return 0.0
+        return round(n / total_repos * 100, 1)
+
+    tags_covered = (
+        await db.execute(
+            text("SELECT COUNT(DISTINCT repo_id) FROM repo_tags")
+        )
+    ).scalar() or 0
+
+    cats_covered = (
+        await db.execute(
+            text("SELECT COUNT(DISTINCT repo_id) FROM repo_categories")
+        )
+    ).scalar() or 0
+
+    langs_covered = (
+        await db.execute(
+            text("SELECT COUNT(DISTINCT repo_id) FROM repo_languages")
+        )
+    ).scalar() or 0
+
+    coverage = {
+        "tags_pct": _pct(tags_covered),
+        "categories_pct": _pct(cats_covered),
+        "languages_pct": _pct(langs_covered),
+    }
+
+    # --- alerts & status ---
+    alerts: list[str] = []
+    status = "healthy"
+
+    tag_total = counts["repo_tags"]
+    tags_pct = coverage["tags_pct"]
+
+    if tag_total < 100:
+        status = "critical"
+        alerts.append(
+            f"repo_tags critically low: {tag_total} rows for {total_repos} repos"
+        )
+    elif tags_pct < 50.0:
+        status = "degraded"
+        alerts.append(
+            f"repo_tags coverage degraded: {tags_pct}% of repos have a tag"
+        )
+
+    thresholds = {
+        "repo_tags_min_rows": 100,
+        "tags_coverage_min_pct": 50.0,
+    }
+
+    return {
+        "status": status,
+        "counts": counts,
+        "coverage": coverage,
+        "thresholds": thresholds,
+        "alerts": alerts,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Run history
 # ---------------------------------------------------------------------------
 
 @router.get(
     "/admin/runs",
     summary="List recent ingestion runs",
-    dependencies=[Depends(require_admin_key)],
+    dependencies=[Depends(require_admin_key), Depends(verify_api_key)],
 )
 async def list_runs(
     limit: int = Query(50, ge=1, le=200),
@@ -416,10 +900,25 @@ async def list_runs(
     ]
 
 
+@router.post("/admin/enrichment/trigger", response_model=dict)
+async def trigger_enrichment(
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Mark unenriched repos and return count.
+    A cron/external process picks these up."""
+    result = await db.execute(text(
+        "SELECT COUNT(*) FROM repos WHERE quality_signals IS NULL"
+    ))
+    pending = result.scalar()
+    return {"pending_enrichment": pending, "message": f"{pending} repos need enrichment"}
+
+
 @router.post(
     "/admin/runs",
     summary="Record a completed ingestion run",
-    dependencies=[Depends(require_admin_key)],
+    dependencies=[Depends(require_admin_key), Depends(verify_api_key)],
     status_code=201,
 )
 async def record_run(
@@ -463,3 +962,164 @@ async def record_run(
     await db.commit()
     await db.refresh(run)
     return {"id": run.id, "status": "recorded"}
+
+
+@router.post("/admin/backfill/categories", response_model=dict)
+async def backfill_categories(
+    batch_size: int = Query(default=200, ge=1, le=1000),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """
+    Re-derive repo_categories for all repos from their current repo_tags.
+
+    Idempotent: uses INSERT … ON CONFLICT DO NOTHING so existing rows are
+    preserved and the endpoint can be called repeatedly without data loss.
+
+    Returns {processed, assigned, skipped}.
+    """
+    BATCH = batch_size
+    offset = 0
+    processed = 0
+    assigned = 0
+    skipped = 0
+
+    # Build full tag map once (tags are small, fits in memory for ~1 500 repos)
+    tags_result = await db.execute(text(
+        "SELECT repo_id::text, tag FROM repo_tags"
+    ))
+    tags_by_repo: dict[str, list[str]] = {}
+    for row in tags_result.fetchall():
+        tags_by_repo.setdefault(str(row.repo_id), []).append(row.tag)
+
+    while True:
+        repo_result = await db.execute(text(
+            "SELECT id::text FROM repos ORDER BY updated_at DESC LIMIT :lim OFFSET :off"
+        ), {"lim": BATCH, "off": offset})
+        repo_ids = [r[0] for r in repo_result.fetchall()]
+        if not repo_ids:
+            break
+
+        for repo_id in repo_ids:
+            processed += 1
+            tags = tags_by_repo.get(repo_id, [])
+            if not tags:
+                skipped += 1
+                continue
+
+            cats = _assign_categories_from_tags(tags)
+            for cat in cats:
+                try:
+                    await db.execute(text(
+                        """
+                        INSERT INTO repo_categories
+                            (repo_id, category_id, category_name, is_primary)
+                        VALUES
+                            (:repo_id, :cat_id, :cat_name, :is_primary)
+                        ON CONFLICT (repo_id, category_id) DO UPDATE
+                            SET category_name = EXCLUDED.category_name,
+                                is_primary     = EXCLUDED.is_primary
+                        """
+                    ), {
+                        "repo_id": repo_id,
+                        "cat_id":  cat["category_id"],
+                        "cat_name": cat["category_name"],
+                        "is_primary": cat["is_primary"],
+                    })
+                    assigned += 1
+                except Exception as exc:
+                    logger.warning("Category insert failed for %s / %s: %s",
+                                   repo_id, cat["category_id"], exc)
+
+        await db.commit()
+        offset += BATCH
+
+    await cache.invalidate("library:full*")
+    await cache.invalidate("repos:list:*")
+    invalidate_library_cache()
+
+    return {"processed": processed, "assigned": assigned, "skipped": skipped}
+
+
+# ── Security signal models ──────────────────────────────────────────────────
+
+class SecuritySignalsPatch(BaseModel):
+    """Payload for manually setting a repo's security risk signals."""
+    risk_level: str | None = None        # 'critical' | 'high' | 'medium' | 'low'
+    incident_reported: bool = False
+    incident_date: str | None = None     # ISO date, e.g. "2024-05-20"
+    incident_url: str | None = None      # link to advisory / blog post / CVE
+    incident_summary: str | None = None  # one-sentence human-readable summary
+
+
+@router.patch(
+    "/admin/repos/{repo_name}/security",
+    dependencies=[Depends(require_admin_key)],
+    summary="Set security risk signals for a repo",
+)
+async def set_repo_security_signals(
+    repo_name: str,
+    payload: SecuritySignalsPatch,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Manually mark a repo with security risk metadata.
+    Creates or replaces the security_signals JSONB on the matching repo row.
+
+    Example body for LiteLLM-style supply-chain incident:
+        {
+          "risk_level": "critical",
+          "incident_reported": true,
+          "incident_date": "2024-05-20",
+          "incident_url": "https://github.com/BerriAI/litellm/issues/3668",
+          "incident_summary": "Malicious PyPI package published; credentials at risk"
+        }
+    """
+    result = await db.execute(
+        select(Repo).where(Repo.name == repo_name)
+    )
+    repo = result.scalar_one_or_none()
+    if repo is None:
+        raise HTTPException(status_code=404, detail=f"Repo '{repo_name}' not found")
+
+    repo.security_signals = {
+        "risk_level": payload.risk_level,
+        "incident_reported": payload.incident_reported,
+        "incident_date": payload.incident_date,
+        "incident_url": payload.incident_url,
+        "incident_summary": payload.incident_summary,
+    }
+    await db.commit()
+
+    # Bust all library caches so the next page load reflects the update
+    await cache.invalidate("library:full*")
+    await cache.invalidate("repos:list:*")
+    invalidate_library_cache()
+
+    return {
+        "repo": repo_name,
+        "security_signals": repo.security_signals,
+    }
+
+
+@router.delete(
+    "/admin/repos/{repo_name}/security",
+    dependencies=[Depends(require_admin_key)],
+    summary="Clear security risk signals for a repo",
+)
+async def clear_repo_security_signals(
+    repo_name: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Remove all security signals from a repo (set to NULL)."""
+    result = await db.execute(select(Repo).where(Repo.name == repo_name))
+    repo = result.scalar_one_or_none()
+    if repo is None:
+        raise HTTPException(status_code=404, detail=f"Repo '{repo_name}' not found")
+
+    repo.security_signals = None
+    await db.commit()
+    invalidate_library_cache()
+
+    return {"repo": repo_name, "security_signals": None}

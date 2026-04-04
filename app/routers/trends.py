@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Response
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -81,7 +81,8 @@ def _build_trend_report(
 
 
 @router.get("/trends", response_model=list[TrendSnapshotOut])
-async def get_trends(db: AsyncSession = Depends(get_db)) -> list[TrendSnapshotOut]:
+async def get_trends(response: Response, db: AsyncSession = Depends(get_db)) -> list[TrendSnapshotOut]:
+    response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=3600"
     cached = await cache.get("trends:latest")
     if cached:
         return [TrendSnapshotOut(**t) for t in cached]
@@ -175,7 +176,8 @@ async def get_trends_report(db: AsyncSession = Depends(get_db)) -> TrendReportOu
 
 
 @router.get("/gaps", response_model=list[GapAnalysisOut], tags=["Trends", "Taxonomy"])
-async def get_gaps(db: AsyncSession = Depends(get_db)) -> list[GapAnalysisOut]:
+async def get_gaps(response: Response, db: AsyncSession = Depends(get_db)) -> list[GapAnalysisOut]:
+    response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=3600"
     cached = await cache.get("gaps:latest")
     if cached:
         return [GapAnalysisOut(**g) for g in cached]
@@ -232,13 +234,18 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
     ).all()
     sync_states = {row.fork_sync_state: row.cnt for row in sync_rows}
 
-    last_log_stmt = select(IngestionLog).order_by(IngestionLog.started_at.desc()).limit(1)
-    last_log_row = (await db.execute(last_log_stmt)).scalar_one_or_none()
-    last_ingestion = (
-        IngestionLogOut.model_validate(last_log_row, from_attributes=True)
-        if last_log_row
-        else None
-    )
+    # ingestion_log table may not exist in all deployments; degrade gracefully
+    last_ingestion = None
+    try:
+        last_log_stmt = select(IngestionLog).order_by(IngestionLog.started_at.desc()).limit(1)
+        last_log_row = (await db.execute(last_log_stmt)).scalar_one_or_none()
+        last_ingestion = (
+            IngestionLogOut.model_validate(last_log_row, from_attributes=True)
+            if last_log_row
+            else None
+        )
+    except Exception:
+        pass  # table may not exist in this deployment
 
     system_tags = {"Active", "Forked", "Built by Me", "Inactive", "Archived", "Popular"}
     tag_rows = (

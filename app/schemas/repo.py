@@ -6,6 +6,15 @@ from pydantic import BaseModel, ConfigDict
 
 # --- Sub-schemas ---
 
+class SecuritySignals(BaseModel):
+    """Security risk metadata — manually curated or auto-detected."""
+    risk_level: str | None = None  # 'critical' | 'high' | 'medium' | 'low'
+    incident_reported: bool = False
+    incident_date: str | None = None   # ISO date string, e.g. "2024-05-20"
+    incident_url: str | None = None    # link to CVE / advisory / blog post
+    incident_summary: str | None = None
+
+
 class TaxonomyEntry(BaseModel):
     dimension: str
     value: str
@@ -79,6 +88,7 @@ class RepoSummary(BaseModel):
     quality_signals: dict | None = None
     problem_solved: str | None = None
     license_spdx: str | None = None
+    security_signals: dict | None = None
 
     ingested_at: datetime
     updated_at: datetime
@@ -178,6 +188,9 @@ class RepoIngestItem(BaseModel):
     license_spdx: str | None = None
     has_tests: bool | None = None
     has_ci: bool | None = None
+
+    # Security risk — can be set by ingestion or via admin API
+    security_signals: dict | None = None
 
     # Dynamic taxonomy dimensions
     skill_areas: list[str] = []
