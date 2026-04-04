@@ -53,16 +53,15 @@ class _ScalarResult:
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
-async def test_data_integrity_health_requires_admin_key(client: AsyncClient):
-    """Endpoint should be accessible without an admin key when ADMIN_API_KEY is unset."""
-    # conftest does not set ADMIN_API_KEY, so require_admin_key allows all requests.
+async def test_data_integrity_health_requires_api_key(client: AsyncClient):
+    """Endpoint should reject requests without a valid API key."""
     response = await client.get("/admin/health/data")
-    assert response.status_code == 200
+    assert response.status_code == 403
 
 
 @pytest.mark.asyncio
 async def test_data_integrity_health_returns_correct_shape(client: AsyncClient):
-    response = await client.get("/admin/health/data")
+    response = await client.get("/admin/health/data", headers=AUTH_HEADERS)
     assert response.status_code == 200
     data = response.json()
 
@@ -103,7 +102,7 @@ async def test_data_integrity_health_returns_correct_shape(client: AsyncClient):
 @pytest.mark.asyncio
 async def test_data_integrity_health_status_critical_when_no_tags(client: AsyncClient):
     """With an empty database the tag count is 0 → status must be critical."""
-    response = await client.get("/admin/health/data")
+    response = await client.get("/admin/health/data", headers=AUTH_HEADERS)
     assert response.status_code == 200
     data = response.json()
     # Empty DB → repo_tags = 0 which is < 100 → critical
