@@ -33,11 +33,38 @@ from app.auth import require_app_token
 from app.cache import cache
 from app.circuit_breaker import anthropic_breaker
 from app.cost_tracker import check_budget, record_cost
+from app.rate_limit import rate_limit_storage
 from app.utils import get_anthropic_key
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# KAN-197: Lazy singleton Anthropic client
+# ---------------------------------------------------------------------------
+_anthropic_client: anthropic.Anthropic | None = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        from app.utils import get_anthropic_key
+        _anthropic_client = anthropic.Anthropic(api_key=get_anthropic_key())
+    return _anthropic_client
+
+
+# Per-model pricing (per 1M tokens)
+_MODEL_PRICING = {
+    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    "claude-haiku-4-5-20250414": {"input": 0.80, "output": 4.00},
+    "claude-haiku-4-5": {"input": 0.80, "output": 4.00},
+}
+
+
+def _estimate_cost(input_tokens: int, output_tokens: int, model: str = "claude-haiku-4-5") -> float:
+    pricing = _MODEL_PRICING.get(model, _MODEL_PRICING["claude-haiku-4-5"])
+    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
 router = APIRouter(prefix="/intelligence", tags=["Intelligence"])
-_limiter = Limiter(key_func=get_remote_address)
+_limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 # Valid categories in the Reporium taxonomy
 _VALID_CATEGORIES = [
@@ -127,12 +154,12 @@ async def nl_filter(
     Single Haiku call — ~$0.0005 per request. Results cached 1 hour by query hash.
     Requires X-App-Token header, rate-limited to 15 req/min per IP.
     """
-    cache_key = f"nl_filter:{hash(body.query.lower().strip())}"
+    cache_key = f"nl_filter:{hashlib.sha256(body.query.lower().strip().encode()).hexdigest()[:16]}"
     cached = await cache.get(cache_key)
     if cached:
         return NLFilterResponse(**cached)
 
-    if not check_budget():
+    if not await check_budget():
         raise HTTPException(
             status_code=503,
             detail="Service temporarily unavailable — daily usage limit reached. Try again tomorrow.",
@@ -144,11 +171,8 @@ async def nl_filter(
     )
 
     try:
-        api_key = get_anthropic_key()
-
         def _call_haiku():
-            client = anthropic.Anthropic(api_key=api_key)
-            return client.messages.create(
+            return _get_client().messages.create(
                 model="claude-haiku-4-5",
                 max_tokens=256,
                 messages=[{"role": "user", "content": prompt}],
@@ -156,7 +180,8 @@ async def nl_filter(
 
         with anthropic_breaker:
             response = await asyncio.to_thread(_call_haiku)
-        record_cost(0.0005, model="claude-haiku-4-5")
+        actual_cost = _estimate_cost(response.usage.input_tokens, response.usage.output_tokens, "claude-haiku-4-5")
+        await record_cost(actual_cost, model="claude-haiku-4-5")
         raw = response.content[0].text.strip()
 
         # Strip markdown fences if present

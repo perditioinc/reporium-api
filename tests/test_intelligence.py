@@ -325,7 +325,7 @@ async def test_run_query_returns_semantic_cache_hit_without_calling_anthropic():
              "claude-sonnet-4-20250514",
          ))), \
          patch("app.routers.intelligence._log_query", new=mock_log_query), \
-         patch("app.routers.intelligence.anthropic.Anthropic") as anthropic_client:
+         patch("app.routers.intelligence._get_client") as anthropic_client:
         response = await _run_query(
             QueryRequest(question="What is Reporium?"),
             db,
@@ -418,10 +418,10 @@ async def test_run_query_raises_504_on_claude_timeout():
     async def _slow_executor(executor, fn):
         raise _asyncio.TimeoutError()
 
+    mock_client = MagicMock()
     with patch("app.routers.intelligence.get_embedding_model", return_value=fake_model), \
          patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(side_effect=_no_cache)), \
-         patch("app.routers.intelligence.get_anthropic_key", return_value="sk-fake"), \
-         patch("app.routers.intelligence.anthropic.Anthropic"), \
+         patch("app.routers.intelligence._get_client", return_value=mock_client), \
          patch("app.routers.intelligence.asyncio.wait_for", side_effect=_asyncio.TimeoutError):
         # Provide a minimal DB result so the vector search completes
         db.execute = AsyncMock(return_value=MagicMock(fetchall=lambda: []))
