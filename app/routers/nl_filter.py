@@ -19,6 +19,7 @@ The structured output maps directly to existing query params on GET /repos.
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -184,11 +185,11 @@ async def nl_filter(request: Request, body: NLFilterRequest) -> NLFilterResponse
         result.query_params = _build_query_params(result)
 
         await cache.set(cache_key, result.model_dump(), ttl=3600)  # 1h cache
-        logger.info("nl_filter: '%s' → %s", body.query[:60], result.query_params)
+        logger.info("nl_filter: query_hash=%s → %s", hashlib.sha256(body.query.encode()).hexdigest()[:12], result.query_params)
         return result
 
     except json.JSONDecodeError as e:
-        logger.error("nl_filter: JSON parse failed for query '%s': %s", body.query, e)
+        logger.error("nl_filter: JSON parse failed for query_hash=%s: %s", hashlib.sha256(body.query.encode()).hexdigest()[:12], e)
         raise HTTPException(status_code=502, detail="Filter parsing failed — try rephrasing")
     except Exception as e:
         logger.error("nl_filter: unexpected error: %s", e)

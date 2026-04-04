@@ -15,6 +15,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from uuid import UUID
 
 import anthropic
 import numpy as np
@@ -350,7 +351,11 @@ async def _try_smart_route(question: str, db: AsyncSession) -> dict | None:
             "starred": "COALESCE(parent_stars, stargazers_count, 0) DESC",
             "popular": "COALESCE(parent_stars, stargazers_count, 0) DESC",
         }
-        order_clause = order_map.get(adj, "COALESCE(parent_stars, stargazers_count, 0) DESC")
+        # KAN-124 (#4): Explicit allowlist guard — even if the regex is loosened
+        # later, only known adjectives can reach the f-string SQL interpolation.
+        if adj not in order_map:
+            return None
+        order_clause = order_map[adj]
         result = await db.execute(text(f"""
             SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
                    primary_category, activity_score
@@ -499,6 +504,9 @@ async def _log_query(
     cache_hit: bool = False,
 ) -> None:
     """Fire-and-forget: write one row to query_log. Never raises."""
+    # KAN-124 (#2): query_log stores user questions in plaintext. A periodic
+    # cleanup job should purge old rows to limit data-retention exposure, e.g.:
+    #   DELETE FROM query_log WHERE created_at < NOW() - INTERVAL '90 days';
     try:
         async with async_session_factory() as session:
             await session.execute(
@@ -594,6 +602,9 @@ async def _save_session_turn(
     session_id: str, question: str, answer: str, db: AsyncSession
 ) -> None:
     """Append one turn to ask_sessions. Fire-and-forget — never raises."""
+    # KAN-124 (#2): ask_sessions stores user questions and answers in plaintext.
+    # Like query_log, it needs a periodic TTL cleanup job, e.g.:
+    #   DELETE FROM ask_sessions WHERE created_at < NOW() - INTERVAL '90 days';
     try:
         # Determine the next turn number for this session
         result = await db.execute(
@@ -634,6 +645,17 @@ class QueryRequest(BaseModel):
             "prepended to Claude's context for conversational continuity."
         ),
     )
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        try:
+            UUID(v)
+        except (ValueError, AttributeError):
+            raise ValueError("session_id must be a valid UUID")
+        return v
 
     @field_validator("question")
     @classmethod
@@ -1550,61 +1572,40 @@ Rules:
 @_limiter.limit("30/minute")
 async def suggested_questions(
     request: Request,
-    db: AsyncSession = Depends(get_db),
 ):
     """
-    Return popular/diverse questions from query_log for the ask bar.
-    Zero LLM cost — pulls from historical queries ranked by frequency
-    and answer quality. Cached for 1 hour.
+    Return curated example questions for the ask bar.
+    Uses a static list — never exposes real user queries (privacy).
     """
-    cache_key = "intelligence:suggestions"
-    cached = await cache.get(cache_key)
-    if cached:
-        return cached
+    import random
 
-    result = await db.execute(text("""
-        SELECT question, COUNT(*) as freq,
-               AVG(tokens_completion) as avg_tokens
-        FROM query_log
-        WHERE answer_full IS NOT NULL
-          AND cache_hit = false
-          AND LENGTH(question) BETWEEN 10 AND 120
-          AND question NOT LIKE '%ignore%'
-          AND tokens_completion > 50
-        GROUP BY question
-        ORDER BY freq DESC, avg_tokens DESC
-        LIMIT 20
-    """))
-    rows = result.fetchall()
+    # Curated questions showcasing platform capabilities.
+    # NEVER pull from query_log — that leaks real user questions publicly.
+    _CURATED_SUGGESTIONS = [
+        # Discovery
+        "What are the most starred AI repos?",
+        "Which repos support MCP?",
+        "Show me RAG tools with the most stars",
+        "What are the best LLM inference frameworks?",
+        # Category exploration
+        "Which repos focus on retrieval-augmented generation?",
+        "What agent frameworks are available?",
+        "Show me repos for fine-tuning LLMs",
+        "What evaluation and benchmarking tools exist?",
+        # Stats / smart-routed (showcase $0 instant answers)
+        "How many repos are tracked?",
+        "What categories are available?",
+        "How many Python repos are there?",
+        "What are the most forked repos?",
+        # Comparisons
+        "Compare LangChain and LlamaIndex",
+        "What's the difference between vLLM and TGI?",
+        "Compare CrewAI and AutoGen for multi-agent systems",
+    ]
 
-    # Deduplicate similar questions (simple prefix check)
-    seen_prefixes: set[str] = set()
-    suggestions: list[str] = []
-    for row in rows:
-        prefix = row.question[:30].lower()
-        if prefix not in seen_prefixes:
-            seen_prefixes.add(prefix)
-            suggestions.append(row.question)
-        if len(suggestions) >= 8:
-            break
-
-    # Fallback if no history yet
-    if len(suggestions) < 4:
-        defaults = [
-            "What are the best LLM inference frameworks?",
-            "Which repos support MCP?",
-            "What are the most active repos?",
-            "Show me RAG tools with the most stars",
-        ]
-        for d in defaults:
-            if d not in suggestions:
-                suggestions.append(d)
-            if len(suggestions) >= 8:
-                break
-
-    response = {"suggestions": suggestions}
-    await cache.set(cache_key, response, ttl=CACHE_TTL_STATS)
-    return response
+    # Return a random subset of 6 so the UI feels fresh on each visit
+    selected = random.sample(_CURATED_SUGGESTIONS, min(6, len(_CURATED_SUGGESTIONS)))
+    return {"suggestions": selected}
 
 
 @router.get("/portfolio-insights", response_model=PortfolioInsightsResponse)

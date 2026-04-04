@@ -1,3 +1,4 @@
+import logging
 import os
 
 from fastapi import HTTPException, Request, Security, status
@@ -8,7 +9,10 @@ from google.oauth2 import id_token
 
 from app.config import settings
 
+logger = logging.getLogger(__name__)
 security = HTTPBearer()
+
+_IS_PRODUCTION = os.getenv("ENVIRONMENT") == "production"
 
 
 async def verify_api_key(
@@ -34,7 +38,10 @@ async def require_admin_key(
 ) -> None:
     admin_key = os.getenv("ADMIN_API_KEY")
     if not admin_key:
-        return  # No key configured - allow (dev mode)
+        if _IS_PRODUCTION:
+            logger.error("ADMIN_API_KEY not set in production — rejecting request")
+            raise HTTPException(status_code=500, detail="Server misconfiguration")
+        return  # No key configured — allow in dev mode only
     if x_admin_key != admin_key:
         raise HTTPException(status_code=403, detail="Invalid admin key")
 
@@ -54,7 +61,10 @@ async def require_ingest_key(
 ) -> None:
     ingest_key = os.getenv("INGEST_API_KEY")
     if not ingest_key:
-        return  # No key configured - allow (dev mode)
+        if _IS_PRODUCTION:
+            logger.error("INGEST_API_KEY not set in production — rejecting request")
+            raise HTTPException(status_code=500, detail="Server misconfiguration")
+        return  # No key configured — allow in dev mode only
     if x_ingest_key == ingest_key or x_admin_key == ingest_key:
         return
     raise HTTPException(status_code=403, detail="Invalid ingest key")
@@ -66,7 +76,10 @@ async def require_pubsub_push(
 ) -> None:
     audience = settings.pubsub_audience
     if not audience:
-        return  # No audience configured - allow (dev/manual mode)
+        if _IS_PRODUCTION:
+            logger.error("pubsub_audience not set in production — rejecting request")
+            raise HTTPException(status_code=500, detail="Server misconfiguration")
+        return  # No audience configured — allow in dev/manual mode only
     if credentials is None or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing Pub/Sub bearer token")
 
