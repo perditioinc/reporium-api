@@ -264,7 +264,7 @@ async def repo_health(
     result = await db.execute(stmt)
     repo = result.scalar_one_or_none()
     if not repo:
-        raise HTTPException(status_code=404, detail=f"Repo '{name}' not found")
+        raise HTTPException(status_code=404, detail="Repository not found")
 
     # --- Activity (30%) ---
     activity_raw = repo.activity_score or 0  # already 0-100
@@ -366,7 +366,7 @@ async def get_repo(name: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
     result = await db.execute(stmt)
     repo = result.scalar_one_or_none()
     if not repo:
-        raise HTTPException(status_code=404, detail=f"Repo '{name}' not found")
+        raise HTTPException(status_code=404, detail="Repository not found")
 
     detail = _repo_to_detail(repo)
     await cache.set(cache_key, detail.model_dump(), ttl=CACHE_TTL_REPO_DETAIL)
@@ -393,5 +393,5 @@ async def get_repo_by_owner(owner: str, repo: str, db: AsyncSession = Depends(ge
     result = await db.execute(stmt)
     found = result.scalar_one_or_none()
     if not found:
-        raise HTTPException(status_code=404, detail=f"Repo '{owner}/{repo}' not found")
+        raise HTTPException(status_code=404, detail="Repository not found")
     return _repo_to_detail(found)
