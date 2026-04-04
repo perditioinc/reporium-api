@@ -1,0 +1,29 @@
+name: Keep Cloud Run warm
+
+on:
+  schedule:
+    # Every 10 minutes during active hours (06:00–02:00 UTC, covers US/EU daytime)
+    - cron: '*/10 6-23 * * *'
+    - cron: '*/10 0-2 * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping health endpoint with latency check
+        run: |
+          RESPONSE=$(curl -s -o /dev/null -w "%{http_code} %{time_total}" \
+            "https://reporium-api-573778300586.us-central1.run.app/health" \
+            --max-time 10)
+          STATUS=$(echo "$RESPONSE" | awk '{print $1}')
+          LATENCY_S=$(echo "$RESPONSE" | awk '{print $2}')
+          LATENCY_MS=$(echo "$LATENCY_S * 1000" | bc | cut -d. -f1)
+          echo "Health status: $STATUS | Latency: ${LATENCY_MS}ms"
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Health returned $STATUS"
+            exit 1
+          fi
+          if [ "$LATENCY_MS" -gt 2000 ]; then
+            echo "::warning::Health latency ${LATENCY_MS}ms exceeds 2000ms threshold (possible cold start regression)"
+          fi

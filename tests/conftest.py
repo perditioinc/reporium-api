@@ -1,13 +1,13 @@
-import asyncio
 import os
 from collections.abc import AsyncGenerator
 
-import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
-os.environ["DATABASE_URL"] = "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test"
+os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test")
 os.environ["INGESTION_API_KEY"] = "test-api-key"
 os.environ["GH_USERNAME"] = "testuser"
 os.environ["REDIS_URL"] = ""  # disable Redis in tests
@@ -23,28 +23,31 @@ AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
 TEST_DB_URL = os.environ["DATABASE_URL"]
 
 
-@pytest.fixture(scope="session")
-def event_loop():
-    """Single event loop for all tests."""
-    loop = asyncio.new_event_loop()
-    yield loop
-    loop.close()
-
-
 @pytest_asyncio.fixture(scope="session")
-async def _setup_db(event_loop):
-    # Replace the app engine with one on this event loop
+async def _setup_db():
     await db_module.engine.dispose()
-    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, pool_pre_ping=True)
+    # NullPool: no connection pooling → each session gets a fresh connection.
+    # This prevents "Future attached to a different loop" errors when pytest-asyncio
+    # creates a new event loop per test while the engine is session-scoped.
+    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=NullPool)
     db_module.async_session_factory.configure(bind=db_module.engine)
 
     async with db_module.engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # Install pgvector and add embedding_vec columns that are managed
+        # outside the ORM model (via raw migrations in production).
+        await conn.execute(
+            text("CREATE EXTENSION IF NOT EXISTS vector")
+        )
+        await conn.execute(
+            text("ALTER TABLE taxonomy_values ADD COLUMN IF NOT EXISTS embedding_vec vector(384)")
+        )
+        await conn.execute(
+            text("ALTER TABLE repo_embeddings ADD COLUMN IF NOT EXISTS embedding_vec vector(384)")
+        )
     yield
-    # Dispose engine first to drain connection pool before loop teardown
     await db_module.engine.dispose()
-    # Recreate for drop_all, then dispose again
-    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, pool_pre_ping=True)
+    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=NullPool)
     async with db_module.engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
     await db_module.engine.dispose()

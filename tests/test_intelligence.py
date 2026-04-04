@@ -317,7 +317,8 @@ async def test_run_query_returns_semantic_cache_hit_without_calling_anthropic():
     fake_model.encode.return_value = np.array([0.1, 0.2, 0.3])
     mock_log_query = AsyncMock()
 
-    with patch("app.routers.intelligence._get_model", return_value=fake_model), \
+    with patch("app.routers.intelligence._try_smart_route", new=AsyncMock(return_value=None)), \
+         patch("app.routers.intelligence.get_embedding_model", return_value=fake_model), \
          patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(return_value=(
              "Cached answer",
              _coerce_cached_sources([{"owner": "perditioinc", "name": "reporium", "relevance_score": 0.88}]),
@@ -397,3 +398,38 @@ def test_portfolio_summary_formats_signal_highlights():
     assert "old-repo" in summary[1]
     assert "hot-repo" in summary[2]
     assert "perditioinc/one" in summary[3]
+
+
+@pytest.mark.asyncio
+async def test_run_query_raises_504_on_claude_timeout():
+    """_run_query must surface a 504 HTTPException when Claude times out."""
+    from fastapi import HTTPException as _HTTPException
+    import asyncio as _asyncio
+
+    db = AsyncMock()
+    fake_model = MagicMock()
+    fake_model.encode.return_value = np.array([0.1, 0.2, 0.3])
+
+    # Simulate no semantic cache hit so we proceed to the Claude call
+    async def _no_cache(*args, **kwargs):
+        return None
+
+    # Simulate Claude taking forever
+    async def _slow_executor(executor, fn):
+        raise _asyncio.TimeoutError()
+
+    with patch("app.routers.intelligence.get_embedding_model", return_value=fake_model), \
+         patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(side_effect=_no_cache)), \
+         patch("app.routers.intelligence._get_anthropic_key", return_value="sk-fake"), \
+         patch("app.routers.intelligence.anthropic.Anthropic"), \
+         patch("app.routers.intelligence.asyncio.wait_for", side_effect=_asyncio.TimeoutError):
+        # Provide a minimal DB result so the vector search completes
+        db.execute = AsyncMock(return_value=MagicMock(fetchall=lambda: []))
+        with pytest.raises(_HTTPException) as exc_info:
+            await _run_query(
+                QueryRequest(question="What are the best RAG tools?"),
+                db,
+            )
+
+    assert exc_info.value.status_code == 504
+    assert "did not respond" in exc_info.value.detail

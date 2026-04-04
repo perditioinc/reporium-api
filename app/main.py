@@ -15,7 +15,7 @@ from slowapi.util import get_remote_address
 
 from app.cache import cache
 from app.database import async_session_factory, check_db_connection, engine
-from app.routers import admin, analytics, ingest, intelligence, library, library_full, platform, repos, search, taxonomy, trends, webhooks, wiki
+from app.routers import admin, analytics, graph, ingest, intelligence, library, library_full, nl_filter, platform, recommendations, repos, search, taxonomy, trends, webhooks, wiki
 
 
 class _JsonFormatter(logging.Formatter):
@@ -49,6 +49,14 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     await cache.connect()
     await check_db_connection()
+    # Pre-warm the sentence-transformers model so the first /search/semantic
+    # and /intelligence/ask requests don't pay a 3-5s cold-start penalty on
+    # Cloud Run. The model is ~90 MB and loads once per process.
+    import asyncio as _asyncio
+    from app.embeddings import get_embedding_model as _get_embedding_model
+    loop = _asyncio.get_event_loop()
+    await loop.run_in_executor(None, _get_embedding_model)
+    logger.info("Embedding model pre-warmed at startup")
     yield
     await cache.disconnect()
     await engine.dispose()
@@ -172,13 +180,15 @@ _ALLOWED_ORIGINS = [
     "https://reporium.com",
     "https://www.reporium.com",
     "https://perditioinc.github.io",
+    "http://localhost:3000",
 ]
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
+    allow_origin_regex=r"https://reporium(-[a-z0-9]+)*\.vercel\.app",
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Ingest-Key", "Accept"],
 )
 
 
@@ -217,6 +227,7 @@ async def add_security_headers(request: Request, call_next):
     return response
 
 app.include_router(library.router)
+app.include_router(graph.router)
 app.include_router(repos.router)
 app.include_router(search.router)
 app.include_router(analytics.router)
@@ -226,6 +237,8 @@ app.include_router(platform.router)
 app.include_router(ingest.router)
 app.include_router(ingest.events_router)
 app.include_router(intelligence.router)
+app.include_router(nl_filter.router)
+app.include_router(recommendations.router)
 app.include_router(library_full.router)
 app.include_router(taxonomy.router, prefix="/taxonomy")
 app.include_router(admin.router)
@@ -256,7 +269,7 @@ async def health():
             content={
                 "status": "degraded",
                 "db": "error",
-                "detail": db_error,
+                "detail": "database check failed",
             },
         )
 

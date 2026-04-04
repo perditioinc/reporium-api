@@ -33,7 +33,7 @@ async def get_skill_wiki(skill: str, db: AsyncSession = Depends(get_db)) -> Skil
     stmt = (
         select(Repo)
         .join(RepoAIDevSkill, RepoAIDevSkill.repo_id == Repo.id)
-        .where(RepoAIDevSkill.skill == skill)
+        .where(RepoAIDevSkill.skill == skill, Repo.is_private == False)  # noqa: E712
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -53,7 +53,7 @@ async def get_skill_wiki(skill: str, db: AsyncSession = Depends(get_db)) -> Skil
         stmt2 = (
             select(Repo)
             .join(RepoPMSkill, RepoPMSkill.repo_id == Repo.id)
-            .where(RepoPMSkill.skill == skill)
+            .where(RepoPMSkill.skill == skill, Repo.is_private == False)  # noqa: E712
             .options(
                 selectinload(Repo.tags),
                 selectinload(Repo.categories),
@@ -98,7 +98,7 @@ async def get_category_wiki(
     stmt = (
         select(Repo)
         .join(RepoCategory, RepoCategory.repo_id == Repo.id)
-        .where(RepoCategory.category_id == category)
+        .where(RepoCategory.category_id == category, Repo.is_private == False)  # noqa: E712
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),

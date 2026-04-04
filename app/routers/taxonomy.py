@@ -109,7 +109,7 @@ async def get_repos_for_skill_area(name: str, db: AsyncSession = Depends(get_db)
         "       r.stargazers_count, r.parent_stars, r.activity_score, r.readme_summary "
         "FROM repos r "
         "JOIN repo_ai_dev_skills s ON s.repo_id = r.id "
-        "WHERE s.skill = :skill "
+        "WHERE s.skill = :skill AND r.is_private = false "
         "ORDER BY COALESCE(r.stargazers_count, r.parent_stars, 0) DESC"
     )
     repos_result = await db.execute(repos_stmt, {"skill": name})
@@ -154,6 +154,7 @@ class RebuildBody(BaseModel):
 class AssignBody(BaseModel):
     dimension: Optional[str] = None
     threshold: float = 0.65
+    limit: int = 500  # Max taxonomy values to process per call; use dimension filter for large runs
 
 
 @router.get("/dimensions", response_model=dict)
@@ -219,25 +220,92 @@ async def rebuild_taxonomy(
 
     upserted = 0
     for dim in dimensions:
-        raw_result = await db.execute(text(
-            "SELECT raw_value, COUNT(DISTINCT repo_id) AS repo_count "
+        # Single bulk INSERT…SELECT per dimension — turns O(n) round-trips into one query.
+        result = await db.execute(text(
+            "INSERT INTO taxonomy_values (dimension, name, repo_count, last_active_at) "
+            "SELECT :dim, raw_value, COUNT(DISTINCT repo_id), NOW() "
             "FROM repo_taxonomy "
             "WHERE dimension = :dim "
-            "GROUP BY raw_value"
+            "GROUP BY raw_value "
+            "ON CONFLICT (dimension, name) DO UPDATE "
+            "  SET repo_count = EXCLUDED.repo_count, "
+            "      last_active_at = NOW()"
         ), {"dim": dim})
-        for row in raw_result.fetchall():
-            raw_value = row.raw_value
-            repo_count = row.repo_count
-            await db.execute(text(
-                "INSERT INTO taxonomy_values (dimension, name, repo_count, last_active_at) "
-                "VALUES (:dim, :name, :repo_count, NOW()) "
-                "ON CONFLICT (dimension, name) DO UPDATE "
-                "SET repo_count = EXCLUDED.repo_count, last_active_at = NOW()"
-            ), {"dim": dim, "name": raw_value, "repo_count": repo_count})
-            upserted += 1
+        upserted += result.rowcount
 
     await db.commit()
     return {"status": "ok", "upserted": upserted, "dimensions": dimensions}
+
+
+@router.post("/admin/taxonomy/backfill", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
+async def backfill_taxonomy_from_repos(db: AsyncSession = Depends(get_db)) -> dict:
+    """
+    Backfill repo_taxonomy from JSONB columns on repos (skill_areas, industries,
+    use_cases, modalities, ai_trends, deployment_context).
+
+    Reads repos whose JSONB enrichment columns are non-null and non-empty, then
+    inserts rows into repo_taxonomy using ON CONFLICT DO NOTHING — safe to re-run.
+
+    Use this after running the AI enricher directly against the DB (which writes to
+    repos.skill_areas etc. but bypasses the ingest API and _upsert_repo_taxonomy).
+    """
+    dimension_columns = {
+        "skill_area": "skill_areas",
+        "industry": "industries",
+        "use_case": "use_cases",
+        "modality": "modalities",
+        "ai_trend": "ai_trends",
+        "deployment_context": "deployment_context",
+    }
+
+    total_inserted = 0
+    repos_processed = 0
+
+    result = await db.execute(text(
+        "SELECT id, skill_areas, industries, use_cases, modalities, ai_trends, deployment_context "
+        "FROM repos "
+        "WHERE skill_areas IS NOT NULL "
+        "   OR industries IS NOT NULL "
+        "   OR use_cases IS NOT NULL "
+        "   OR modalities IS NOT NULL "
+        "   OR ai_trends IS NOT NULL "
+        "   OR deployment_context IS NOT NULL"
+    ))
+    rows = result.fetchall()
+
+    for row in rows:
+        repo_id = str(row[0])
+        col_values = {
+            "skill_area":         row[1] or [],
+            "industry":           row[2] or [],
+            "use_case":           row[3] or [],
+            "modality":           row[4] or [],
+            "ai_trend":           row[5] or [],
+            "deployment_context": row[6] or [],
+        }
+        repo_had_data = False
+        for dimension, values in col_values.items():
+            if not isinstance(values, list):
+                continue
+            for raw_value in values:
+                if not raw_value or not isinstance(raw_value, str):
+                    continue
+                await db.execute(text(
+                    "INSERT INTO repo_taxonomy (repo_id, dimension, raw_value, assigned_by) "
+                    "VALUES (:repo_id, :dimension, :raw_value, 'enrichment') "
+                    "ON CONFLICT (repo_id, dimension, raw_value) DO NOTHING"
+                ), {"repo_id": repo_id, "dimension": dimension, "raw_value": raw_value.strip()})
+                total_inserted += 1
+                repo_had_data = True
+        if repo_had_data:
+            repos_processed += 1
+
+    await db.commit()
+    return {
+        "status": "ok",
+        "repos_processed": repos_processed,
+        "rows_inserted": total_inserted,
+    }
 
 
 @router.post("/admin/taxonomy/embed", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
@@ -256,20 +324,36 @@ async def embed_taxonomy(db: AsyncSession = Depends(get_db)) -> dict:
     if not rows:
         return {"status": "ok", "embedded": 0}
 
+    _EMBED_WARN_THRESHOLD = 5000
+    warning: Optional[str] = None
+    if len(rows) > _EMBED_WARN_THRESHOLD:
+        warning = (
+            f"{len(rows)} rows need embedding — this may exceed Cloud Run's timeout. "
+            "Consider filtering by dimension and running in batches."
+        )
+        logger.warning("embed_taxonomy: %s", warning)
+
     model = get_embedding_model()
     texts = [f"{row.dimension}: {row.name}" for row in rows]
     embeddings = model.encode(texts, normalize_embeddings=True)
 
+    _CHUNK_SIZE = 500
     embedded = 0
-    for row, emb in zip(rows, embeddings):
-        vec_str = "[" + ",".join(str(float(v)) for v in emb) + "]"
-        await db.execute(text(
-            "UPDATE taxonomy_values SET embedding_vec = :vec::vector WHERE id = :id"
-        ), {"vec": vec_str, "id": row.id})
-        embedded += 1
+    pairs = list(zip(rows, embeddings))
+    for chunk_start in range(0, len(pairs), _CHUNK_SIZE):
+        chunk = pairs[chunk_start : chunk_start + _CHUNK_SIZE]
+        for row, emb in chunk:
+            vec_str = "[" + ",".join(str(float(v)) for v in emb) + "]"
+            await db.execute(text(
+                "UPDATE taxonomy_values SET embedding_vec = CAST(:vec AS vector) WHERE id = :id"
+            ), {"vec": vec_str, "id": row.id})
+            embedded += 1
+        await db.commit()
 
-    await db.commit()
-    return {"status": "ok", "embedded": embedded}
+    response: dict = {"status": "ok", "embedded": embedded}
+    if warning:
+        response["warning"] = warning
+    return response
 
 
 @router.post("/admin/taxonomy/assign", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
@@ -281,18 +365,26 @@ async def assign_taxonomy(
     For each taxonomy_value with an embedding_vec, find repos whose own embedding
     is within the similarity threshold and upsert repo_taxonomy rows with
     assigned_by='similarity'.
+
+    Because this performs one vector query per taxonomy value, large catalogues will
+    exceed Cloud Run's timeout if run all at once.  Use ``dimension`` to restrict to
+    a single dimension and ``limit`` (default 500) to process in manageable batches.
     """
     threshold = body.threshold
+    limit = body.limit
 
     if body.dimension:
         tv_result = await db.execute(text(
             "SELECT id, dimension, name FROM taxonomy_values "
-            "WHERE embedding_vec IS NOT NULL AND dimension = :dim"
-        ), {"dim": body.dimension})
+            "WHERE embedding_vec IS NOT NULL AND dimension = :dim "
+            "LIMIT :limit"
+        ), {"dim": body.dimension, "limit": limit})
     else:
         tv_result = await db.execute(text(
-            "SELECT id, dimension, name FROM taxonomy_values WHERE embedding_vec IS NOT NULL"
-        ))
+            "SELECT id, dimension, name FROM taxonomy_values "
+            "WHERE embedding_vec IS NOT NULL "
+            "LIMIT :limit"
+        ), {"limit": limit})
     taxonomy_values = tv_result.fetchall()
 
     assigned = 0
@@ -324,7 +416,12 @@ async def assign_taxonomy(
             assigned += 1
 
     await db.commit()
-    return {"status": "ok", "assigned": assigned}
+    return {
+        "status": "ok",
+        "assigned": assigned,
+        "taxonomy_values_processed": len(taxonomy_values),
+        "limit": limit,
+    }
 
 
 @router.post(

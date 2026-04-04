@@ -16,6 +16,7 @@ from app.models.repo import (
     RepoCommit,
     RepoLanguage,
     RepoTag,
+    RepoTaxonomy,
 )
 from app.routers.library import _repo_to_summary
 from app.schemas.repo import RepoDetail, RepoSummary
@@ -75,6 +76,7 @@ async def list_repos(
 
     stmt = (
         select(Repo)
+        .where(Repo.is_private == False)  # noqa: E712 — SECURITY: never expose private repos
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -82,6 +84,7 @@ async def list_repos(
             selectinload(Repo.ai_dev_skills),
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
+            selectinload(Repo.taxonomy),
         )
     )
 
@@ -165,7 +168,7 @@ async def get_repo(name: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
 
     stmt = (
         select(Repo)
-        .where(Repo.name == name)
+        .where(Repo.name == name, Repo.is_private == False)  # noqa: E712
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -174,6 +177,7 @@ async def get_repo(name: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
             selectinload(Repo.commits),
+            selectinload(Repo.taxonomy),
         )
     )
     result = await db.execute(stmt)
@@ -191,7 +195,7 @@ async def get_repo_by_owner(owner: str, repo: str, db: AsyncSession = Depends(ge
     """Get a single repo by owner/name."""
     stmt = (
         select(Repo)
-        .where(Repo.owner == owner, Repo.name == repo)
+        .where(Repo.owner == owner, Repo.name == repo, Repo.is_private == False)  # noqa: E712
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -200,6 +204,7 @@ async def get_repo_by_owner(owner: str, repo: str, db: AsyncSession = Depends(ge
             selectinload(Repo.pm_skills),
             selectinload(Repo.languages),
             selectinload(Repo.commits),
+            selectinload(Repo.taxonomy),
         )
     )
     result = await db.execute(stmt)

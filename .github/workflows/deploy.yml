@@ -39,18 +39,71 @@ jobs:
           region: us-central1
           source: .
           flags: >-
-            --memory=1Gi
+            --memory=2Gi
             --cpu=1
-            --min-instances=1
-            --max-instances=10
+            --min-instances=0
+            --max-instances=3
             --concurrency=20
             --timeout=60
+            --clear-vpc-connector
+
+      - name: Prune old container images (keep latest 5)
+        if: success()
+        continue-on-error: true
+        run: |
+          # Delete untagged images first
+          gcloud container images list-tags gcr.io/perditio-platform/reporium-api \
+            --filter="NOT tags:*" --format="get(digest)" | \
+            while read digest; do
+              gcloud container images delete \
+                "gcr.io/perditio-platform/reporium-api@${digest}" \
+                --quiet --force-delete-tags 2>/dev/null || true
+            done
+          # Keep only the 5 most recent tagged images
+          gcloud container images list-tags gcr.io/perditio-platform/reporium-api \
+            --sort-by="~TIMESTAMP" --format="get(digest)" | tail -n +6 | \
+            while read digest; do
+              gcloud container images delete \
+                "gcr.io/perditio-platform/reporium-api@${digest}" \
+                --quiet --force-delete-tags 2>/dev/null || true
+            done
+
+      - name: Post-deploy taxonomy rebuild
+        if: success()
+        continue-on-error: true
+        env:
+          API_URL: https://reporium-api-573778300586.us-central1.run.app
+          INGEST_API_KEY: ${{ secrets.INGESTION_API_KEY }}
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+        run: |
+          # Wait for Cloud Run to be healthy
+          sleep 15
+          # Rebuild taxonomy_values from repo_taxonomy (fast batch INSERT — no timeout risk)
+          curl -sf -X POST "${API_URL}/admin/taxonomy/rebuild" \
+            -H "Authorization: Bearer ${INGEST_API_KEY}" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            && echo "Taxonomy rebuild triggered" || echo "Taxonomy rebuild skipped (secrets not configured)"
+          # Re-derive categories from current tags (idempotent, safe to repeat)
+          curl -sf -X POST "${API_URL}/admin/backfill/categories" \
+            -H "Authorization: Bearer ${INGEST_API_KEY}" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            && echo "Category backfill triggered" || echo "Category backfill skipped (secrets not configured)"
+          # Backfill embeddings for any repos missing them (needed for knowledge graph)
+          curl -sf -X POST "${API_URL}/admin/embeddings/backfill" \
+            -H "Authorization: Bearer ${INGEST_API_KEY}" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            --max-time 120 \
+            && echo "Embeddings backfill triggered" || echo "Embeddings backfill skipped"
 
       - name: Publish api.deployed event
         if: success()
         continue-on-error: true
         run: |
-          pip install -q google-cloud-pubsub google-cloud-firestore
+          pip install -q google-cloud-pubsub google-cloud-firestore git+https://github.com/perditioinc/reporium-events.git
           python - <<'EOF'
           import asyncio, os, sys
           sys.path.insert(0, '.')

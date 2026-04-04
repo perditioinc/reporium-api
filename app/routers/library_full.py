@@ -12,7 +12,7 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Response
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -60,6 +60,8 @@ KNOWN_ORG_CATEGORIES: dict = {
     'google':          ('big-tech',  'Google'),
     'google-deepmind': ('ai-lab',    'Google DeepMind'),
     'google-gemini':   ('big-tech',  'Google Gemini'),
+    'googlecloudplatform': ('big-tech', 'Google Cloud'),
+    'googleapis':      ('big-tech',  'Google APIs'),
     'microsoft':       ('big-tech',  'Microsoft'),
     'meta-llama':      ('big-tech',  'Meta'),
     'facebookresearch':('ai-lab',    'Meta Research'),
@@ -182,27 +184,12 @@ _LIFECYCLE_GROUPS_TTL = 300  # 5 minutes
 
 
 async def _get_lifecycle_groups(db: AsyncSession) -> dict:
-    """Return {skill_area_name: lifecycle_group} from the skill_areas table.
+    """Return {skill_area_name: lifecycle_group}.
 
-    Results are cached in memory for 5 minutes. Falls back to the compile-time
-    dict if the table is unavailable (e.g. migration not yet applied).
+    taxonomy_values does not carry a lifecycle_group column, so this function
+    returns the compile-time fallback dict which encodes the 28-skill taxonomy.
+    The async signature is kept so call sites do not need to change.
     """
-    now = time.time()
-    cached = _lifecycle_groups_cache.get("data")
-    if cached and _lifecycle_groups_cache.get("expires_at", 0) > now:
-        return cached
-
-    try:
-        result = await db.execute(text("SELECT name, lifecycle_group FROM skill_areas"))
-        rows = result.fetchall()
-        if rows:
-            mapping = {row.name: row.lifecycle_group for row in rows}
-            _lifecycle_groups_cache["data"] = mapping
-            _lifecycle_groups_cache["expires_at"] = now + _LIFECYCLE_GROUPS_TTL
-            return mapping
-    except Exception:
-        logger.warning("_get_lifecycle_groups: skill_areas table unavailable, using fallback", exc_info=True)
-
     return _LIFECYCLE_GROUPS_FALLBACK
 
 # Keep a set for O(1) membership checks in _build_ai_dev_skill_stats
@@ -287,6 +274,276 @@ _SKILL_TAG_TO_GROUP: dict = {
     'speech to text': 'Speech & Audio', 'music / audio ai': 'Speech & Audio',
 }
 
+
+# Maps taxonomy raw_values (as produced by the AI enricher) → canonical 28 skill names.
+# Used in _build_ai_dev_skill_stats when the raw_value doesn't exactly match a canonical name.
+# Keys are lowercase for case-insensitive lookup.
+_TAXONOMY_RAW_TO_CANONICAL: dict[str, str] = {
+    # Foundation Model Architecture
+    "transformer architecture": "Foundation Model Architecture",
+    "large language models": "Foundation Model Architecture",
+    "large language model training": "Foundation Model Architecture",
+    "large language model integration": "Foundation Model Architecture",
+    "neural network architecture design": "Foundation Model Architecture",
+    "attention mechanisms": "Foundation Model Architecture",
+    "convolutional neural networks": "Foundation Model Architecture",
+    "deep learning": "Foundation Model Architecture",
+    "machine learning fundamentals": "Foundation Model Architecture",
+    "recurrent neural networks": "Foundation Model Architecture",
+    "distributed training": "Foundation Model Architecture",
+    "pre-training": "Foundation Model Architecture",
+    "language model pretraining": "Foundation Model Architecture",
+    "gpt architecture": "Foundation Model Architecture",
+    "bert": "Foundation Model Architecture",
+    "llm architecture": "Foundation Model Architecture",
+    "model architecture": "Foundation Model Architecture",
+    "neural architecture search": "Foundation Model Architecture",
+    # Fine-tuning & Alignment
+    "model fine-tuning": "Fine-tuning & Alignment",
+    "transfer learning": "Fine-tuning & Alignment",
+    "reinforcement learning": "Fine-tuning & Alignment",
+    "policy gradient methods": "Fine-tuning & Alignment",
+    "deep learning model training": "Fine-tuning & Alignment",
+    "reinforcement learning from human feedback": "Fine-tuning & Alignment",
+    "rlhf": "Fine-tuning & Alignment",
+    "dpo": "Fine-tuning & Alignment",
+    "peft": "Fine-tuning & Alignment",
+    "lora": "Fine-tuning & Alignment",
+    "alignment": "Fine-tuning & Alignment",
+    "instruction tuning": "Fine-tuning & Alignment",
+    "supervised fine-tuning": "Fine-tuning & Alignment",
+    "knowledge distillation": "Fine-tuning & Alignment",
+    "model distillation": "Fine-tuning & Alignment",
+    # Data Engineering
+    "feature engineering": "Data Engineering",
+    "data pipeline engineering": "Data Engineering",
+    "data preprocessing": "Data Engineering",
+    "data pipeline": "Data Engineering",
+    "dataset curation": "Data Engineering",
+    "data collection": "Data Engineering",
+    "data annotation": "Data Engineering",
+    "etl pipeline": "Data Engineering",
+    "data labeling": "Data Engineering",
+    "web scraping": "Data Engineering",
+    # Synthetic Data
+    "synthetic data generation": "Synthetic Data",
+    "data synthesis": "Synthetic Data",
+    "data augmentation": "Synthetic Data",
+    "generative data": "Synthetic Data",
+    # Inference & Serving
+    "model deployment": "Inference & Serving",
+    "large language model deployment": "Inference & Serving",
+    "gpu computing": "Inference & Serving",
+    "cuda programming": "Inference & Serving",
+    "llm serving": "Inference & Serving",
+    "model serving": "Inference & Serving",
+    "api deployment": "Inference & Serving",
+    "serverless deployment": "Inference & Serving",
+    "distributed inference": "Inference & Serving",
+    "batch inference": "Inference & Serving",
+    # Model Compression
+    "model quantization": "Model Compression",
+    "model optimization": "Model Compression",
+    "neural network pruning": "Model Compression",
+    "model pruning": "Model Compression",
+    "weight compression": "Model Compression",
+    "int8 quantization": "Model Compression",
+    # Edge AI
+    "edge computing": "Edge AI",
+    "on-device ai": "Edge AI",
+    "embedded ai": "Edge AI",
+    "iot ai": "Edge AI",
+    "mobile ai": "Edge AI",
+    "tinyml": "Edge AI",
+    # Agents & Orchestration
+    "agent orchestration": "Agents & Orchestration",
+    "multi-agent systems": "Agents & Orchestration",
+    "ai agent development": "Agents & Orchestration",
+    "agentic ai systems": "Agents & Orchestration",
+    "agentic ai development": "Agents & Orchestration",
+    "ai agent architecture": "Agents & Orchestration",
+    "ai agent orchestration": "Agents & Orchestration",
+    "agent communication protocols": "Agents & Orchestration",
+    "workflow orchestration": "Agents & Orchestration",
+    "conversational ai": "Agents & Orchestration",
+    "task planning": "Agents & Orchestration",
+    "autonomous agents": "Agents & Orchestration",
+    "multi-agent coordination": "Agents & Orchestration",
+    "agent framework": "Agents & Orchestration",
+    "llm agents": "Agents & Orchestration",
+    "ai pipeline": "Agents & Orchestration",
+    "chatbot development": "Agents & Orchestration",
+    # RAG & Retrieval
+    "retrieval-augmented generation": "RAG & Retrieval",
+    "semantic search": "RAG & Retrieval",
+    "information retrieval": "RAG & Retrieval",
+    "vector database management": "RAG & Retrieval",
+    "document processing": "RAG & Retrieval",
+    "vector search": "RAG & Retrieval",
+    "embedding search": "RAG & Retrieval",
+    "hybrid search": "RAG & Retrieval",
+    "reranking": "RAG & Retrieval",
+    "dense retrieval": "RAG & Retrieval",
+    "chunking strategies": "RAG & Retrieval",
+    "document indexing": "RAG & Retrieval",
+    # Context Engineering
+    "memory management": "Context Engineering",
+    "long context processing": "Context Engineering",
+    "context window management": "Context Engineering",
+    "agent memory": "Context Engineering",
+    "episodic memory": "Context Engineering",
+    "working memory": "Context Engineering",
+    # Tool Use
+    "function calling": "Tool Use",
+    "tool integration": "Tool Use",
+    "external tool use": "Tool Use",
+    "api tool use": "Tool Use",
+    "mcp (model context protocol)": "Tool Use",
+    "model context protocol": "Tool Use",
+    # Structured Output
+    "json schema generation": "Structured Output",
+    "schema-guided generation": "Structured Output",
+    "output parsing": "Structured Output",
+    "structured generation": "Structured Output",
+    # Knowledge Graphs
+    "knowledge graph": "Knowledge Graphs",
+    "knowledge graph construction": "Knowledge Graphs",
+    "graph databases": "Knowledge Graphs",
+    "ontology engineering": "Knowledge Graphs",
+    "ontology design": "Knowledge Graphs",
+    "semantic web": "Knowledge Graphs",
+    "graph rag": "Knowledge Graphs",
+    "graphrag": "Knowledge Graphs",
+    # Evaluation
+    "model evaluation": "Evaluation",
+    "ai benchmarking": "Evaluation",
+    "benchmarking": "Evaluation",
+    "llm evaluation": "Evaluation",
+    "performance evaluation": "Evaluation",
+    "evals": "Evaluation",
+    "red teaming": "Evaluation",
+    "adversarial testing": "Evaluation",
+    "human evaluation": "Evaluation",
+    # Security & Guardrails
+    "ai safety": "Security & Guardrails",
+    "prompt injection": "Security & Guardrails",
+    "adversarial robustness": "Security & Guardrails",
+    "ai red teaming": "Security & Guardrails",
+    "content filtering": "Security & Guardrails",
+    "pii detection": "Security & Guardrails",
+    "bias detection": "Security & Guardrails",
+    "watermarking": "Security & Guardrails",
+    "privacy-preserving ai": "Security & Guardrails",
+    # Observability
+    "ai monitoring": "Observability",
+    "model monitoring": "Observability",
+    "llm observability": "Observability",
+    "logging": "Observability",
+    "tracing": "Observability",
+    "cost tracking": "Observability",
+    "latency monitoring": "Observability",
+    # MLOps
+    "hyperparameter optimization": "MLOps",
+    "machine learning pipeline": "MLOps",
+    "data version control": "MLOps",
+    "experiment tracking": "MLOps",
+    "model registry": "MLOps",
+    "ci/cd for ml": "MLOps",
+    "model versioning": "MLOps",
+    "feature store": "MLOps",
+    "workflow management": "MLOps",
+    # AI Governance
+    "ai regulation": "AI Governance",
+    "responsible ai": "AI Governance",
+    "ai ethics": "AI Governance",
+    "model transparency": "AI Governance",
+    "ai compliance": "AI Governance",
+    "explainability": "AI Governance",
+    "fairness": "AI Governance",
+    # Computer Vision
+    "object detection": "Computer Vision",
+    "image processing": "Computer Vision",
+    "sensor fusion": "Computer Vision",
+    "optical character recognition": "Computer Vision",
+    "optical character recognition (ocr)": "Computer Vision",
+    "video processing": "Computer Vision",
+    "slam (simultaneous localization and mapping)": "Computer Vision",
+    "slam": "Computer Vision",
+    "image segmentation": "Computer Vision",
+    "image classification": "Computer Vision",
+    "pose estimation": "Computer Vision",
+    "3d reconstruction": "Computer Vision",
+    "depth estimation": "Computer Vision",
+    "face recognition": "Computer Vision",
+    "visual question answering": "Computer Vision",
+    # Speech & Audio
+    "audio signal processing": "Speech & Audio",
+    "text-to-speech synthesis": "Speech & Audio",
+    "speech recognition": "Speech & Audio",
+    "speech processing": "Speech & Audio",
+    "speech to text": "Speech & Audio",
+    "automatic speech recognition": "Speech & Audio",
+    "voice synthesis": "Speech & Audio",
+    "audio generation": "Speech & Audio",
+    "music generation": "Speech & Audio",
+    # Generative Media
+    "diffusion models": "Generative Media",
+    "generative ai": "Generative Media",
+    "image generation": "Generative Media",
+    "video generation": "Generative Media",
+    "text-to-image generation": "Generative Media",
+    "3d generation": "Generative Media",
+    "creative ai": "Generative Media",
+    "content generation": "Generative Media",
+    # NLP
+    "natural language processing": "NLP",
+    "text classification": "NLP",
+    "named entity recognition": "NLP",
+    "information extraction": "NLP",
+    "machine translation": "NLP",
+    "text summarization": "NLP",
+    "sentiment analysis": "NLP",
+    "question answering": "NLP",
+    "relation extraction": "NLP",
+    "text mining": "NLP",
+    # Multimodal
+    "multimodal ai": "Multimodal",
+    "multimodal learning": "Multimodal",
+    "vision-language models": "Multimodal",
+    "visual language model": "Multimodal",
+    "audio-visual learning": "Multimodal",
+    # Coding Assistants
+    "code generation": "Coding Assistants",
+    "code intelligence": "Coding Assistants",
+    "software development ai": "Coding Assistants",
+    "ai-assisted coding": "Coding Assistants",
+    "automated code review": "Coding Assistants",
+    "code completion": "Coding Assistants",
+    "ai code generation": "Coding Assistants",
+    "developer tools": "Coding Assistants",
+    # Robotics
+    "slam (simultaneous localization and mapping)": "Robotics",
+    "robot learning": "Robotics",
+    "control systems": "Robotics",
+    "robot perception": "Robotics",
+    "autonomous systems": "Robotics",
+    "motion planning": "Robotics",
+    # AI for Science
+    "time series analysis": "AI for Science",
+    "time series forecasting": "AI for Science",
+    "graph neural networks": "AI for Science",
+    "bioinformatics": "AI for Science",
+    "drug discovery": "AI for Science",
+    "climate ai": "AI for Science",
+    "materials science ai": "AI for Science",
+    "computational biology": "AI for Science",
+    "scientific computing": "AI for Science",
+    # Recommendation Systems
+    "collaborative filtering": "Recommendation Systems",
+    "matrix factorization": "Recommendation Systems",
+    "content-based filtering": "Recommendation Systems",
+    "personalization": "Recommendation Systems",
+}
 
 router = APIRouter(tags=["Library"])
 
@@ -417,7 +674,8 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
                          ai_skills: list, tags: list, pm_skills: list,
                          builders: list = None, industries: list = None,
                          lifecycle_groups: dict = None,
-                         taxonomy: list = None) -> dict:
+                         taxonomy: list = None,
+                         commits: list = None) -> dict:
     """Transform a DB repo row + junction data into the frontend EnrichedRepo shape."""
     forked_from = repo.get("forked_from")
     owner = repo.get("owner", "perditioinc")
@@ -448,17 +706,48 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
             "url": f"https://github.com/{forked_from}",
         }
 
-    # Fork sync status
+    # Fork sync status — behind_by/ahead_by are often stale (0) in the DB,
+    # so cross-check with dates: if upstream pushed after our last sync,
+    # the fork is behind regardless of what the commit counts say.
     fork_sync = None
     if repo.get("is_fork"):
         behind = repo.get("behind_by") or 0
         ahead = repo.get("ahead_by") or 0
-        if behind == 0 and ahead == 0:
+
+        # Date-based override: compare your_last_push_at vs upstream_last_push_at
+        your_push = repo.get("your_last_push_at")
+        upstream_push = repo.get("upstream_last_push_at")
+        date_says_behind = False
+        if your_push and upstream_push:
+            import datetime as _dt_mod
+            def _to_naive_utc(v):
+                """Convert to naive UTC datetime for safe comparison."""
+                if isinstance(v, _dt_mod.datetime):
+                    if v.tzinfo is not None:
+                        return v.replace(tzinfo=None)
+                    return v
+                if isinstance(v, str):
+                    try:
+                        dt = _dt_mod.datetime.fromisoformat(v.replace("Z", "+00:00"))
+                        return dt.replace(tzinfo=None)
+                    except Exception:
+                        return None
+                return None
+            yp = _to_naive_utc(your_push)
+            up = _to_naive_utc(upstream_push)
+            if yp and up and up > yp:
+                date_says_behind = True
+
+        if behind == 0 and ahead == 0 and not date_says_behind:
             state = "up-to-date"
-        elif behind > 0 and ahead > 0:
-            state = "diverged"
-        elif behind > 0:
-            state = "behind"
+        elif date_says_behind or behind > 0:
+            if behind > 0 and ahead > 0:
+                state = "diverged"
+            else:
+                state = "behind"
+                # If commit count is 0 but dates say behind, estimate ~1
+                if behind == 0:
+                    behind = 1
         elif ahead > 0:
             state = "ahead"
         else:
@@ -473,6 +762,33 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
     c7 = repo.get("commits_last_7_days") or 0
     c30 = repo.get("commits_last_30_days") or 0
     c90 = repo.get("commits_last_90_days") or 0
+
+    # Bin commit history from repo_commits table into time buckets
+    all_commit_data = commits or []
+    now = datetime.now(tz=None)  # naive UTC-ish for comparison
+    commits_7d = []
+    commits_30d = []
+    commits_90d = []
+    for cmt in all_commit_data:
+        date_str = cmt.get("date", "")
+        if not date_str:
+            continue
+        try:
+            cdate = datetime.fromisoformat(date_str.replace("Z", "+00:00")).replace(tzinfo=None)
+        except (ValueError, TypeError):
+            continue
+        days_ago = (now - cdate).days
+        if days_ago <= 7:
+            commits_7d.append(cmt)
+        if days_ago <= 30:
+            commits_30d.append(cmt)
+        if days_ago <= 90:
+            commits_90d.append(cmt)
+
+    # Use actual commit counts when DB scalars are 0 but we have commit rows
+    effective_c7 = max(c7, len(commits_7d))
+    effective_c30 = max(c30, len(commits_30d))
+    effective_c90 = max(c90, len(commits_90d))
 
     all_cats = list(dict.fromkeys(_normalize_category(c["category_name"]) for c in categories))
     primary_cat = all_cats[0] if all_cats else "Dev Tools & Automation"
@@ -492,35 +808,39 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         "topics": [t["tag"] for t in tags],
         "enrichedTags": list(dict.fromkeys([s["skill"] for s in ai_skills] + [t["tag"] for t in tags])),
         "stars": repo.get("parent_stars") if repo.get("is_fork") else (repo.get("stargazers_count") or 0),
-        "forks": repo.get("parent_forks") if repo.get("is_fork") else 0,
+        "forks": repo.get("parent_forks") if repo.get("is_fork") else (repo.get("fork_count") or 0),
         "openIssuesCount": repo.get("open_issues_count") or 0,
         "lastUpdated": _iso(repo.get("github_updated_at") or repo.get("updated_at")),
         "url": repo.get("github_url") or f"https://github.com/{owner}/{name}",
         "isArchived": repo.get("parent_is_archived") or False,
         "readmeSummary": repo.get("readme_summary"),
         "parentStats": parent_stats,
-        "recentCommits": [],
-        "createdAt": _iso(repo.get("upstream_created_at") if repo.get("forked_from") else repo.get("github_created_at")),
+        "recentCommits": all_commit_data[:10],
+        "createdAt": _iso(
+            repo.get("upstream_created_at")
+            if repo.get("forked_from")
+            else (repo.get("ingested_at") or repo.get("github_updated_at"))
+        ),
         "forkedAt": _iso(repo.get("forked_at")),
         "yourLastPushAt": _iso(repo.get("your_last_push_at")),
         "upstreamLastPushAt": _iso(repo.get("upstream_last_push_at")),
         "upstreamCreatedAt": _iso(repo.get("upstream_created_at")),
         "forkSync": fork_sync,
-        "weeklyCommitCount": c7,
+        "weeklyCommitCount": effective_c7,
         "languageBreakdown": lang_breakdown,
         "languagePercentages": lang_percentages,
-        "commitsLast7Days": [],
-        "commitsLast30Days": [],
-        "commitsLast90Days": [],
-        "totalCommitsFetched": 0,
+        "commitsLast7Days": commits_7d,
+        "commitsLast30Days": commits_30d,
+        "commitsLast90Days": commits_90d,
+        "totalCommitsFetched": len(all_commit_data),
         "primaryCategory": primary_cat,
         "allCategories": all_cats,
         "commitStats": {
-            "today": 0,
-            "last7Days": c7,
-            "last30Days": c30,
-            "last90Days": c90,
-            "recentCommits": [],
+            "today": len([c for c in commits_7d if c.get("date") and (now - datetime.fromisoformat(c["date"].replace("Z", "+00:00")).replace(tzinfo=None)).days == 0]),
+            "last7Days": effective_c7,
+            "last30Days": effective_c30,
+            "last90Days": effective_c90,
+            "recentCommits": all_commit_data[:5],
         },
         "latestRelease": None,
         "aiDevSkills": [
@@ -541,6 +861,10 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         ],
         "problemSolved": repo.get("problem_solved"),
         "licenseSpdx": repo.get("license_spdx"),
+        "qualitySignals": repo.get("quality_signals"),
+        "securitySignals": repo.get("security_signals"),
+        "dbCategory": repo.get("primary_category"),
+        "dbSecondaryCategories": repo.get("secondary_categories") or [],
         "builders": [
             {
                 "login": b["login"],
@@ -740,11 +1064,15 @@ def _build_ai_dev_skill_stats(repos: list, lifecycle_groups: dict = None) -> lis
     for r in repos:
         matched: set = set()
 
-        # Primary: direct match against canonical 28 skill names
+        # Primary: direct match against canonical 28 skill names.
+        # Also normalises taxonomy raw_values via _TAXONOMY_RAW_TO_CANONICAL so that
+        # values like "Retrieval-Augmented Generation" map to "RAG & Retrieval".
         # aiDevSkills entries are dicts {"skill": ..., "lifecycleGroup": ...}
         for entry in r.get("aiDevSkills", []):
-            skill = entry["skill"] if isinstance(entry, dict) else entry
-            if skill in _AI_DEV_SKILL_SET and skill not in matched:
+            raw = entry["skill"] if isinstance(entry, dict) else entry
+            # Exact canonical match first, then normalised lookup
+            skill = raw if raw in _AI_DEV_SKILL_SET else _TAXONOMY_RAW_TO_CANONICAL.get(raw.lower())
+            if skill and skill in _AI_DEV_SKILL_SET and skill not in matched:
                 matched.add(skill)
                 skill_repo_names[skill].add(r["name"])
                 skill_top_repos[skill].append((r.get("stars", 0), r["name"]))
@@ -837,13 +1165,14 @@ async def _fetch_page_repos(
 
     # Main repos query — paginated
     result = await db.execute(text("""
-        SELECT id, name, owner, full_name, description, is_fork, forked_from, primary_language,
+        SELECT id, name, owner, (owner || '/' || name) AS full_name, description, is_fork, forked_from, primary_language,
                github_url, fork_sync_state, behind_by, ahead_by,
                github_created_at, upstream_created_at, forked_at, your_last_push_at, upstream_last_push_at,
                parent_stars, parent_forks, parent_is_archived, stargazers_count, open_issues_count,
                commits_last_7_days, commits_last_30_days, commits_last_90_days,
                readme_summary, activity_score, ingested_at, updated_at, github_updated_at,
-               problem_solved
+               problem_solved, license_spdx, quality_signals, has_tests, has_ci, security_signals,
+               primary_category, secondary_categories
         FROM repos
         WHERE is_private = false
         ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
@@ -872,15 +1201,19 @@ async def _fetch_page_repos(
         r = await db.execute(text(q), {"ids": page_ids})
         return r.fetchall()
 
-    lang_rows, cat_rows, skill_rows, tag_rows, pm_rows, builder_rows, taxonomy_rows = (
+    lang_rows, cat_rows, skill_rows, tag_rows, pm_rows, builder_rows, taxonomy_rows, commit_rows = (
         await asyncio.gather(
             _fetch_junction("SELECT repo_id, language, bytes, percentage FROM repo_languages WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, category_name, is_primary FROM repo_categories WHERE repo_id::text = ANY(:ids)"),
-            _fetch_junction("SELECT repo_id, skill FROM repo_ai_dev_skills WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction("SELECT repo_id, raw_value AS skill FROM repo_taxonomy WHERE dimension = 'skill_area' AND repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, tag FROM repo_tags WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, skill FROM repo_pm_skills WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, login, display_name, org_category, is_known_org FROM repo_builders WHERE repo_id::text = ANY(:ids)"),
             _fetch_junction("SELECT repo_id, dimension, raw_value, similarity_score, assigned_by FROM repo_taxonomy WHERE repo_id::text = ANY(:ids)"),
+            _fetch_junction(
+                "SELECT repo_id, sha, message, author, committed_at, url FROM repo_commits "
+                "WHERE repo_id::text = ANY(:ids) ORDER BY committed_at DESC"
+            ),
         )
     )
 
@@ -920,6 +1253,16 @@ async def _fetch_page_repos(
             "assigned_by": r.assigned_by,
         })
 
+    all_commits: dict = defaultdict(list)
+    for r in commit_rows:
+        all_commits[str(r.repo_id)].append({
+            "sha": r.sha,
+            "message": r.message,
+            "author": r.author,
+            "date": r.committed_at.isoformat() if r.committed_at else "",
+            "url": r.url or "",
+        })
+
     lifecycle_groups = await _get_lifecycle_groups(db)
 
     enriched = []
@@ -936,6 +1279,7 @@ async def _fetch_page_repos(
             industries=[],
             lifecycle_groups=lifecycle_groups,
             taxonomy=all_taxonomy.get(rid, []),
+            commits=all_commits.get(rid, []),
         )))
 
     return enriched, total
@@ -979,6 +1323,7 @@ async def _fetch_aggregates(db: AsyncSession) -> dict:
 
 @router.get("/library/full", response_model=dict)
 async def library_full(
+    response: Response,
     db: AsyncSession = Depends(get_db),
     page: int = Query(default=1, ge=1, description="1-based page number"),
     page_size: int = Query(default=200, ge=1, le=500, description="Repos per page (max 500)"),
@@ -996,6 +1341,8 @@ async def library_full(
     cache_key = f"page_{page}_{page_size}"
     redis_key = f"library:page:{page}:size:{page_size}"
     now = time.time()
+
+    response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=3600"
 
     # 1. Check Redis cache first (shared, survives restarts)
     redis_hit = await redis_cache.get(redis_key)
