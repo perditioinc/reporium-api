@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -178,6 +179,26 @@ _ROUTE_RECENTLY_ADDED = re.compile(
 )
 _ROUTE_QUALITY_FILTER = re.compile(
     r"(?:which|what|show|list)\s+repos?\s+(?:have|with)\s+(?:tests?|ci|testing|continuous integration)(?:\s+and\s+(?:tests?|ci|testing|continuous integration))?",
+    re.IGNORECASE,
+)
+_ROUTE_TECH_SEARCH = re.compile(
+    r"(?:what|which|show|list|find)\s+repos?\s+(?:use|using|with|for|support(?:ing)?|built\s+with)\s+(pytorch|tensorflow|jax|cuda|onnx|huggingface|transformers|langchain|llamaindex|openai|anthropic|fastapi|flask|django|nextjs|react|vue|streamlit|gradio)",
+    re.IGNORECASE,
+)
+_ROUTE_SKILL_SEARCH = re.compile(
+    r"(?:tools?|repos?|projects?)\s+(?:for|about|related to|helping with|that help with)\s+(prompt.?engineer(?:ing)?|model.?eval(?:uation)?|fine.?tun(?:e|ing)|data.?prepar?ation|deploy(?:ment)?|monitor(?:ing)?|inference|train(?:ing)?)",
+    re.IGNORECASE,
+)
+_ROUTE_SIMILARITY = re.compile(
+    r"(?:repos?|projects?|tools?)\s+(?:similar|like|comparable|alternatives?)\s+(?:to\s+)?(\S+)",
+    re.IGNORECASE,
+)
+_ROUTE_DEPENDENCY = re.compile(
+    r"what\s+(?:depends on|uses|extends|forks?|is built on|requires)\s+(\S+)",
+    re.IGNORECASE,
+)
+_ROUTE_TEMPORAL = re.compile(
+    r"(?:what(?:'s| is| was)?|show|list)\s+(?:new|changed|updated|added|modified)\s+(?:this|last|past)\s+(week|month|day)",
     re.IGNORECASE,
 )
 
@@ -680,6 +701,168 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             }
             return result
 
+    # --- Technology/framework search ---
+    m = _ROUTE_TECH_SEARCH.search(q)
+    if m:
+        tech = m.group(1).strip().lower()
+        result = await db.execute(text("""
+            SELECT DISTINCT r.name, r.owner,
+                   COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
+                   r.primary_category, r.description
+            FROM repos r
+            LEFT JOIN repo_tags rt ON rt.repo_id = r.id
+            WHERE r.is_private = false
+              AND (
+                r.description ILIKE :term
+                OR r.readme_summary ILIKE :term
+                OR LOWER(rt.tag) = :exact_term
+              )
+            ORDER BY COALESCE(r.parent_stars, r.stargazers_count, 0) DESC
+            LIMIT 10
+        """), {"term": f"%{tech}%", "exact_term": tech})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            return {
+                "answer": f"Repos using or supporting **{tech}** ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "tech_search",
+            }
+        return {
+            "answer": f"No repos found matching the technology \"{tech}\".",
+            "sources": [],
+            "route": "tech_search",
+        }
+
+    # --- Skill-based search ---
+    m = _ROUTE_SKILL_SEARCH.search(q)
+    if m:
+        skill = m.group(1).strip().lower()
+        result = await db.execute(text("""
+            SELECT r.name, r.owner,
+                   COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
+                   r.primary_category, r.description
+            FROM repo_ai_dev_skills sk
+            JOIN repos r ON r.id = sk.repo_id
+            WHERE r.is_private = false
+              AND sk.skill_name ILIKE :skill
+            ORDER BY COALESCE(r.parent_stars, r.stargazers_count, 0) DESC
+            LIMIT 10
+        """), {"skill": f"%{skill}%"})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            return {
+                "answer": f"Repos for **{skill}** ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "skill_search",
+            }
+        return {
+            "answer": f"No repos found for the skill \"{skill}\".",
+            "sources": [],
+            "route": "skill_search",
+        }
+
+    # --- Similarity redirect ---
+    m = _ROUTE_SIMILARITY.search(q)
+    if m:
+        repo_name = m.group(1).strip().lower()
+        # Look up the repo and its embedding, then do pgvector similarity search
+        result = await db.execute(text("""
+            SELECT r.id, r.name, r.owner, e.embedding_vec
+            FROM repos r
+            JOIN repo_embeddings e ON e.repo_id = r.id
+            WHERE r.is_private = false
+              AND LOWER(r.name) = :name
+              AND e.embedding_vec IS NOT NULL
+            LIMIT 1
+        """), {"name": repo_name})
+        source_row = result.first()
+        if source_row:
+            result = await db.execute(text("""
+                SELECT r.name, r.owner,
+                       COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
+                       r.primary_category, r.description,
+                       1 - (e.embedding_vec <=> (
+                           SELECT e2.embedding_vec FROM repo_embeddings e2 WHERE e2.repo_id = CAST(:source_id AS uuid)
+                       )) AS similarity
+                FROM repo_embeddings e
+                JOIN repos r ON r.id = e.repo_id
+                WHERE r.is_private = false
+                  AND e.embedding_vec IS NOT NULL
+                  AND r.id != CAST(:source_id AS uuid)
+                ORDER BY e.embedding_vec <=> (
+                    SELECT e2.embedding_vec FROM repo_embeddings e2 WHERE e2.repo_id = CAST(:source_id AS uuid)
+                )
+                LIMIT 5
+            """), {"source_id": str(source_row.id)})
+            rows = result.fetchall()
+            if rows:
+                parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars, similarity: {r.similarity:.2f}" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+                return {
+                    "answer": f"Repos similar to **{source_row.owner}/{source_row.name}** ({len(rows)} shown):\n\n" + "\n".join(parts),
+                    "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": round(float(r.similarity), 4), "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                    "route": "similarity_redirect",
+                }
+        # Fall through to LLM if repo not found
+
+    # --- Dependency/relationship queries ---
+    m = _ROUTE_DEPENDENCY.search(q)
+    if m:
+        target_name = m.group(1).strip().lower()
+        result = await db.execute(text("""
+            SELECT r_src.name, r_src.owner,
+                   COALESCE(r_src.parent_stars, r_src.stargazers_count, 0) as stars,
+                   r_src.primary_category, r_src.description,
+                   e.edge_type
+            FROM repo_edges e
+            JOIN repos r_tgt ON r_tgt.id = e.target_repo_id
+            JOIN repos r_src ON r_src.id = e.source_repo_id
+            WHERE r_src.is_private = false
+              AND LOWER(r_tgt.name) = :target_name
+              AND e.edge_type IN ('DEPENDS_ON', 'EXTENDS', 'FORK_OF')
+            ORDER BY COALESCE(r_src.parent_stars, r_src.stargazers_count, 0) DESC
+            LIMIT 10
+        """), {"target_name": target_name})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** ({r.edge_type.lower().replace('_', ' ')}) — {r.stars:,} stars" for r in rows]
+            return {
+                "answer": f"Repos that depend on, extend, or fork **{target_name}** ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "dependency_search",
+            }
+
+    # --- Temporal queries ---
+    m = _ROUTE_TEMPORAL.search(q)
+    if m:
+        period = m.group(1).strip().lower()
+        interval_map = {"day": 1, "week": 7, "month": 30}
+        days = interval_map.get(period, 7)
+        result = await db.execute(text("""
+            SELECT name, owner,
+                   COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   primary_category, description, ingested_at
+            FROM repos
+            WHERE is_private = false
+              AND ingested_at > NOW() - MAKE_INTERVAL(days => :days)
+            ORDER BY ingested_at DESC
+            LIMIT 10
+        """), {"days": days})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            return {
+                "answer": f"Repos added or updated in the last {period} ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "temporal_search",
+            }
+        return {
+            "answer": f"No repos were added or updated in the last {period}.",
+            "sources": [],
+            "route": "temporal_search",
+        }
+
     return None  # No smart route matched — fall through to LLM
 
 
@@ -747,9 +930,11 @@ def _vec_to_pg(arr) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in arr.tolist()) + "]"
 
 
-# claude-sonnet-4-20250514 pricing (per 1M tokens)
-_COST_PER_M_INPUT = 3.00
-_COST_PER_M_OUTPUT = 15.00
+# Per-model pricing (per 1M tokens) — keeps cost estimation accurate across tiers
+_MODEL_PRICING = {
+    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    "claude-haiku-4-5-20250414": {"input": 0.80, "output": 4.00},
+}
 
 
 def _hash_ip(ip: str | None) -> str | None:
@@ -759,10 +944,9 @@ def _hash_ip(ip: str | None) -> str | None:
     return hashlib.sha256(ip.encode()).hexdigest()
 
 
-def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
-    return (prompt_tokens / 1_000_000 * _COST_PER_M_INPUT) + (
-        completion_tokens / 1_000_000 * _COST_PER_M_OUTPUT
-    )
+def _estimate_cost(input_tokens: int, output_tokens: int, model: str = "claude-sonnet-4-20250514") -> float:
+    pricing = _MODEL_PRICING.get(model, _MODEL_PRICING["claude-sonnet-4-20250514"])
+    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
 
 
 async def _log_query(
@@ -821,7 +1005,7 @@ async def _log_query(
                     "sources": json.dumps(sources),
                     "tokens_prompt": tokens_prompt,
                     "tokens_completion": tokens_completion,
-                    "cost_usd": _estimate_cost(tokens_prompt, tokens_completion),
+                    "cost_usd": _estimate_cost(tokens_prompt, tokens_completion, model=model),
                     "hashed_ip": hashed_ip,
                     "latency_ms": latency_ms,
                     "model": model,
@@ -873,41 +1057,39 @@ async def _load_session_turns(session_id: str, db: AsyncSession) -> list[dict]:
     return turns
 
 
-async def _save_session_turn(
-    session_id: str, question: str, answer: str, db: AsyncSession
-) -> None:
-    """Append one turn to ask_sessions. Fire-and-forget — never raises."""
-    # KAN-124 (#2): ask_sessions stores user questions and answers in plaintext.
-    # Like query_log, it needs a periodic TTL cleanup job, e.g.:
-    #   DELETE FROM ask_sessions WHERE created_at < NOW() - INTERVAL '90 days';
+async def _save_session_turn(session_id: str, question: str, answer: str) -> None:
+    """Save a conversation turn. Uses its own DB session for reliability."""
+    # DATA RETENTION: ask_sessions stores user questions in plaintext.
+    # TODO: Add periodic cleanup: DELETE FROM ask_sessions WHERE created_at < NOW() - INTERVAL '90 days'
     try:
-        # Determine the next turn number for this session
-        result = await db.execute(
-            text("""
-                SELECT COALESCE(MAX(turn_number), -1)
-                FROM ask_sessions
-                WHERE session_id = CAST(:sid AS uuid)
-            """),
-            {"sid": session_id},
-        )
-        max_turn = result.scalar()
-        next_turn = (max_turn + 1) if max_turn is not None else 0
+        async with async_session_factory() as db:
+            # Determine the next turn number for this session
+            result = await db.execute(
+                text("""
+                    SELECT COALESCE(MAX(turn_number), -1)
+                    FROM ask_sessions
+                    WHERE session_id = CAST(:sid AS uuid)
+                """),
+                {"sid": session_id},
+            )
+            max_turn = result.scalar()
+            next_turn = (max_turn + 1) if max_turn is not None else 0
 
-        await db.execute(
-            text("""
-                INSERT INTO ask_sessions (session_id, turn_number, question, answer)
-                VALUES (CAST(:sid AS uuid), :turn, :question, :answer)
-            """),
-            {
-                "sid": session_id,
-                "turn": next_turn,
-                "question": question,
-                "answer": answer[:4000],  # cap at 4k chars to keep rows lean
-            },
-        )
-        await db.commit()
+            await db.execute(
+                text("""
+                    INSERT INTO ask_sessions (session_id, turn_number, question, answer)
+                    VALUES (CAST(:sid AS uuid), :turn, :question, :answer)
+                """),
+                {
+                    "sid": session_id,
+                    "turn": next_turn,
+                    "question": question,
+                    "answer": answer[:4000],  # cap at 4k chars to keep rows lean
+                },
+            )
+            await db.commit()
     except Exception:
-        logger.exception("_save_session_turn failed (non-fatal) for session %s", session_id)
+        logger.exception("Failed to save session turn")
 
 
 class QueryRequest(BaseModel):
@@ -1245,114 +1427,101 @@ async def _portfolio_insights(db: AsyncSession) -> PortfolioInsightsResponse:
     return response
 
 
-async def _run_query(
-    req: QueryRequest, db: AsyncSession, client_ip: str | None = None, session_id: str | None = None
-) -> QueryResponse:
-    """
-    Core intelligence query logic — shared by /query (authed) and /ask (public).
+@dataclass
+class QueryContext:
+    """Prepared context for an LLM query."""
+    sources: list[dict]
+    context_text: str
+    model: str
+    session_history: list[dict]
+    cache_result: dict | None  # Non-None if cache hit (smart route, redis, or semantic)
+    query_embedding: list[float] | None
+    route_label: str | None
+    embedding_candidates: int = 0
+    redis_cache_key: str = ""
 
-    1. Embed the question with sentence-transformers
-    2. Find top-K most similar repos via cosine similarity
-    3. Send repo context + question to Claude for answer generation
-    4. Return answer with source repos and relevance scores
-    """
-    _started_at = time.monotonic()
 
+async def _prepare_query(
+    question: str, session_id: str | None, top_k: int, db: AsyncSession
+) -> QueryContext:
+    """
+    Shared query preparation for both streaming and non-streaming endpoints.
+    Handles: smart routing -> Redis cache -> embedding -> semantic cache ->
+    pgvector search -> context building -> graph edges -> session history.
+    """
     # 0. Smart routing — answer simple questions with SQL, no LLM call needed
-    smart_result = await _try_smart_route(req.question, db)
+    smart_result = await _try_smart_route(question, db)
     if smart_result is not None:
         logger.info("ask: smart-routed via %s (no LLM)", smart_result["route"])
-        sources = _coerce_cached_sources(smart_result["sources"])
-        response = QueryResponse(
-            answer=smart_result["answer"],
-            sources=sources,
-            question=req.question,
-            model=f"smart-route:{smart_result['route']}",
-            answered_at=datetime.now(timezone.utc).isoformat(),
-            embedding_candidates=0,
-            cache_hit=False,
-            tokens_used={"input": 0, "output": 0, "total": 0},
-        )
-        asyncio.create_task(_log_query(
-            question=req.question,
-            answer=smart_result["answer"],
+        return QueryContext(
             sources=smart_result["sources"],
-            tokens_prompt=0,
-            tokens_completion=0,
-            hashed_ip=_hash_ip(client_ip),
-            latency_ms=int((time.monotonic() - _started_at) * 1000),
+            context_text="",
             model=f"smart-route:{smart_result['route']}",
-            cache_hit=False,
-        ))
-        return response
+            session_history=[],
+            cache_result={
+                "answer": smart_result["answer"],
+                "sources": smart_result["sources"],
+                "tokens_used": {"input": 0, "output": 0, "total": 0},
+                "cache_source": None,
+                "cache_hit": False,
+                "route": smart_result["route"],
+            },
+            query_embedding=None,
+            route_label=smart_result["route"],
+        )
 
     # 0b. Redis fast-path cache — check before embedding/pgvector (much faster)
-    redis_cache_key = f"llm_response:{hashlib.md5(req.question.lower().strip().encode()).hexdigest()}"
+    redis_cache_key = f"llm_response:{hashlib.md5(question.lower().strip().encode()).hexdigest()}"
     redis_cached = await cache.get(redis_cache_key)
     if redis_cached is not None:
         logger.info("ask: Redis cache hit for question")
-        cached_sources = _coerce_cached_sources(redis_cached.get("sources", []))
-        response = QueryResponse(
-            answer=redis_cached["answer"],
-            sources=cached_sources,
-            question=req.question,
-            model=redis_cached.get("model", "redis-cache"),
-            answered_at=datetime.now(timezone.utc).isoformat(),
-            embedding_candidates=0,
-            cache_hit=True,
-            cache_source="redis",
-            tokens_used=redis_cached.get("tokens_used", {"input": 0, "output": 0, "total": 0}),
-        )
-        asyncio.create_task(_log_query(
-            question=req.question,
-            answer=redis_cached["answer"],
+        return QueryContext(
             sources=redis_cached.get("sources", []),
-            tokens_prompt=0,
-            tokens_completion=0,
-            hashed_ip=_hash_ip(client_ip),
-            latency_ms=int((time.monotonic() - _started_at) * 1000),
+            context_text="",
             model=redis_cached.get("model", "redis-cache"),
-            cache_hit=True,
-        ))
-        return response
+            session_history=[],
+            cache_result={
+                "answer": redis_cached["answer"],
+                "sources": redis_cached.get("sources", []),
+                "tokens_used": redis_cached.get("tokens_used", {"input": 0, "output": 0, "total": 0}),
+                "cache_source": "redis",
+                "cache_hit": True,
+            },
+            query_embedding=None,
+            route_label=None,
+            redis_cache_key=redis_cache_key,
+        )
 
-    model = get_embedding_model()
+    embed_model = get_embedding_model()
 
     # 1. Embed the question — model is pre-warmed at startup so this is fast
-    query_embedding = model.encode(req.question)
+    query_embedding = embed_model.encode(question)
 
+    # 2. Semantic cache check
     cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
     if cached is not None:
         cached_answer, cached_sources, cached_model = cached
-        response = QueryResponse(
-            answer=cached_answer,
-            sources=cached_sources,
-            question=req.question,
+        return QueryContext(
+            sources=[s.model_dump() for s in cached_sources],
+            context_text="",
             model=cached_model or "semantic-cache",
-            answered_at=datetime.now(timezone.utc).isoformat(),
-            embedding_candidates=0,
-            cache_hit=True,
-            cache_source="semantic",
-            tokens_used={"input": 0, "output": 0, "total": 0},
+            session_history=[],
+            cache_result={
+                "answer": cached_answer,
+                "sources": [s.model_dump() for s in cached_sources],
+                "tokens_used": {"input": 0, "output": 0, "total": 0},
+                "cache_source": "semantic",
+                "cache_hit": True,
+            },
+            query_embedding=query_embedding.tolist() if hasattr(query_embedding, 'tolist') else list(query_embedding),
+            route_label=None,
+            redis_cache_key=redis_cache_key,
         )
-        asyncio.create_task(_log_query(
-            question=req.question,
-            answer=cached_answer,
-            sources=[source.model_dump() for source in cached_sources],
-            tokens_prompt=0, tokens_completion=0,
-            hashed_ip=_hash_ip(client_ip),
-            latency_ms=int((time.monotonic() - _started_at) * 1000),
-            model=cached_model or "semantic-cache",
-            question_embedding=query_embedding, cache_hit=True,
-        ))
-        return response
 
     vec_str = _vec_to_pg(query_embedding)
 
-    # 2. pgvector HNSW index scan — O(log N) instead of O(N) Python loop
-    # Fetch top_k + 10 candidates so we have a buffer for knowledge graph context.
-    # 1 - (embedding_vec <=> query) converts cosine distance to cosine similarity.
-    fetch_k = req.top_k + 10
+    # 3. pgvector HNSW index scan — O(log N) instead of O(N) Python loop
+    fetch_k = top_k + 10
     result = await db.execute(
         text("""
             SELECT r.id, r.name, r.owner, r.forked_from, r.description,
@@ -1371,9 +1540,10 @@ async def _run_query(
     )
     rows = result.fetchall()
 
-    # Adaptive top_k: stop including repos when similarity drops below 0.35
+    # Adaptive top_k: stop including repos when similarity drops below threshold
+    # 0.45 ≈ moderately related; below this, repos add noise more than value
     if rows and len(rows) > 3:
-        filtered = [r for r in rows if r.similarity >= 0.35]
+        filtered = [r for r in rows if r.similarity >= 0.45]
         if len(filtered) >= 3:  # keep at least 3
             rows = filtered
 
@@ -1397,14 +1567,11 @@ async def _run_query(
             "similarity": float(row.similarity),
         })
 
-    # Sort descending by similarity (pgvector already returns results this way in
-    # production, but an explicit sort makes the output order deterministic).
+    # Sort descending by similarity
     scored.sort(key=lambda r: r["similarity"], reverse=True)
-    top_for_answer = scored[:req.top_k]
+    top_for_answer = scored[:top_k]
 
-    # 3. Build context for Claude
-    # Repo content fields are wrapped in XML-style delimiters so injected
-    # instructions inside descriptions/summaries cannot escape their data role.
+    # 4. Build context for Claude
     context_parts = []
     for i, repo in enumerate(top_for_answer, 1):
         upstream = repo["forked_from"] or f"{repo['owner']}/{repo['name']}"
@@ -1443,7 +1610,7 @@ async def _run_query(
 
     context = "\n\n".join(context_parts)
 
-    # Also check knowledge graph edges for related repos (with per-repo Redis caching)
+    # 5. Knowledge graph edges for related repos (with per-repo Redis caching)
     if top_for_answer:
         top_ids = [str(r["id"]) for r in top_for_answer[:5]]
 
@@ -1477,7 +1644,6 @@ async def _run_query(
                 {"ids": uncached_ids},
             )
             edge_rows = edge_result.fetchall()
-            # Group edges by repo ID for caching
             for er in edge_rows:
                 edge_data = {
                     "edge_type": er.edge_type,
@@ -1487,7 +1653,6 @@ async def _run_query(
                 for rid in uncached_ids:
                     if rid == er.source_id or rid == er.target_id:
                         new_edges.setdefault(rid, []).append(edge_data)
-            # Cache each repo's edges individually
             for rid in uncached_ids:
                 edges_for_rid = new_edges.get(rid, [])
                 await cache.set(f"graph_edges:{rid}", edges_for_rid, ttl=3600)
@@ -1501,7 +1666,6 @@ async def _run_query(
                 all_edge_data.extend(new_edges[rid])
 
         if all_edge_data:
-            # Deduplicate edges by (source, target, type)
             seen_edges: set[tuple[str, str, str]] = set()
             unique_edges: list[dict] = []
             for e in all_edge_data:
@@ -1510,7 +1674,6 @@ async def _run_query(
                     seen_edges.add(key)
                     unique_edges.append(e)
 
-            # Format as natural language related repos context
             edge_context = "\n\nRelated repos: "
             edge_parts = []
             for e in unique_edges:
@@ -1519,18 +1682,87 @@ async def _run_query(
             edge_context += ", ".join(edge_parts)
             context += edge_context
 
-    # 4. Call Claude
-    # Load session history if a session_id was provided (KAN-158)
+    # 6. Load session history (KAN-158)
     history_messages: list[dict] = []
-    effective_session_id = session_id or req.session_id
-    if effective_session_id:
-        history_messages = await _load_session_turns(effective_session_id, db)
+    if session_id:
+        history_messages = await _load_session_turns(session_id, db)
         if history_messages:
             logger.info(
                 "ask: loaded %d history turns for session %s",
                 len(history_messages) // 2,
-                effective_session_id,
+                session_id,
             )
+
+    # Select model based on question complexity
+    selected_model = _select_model(question, len(top_for_answer))
+    logger.info("Model selected: %s for question length %d, %d repos", selected_model, len(question), len(top_for_answer))
+
+    return QueryContext(
+        sources=[{
+            "name": r["name"],
+            "owner": r["owner"],
+            "forked_from": r["forked_from"],
+            "description": r["description"],
+            "stars": r["stars"],
+            "similarity": r["similarity"],
+            "problem_solved": r["problem_solved"],
+            "integration_tags": r.get("integration_tags") or [],
+        } for r in top_for_answer],
+        context_text=context,
+        model=selected_model,
+        session_history=history_messages,
+        cache_result=None,
+        query_embedding=query_embedding.tolist() if hasattr(query_embedding, 'tolist') else list(query_embedding),
+        route_label=None,
+        embedding_candidates=len(scored),
+        redis_cache_key=redis_cache_key,
+    )
+
+
+async def _run_query(
+    req: QueryRequest, db: AsyncSession, client_ip: str | None = None, session_id: str | None = None
+) -> QueryResponse:
+    """
+    Core intelligence query logic — shared by /query (authed) and /ask (public).
+
+    1. Prepare query context (smart routing, caching, embedding, search)
+    2. If cache hit, return immediately
+    3. Otherwise call Claude for answer generation
+    4. Return answer with source repos and relevance scores
+    """
+    _started_at = time.monotonic()
+    effective_session_id = session_id or req.session_id
+
+    qctx = await _prepare_query(req.question, effective_session_id, req.top_k, db)
+
+    # Handle cache hits (smart route, Redis, or semantic)
+    if qctx.cache_result is not None:
+        cached = qctx.cache_result
+        sources = _coerce_cached_sources(cached["sources"])
+        response = QueryResponse(
+            answer=cached["answer"],
+            sources=sources,
+            question=req.question,
+            model=qctx.model,
+            answered_at=datetime.now(timezone.utc).isoformat(),
+            embedding_candidates=0,
+            cache_hit=cached.get("cache_hit", False),
+            cache_source=cached.get("cache_source"),
+            tokens_used=cached.get("tokens_used", {"input": 0, "output": 0, "total": 0}),
+        )
+        asyncio.create_task(_log_query(
+            question=req.question,
+            answer=cached["answer"],
+            sources=cached["sources"] if isinstance(cached["sources"], list) else [],
+            tokens_prompt=0,
+            tokens_completion=0,
+            hashed_ip=_hash_ip(client_ip),
+            latency_ms=int((time.monotonic() - _started_at) * 1000),
+            model=qctx.model,
+            question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
+            cache_hit=cached.get("cache_hit", False),
+        ))
+        return response
 
     # Daily cost cap check — reject before calling Claude if budget exhausted
     if not check_budget():
@@ -1539,30 +1771,22 @@ async def _run_query(
             detail="Service temporarily unavailable — daily usage limit reached. Try again tomorrow.",
         )
 
-    # Select model based on question complexity
-    selected_model = _select_model(req.question, len(top_for_answer))
-    logger.info("Model selected: %s for question length %d, %d repos", selected_model, len(req.question), len(top_for_answer))
-
     api_key = _get_anthropic_key()
     client = anthropic.Anthropic(api_key=api_key)
 
     user_prompt = (
         f"Answer the following question using only the repo data provided below.\n\n"
         f"<question>{req.question}</question>\n\n"
-        f"<repos>\n{context}\n</repos>\n\n"
+        f"<repos>\n{qctx.context_text}\n</repos>\n\n"
         f"Cite repos by their upstream name. If the context is insufficient, say so."
     )
 
-    # The Anthropic SDK's synchronous .create() blocks the calling thread.
-    # Run it in the default thread-pool executor so the async event loop stays
-    # responsive, and wrap with asyncio.wait_for to enforce a hard 30s ceiling
-    # well inside Cloud Run's 60s request timeout.
     loop = asyncio.get_event_loop()
 
     def _call_claude():
         with anthropic_breaker:
             return client.messages.create(
-                model=selected_model,
+                model=qctx.model,
                 max_tokens=1024,
                 system=[{
                     "type": "text",
@@ -1570,7 +1794,7 @@ async def _run_query(
                     "cache_control": {"type": "ephemeral"},
                 }],
                 messages=[
-                    *history_messages,
+                    *qctx.session_history,
                     {"role": "user", "content": user_prompt},
                 ],
             )
@@ -1600,12 +1824,12 @@ async def _run_query(
     }
 
     # Record estimated cost (Haiku ~$0.0005/call, Sonnet ~$0.01/call)
-    _est_cost = 0.0005 if "haiku" in selected_model else 0.01
-    record_cost(_est_cost, model=selected_model)
+    _est_cost = 0.0005 if "haiku" in qctx.model else 0.01
+    record_cost(_est_cost, model=qctx.model)
 
-    # 5. Build response
+    # Build response
     sources = []
-    for repo in top_for_answer:
+    for repo in qctx.sources:
         sources.append(SourceRepo(
             name=repo["name"],
             owner=repo["owner"],
@@ -1621,19 +1845,19 @@ async def _run_query(
         answer=answer,
         sources=sources,
         question=req.question,
-        model=selected_model,
+        model=qctx.model,
         answered_at=datetime.now(timezone.utc).isoformat(),
-        embedding_candidates=len(scored),
+        embedding_candidates=qctx.embedding_candidates,
         cache_hit=False,
         tokens_used=tokens_used,
     )
 
     # Cache the full LLM response in Redis for fast-path on repeat questions (30 min TTL)
-    asyncio.create_task(cache.set(redis_cache_key, {
+    asyncio.create_task(cache.set(qctx.redis_cache_key, {
         "answer": answer,
         "sources": [source.model_dump() for source in sources],
         "tokens_used": tokens_used,
-        "model": selected_model,
+        "model": qctx.model,
     }, ttl=1800))
 
     # Fire-and-forget — log after response is built, never blocks the caller
@@ -1645,13 +1869,13 @@ async def _run_query(
         tokens_completion=message.usage.output_tokens,
         hashed_ip=_hash_ip(client_ip),
         latency_ms=int((time.monotonic() - _started_at) * 1000),
-        model=selected_model,
-        question_embedding=query_embedding,
+        model=qctx.model,
+        question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
     ))
 
     # Save this turn to the session store so future turns can reference it (KAN-158)
     if effective_session_id:
-        asyncio.create_task(_save_session_turn(effective_session_id, req.question, answer, db))
+        asyncio.create_task(_save_session_turn(effective_session_id, req.question, answer))
 
     return response
 
@@ -1715,266 +1939,83 @@ async def intelligence_ask_stream(
         _started_at = time.monotonic()
 
         try:
-            # 0. Smart routing — answer simple questions with SQL, skip LLM entirely
-            smart_result = await _try_smart_route(req.question, db)
-            if smart_result is not None:
-                logger.info("ask/stream: smart-routed via %s (no LLM)", smart_result["route"])
-                sources = _coerce_cached_sources(smart_result["sources"])
-                yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in sources], 'cache_hit': False, 'route': smart_result['route']})}\n\n"
-                # Stream answer word-by-word
-                words = smart_result["answer"].split(" ")
-                for i, word in enumerate(words):
-                    chunk = word + (" " if i < len(words) - 1 else "")
-                    yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
-                    await asyncio.sleep(0)
-                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'route': smart_result['route']})}\n\n"
-                asyncio.create_task(_log_query(
-                    question=req.question, answer=smart_result["answer"],
-                    sources=smart_result["sources"],
-                    tokens_prompt=0, tokens_completion=0,
-                    hashed_ip=_hash_ip(client_ip),
-                    latency_ms=int((time.monotonic() - _started_at) * 1000),
-                    model=f"smart-route:{smart_result['route']}",
-                    cache_hit=False,
-                ))
-                return
+            qctx = await _prepare_query(req.question, req.session_id, req.top_k, db)
 
-            # 0b. Redis fast-path cache
-            stream_redis_key = f"llm_response:{hashlib.md5(req.question.lower().strip().encode()).hexdigest()}"
-            stream_redis_cached = await cache.get(stream_redis_key)
-            if stream_redis_cached is not None:
-                logger.info("ask/stream: Redis cache hit")
-                redis_sources = _coerce_cached_sources(stream_redis_cached.get("sources", []))
-                yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in redis_sources], 'cache_hit': True, 'cache_source': 'redis'})}\n\n"
-                words = stream_redis_cached["answer"].split(" ")
-                for i, word in enumerate(words):
-                    chunk = word + (" " if i < len(words) - 1 else "")
-                    yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
-                    await asyncio.sleep(0)
-                yield f"data: {json.dumps({'type': 'done', 'tokens': stream_redis_cached.get('tokens_used', {'input': 0, 'output': 0, 'total': 0}), 'cache_hit': True, 'cache_source': 'redis', 'model': stream_redis_cached.get('model', 'redis-cache')})}\n\n"
-                asyncio.create_task(_log_query(
-                    question=req.question, answer=stream_redis_cached["answer"],
-                    sources=stream_redis_cached.get("sources", []),
-                    tokens_prompt=0, tokens_completion=0,
-                    hashed_ip=_hash_ip(client_ip),
-                    latency_ms=int((time.monotonic() - _started_at) * 1000),
-                    model=stream_redis_cached.get("model", "redis-cache"),
-                    cache_hit=True,
-                ))
-                return
+            # Handle cache hits (smart route, Redis, or semantic)
+            if qctx.cache_result is not None:
+                cached = qctx.cache_result
+                sources = _coerce_cached_sources(cached["sources"])
+                cache_source = cached.get("cache_source")
+                route = cached.get("route")
 
-            model = get_embedding_model()
+                # Emit sources event
+                sources_event = {
+                    'type': 'sources',
+                    'sources': [s.model_dump() for s in sources],
+                    'cache_hit': cached.get("cache_hit", False),
+                }
+                if cache_source:
+                    sources_event['cache_source'] = cache_source
+                if route:
+                    sources_event['route'] = route
+                yield f"data: {json.dumps(sources_event)}\n\n"
 
-            # 1. Embed the question
-            query_embedding = model.encode(req.question)
-
-            # 2. Check semantic cache — if hit, stream the cached answer token-by-token
-            cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
-            if cached is not None:
-                cached_answer, cached_sources, cached_model = cached
-                # Emit sources
-                yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in cached_sources], 'cache_hit': True, 'cache_source': 'semantic'})}\n\n"
                 # Stream answer word-by-word (simulate streaming for cache hits)
-                words = cached_answer.split(" ")
+                words = cached["answer"].split(" ")
                 for i, word in enumerate(words):
                     chunk = word + (" " if i < len(words) - 1 else "")
                     yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
-                    await asyncio.sleep(0)  # yield control
-                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'cache_hit': True, 'cache_source': 'semantic'})}\n\n"
+                    await asyncio.sleep(0)
+
+                # Done event
+                done_event = {
+                    'type': 'done',
+                    'tokens': cached.get("tokens_used", {'input': 0, 'output': 0, 'total': 0}),
+                }
+                if cached.get("cache_hit"):
+                    done_event['cache_hit'] = True
+                    done_event['cache_source'] = cache_source
+                if route:
+                    done_event['route'] = route
+                if not route:
+                    done_event['model'] = qctx.model
+                yield f"data: {json.dumps(done_event)}\n\n"
+
                 asyncio.create_task(_log_query(
-                    question=req.question, answer=cached_answer,
-                    sources=[s.model_dump() for s in cached_sources],
+                    question=req.question, answer=cached["answer"],
+                    sources=cached["sources"] if isinstance(cached["sources"], list) else [],
                     tokens_prompt=0, tokens_completion=0,
                     hashed_ip=_hash_ip(client_ip),
                     latency_ms=int((time.monotonic() - _started_at) * 1000),
-                    model=cached_model or "semantic-cache",
-                    question_embedding=query_embedding, cache_hit=True,
+                    model=qctx.model,
+                    question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
+                    cache_hit=cached.get("cache_hit", False),
                 ))
                 return
 
-            vec_str = _vec_to_pg(query_embedding)
-
-            # 3. Semantic search
-            fetch_k = req.top_k + 10
-            result = await db.execute(
-                text("""
-                    SELECT r.id, r.name, r.owner, r.forked_from, r.description,
-                           r.parent_stars, r.readme_summary, r.problem_solved,
-                           r.primary_category, r.language, r.license_spdx,
-                           r.activity_score, r.has_tests, r.has_ci,
-                           1 - (e.embedding_vec <=> CAST(:vec AS vector)) AS similarity
-                    FROM repo_embeddings e
-                    JOIN repos r ON r.id = e.repo_id
-                    WHERE r.is_private = false
-                      AND e.embedding_vec IS NOT NULL
-                    ORDER BY e.embedding_vec <=> CAST(:vec AS vector)
-                    LIMIT :fetch_k
-                """),
-                {"vec": vec_str, "fetch_k": fetch_k},
-            )
-            rows = result.fetchall()
-
-            # Adaptive top_k: stop including repos when similarity drops below 0.35
-            if rows and len(rows) > 3:
-                filtered = [r for r in rows if r.similarity >= 0.35]
-                if len(filtered) >= 3:
-                    rows = filtered
-
-            scored = []
-            for row in rows:
-                scored.append({
-                    "id": row.id, "name": row.name, "owner": row.owner,
-                    "forked_from": row.forked_from, "description": row.description,
-                    "stars": row.parent_stars, "readme_summary": row.readme_summary,
-                    "problem_solved": row.problem_solved,
-                    "primary_category": row.primary_category, "language": row.language,
-                    "license_spdx": row.license_spdx, "activity_score": row.activity_score,
-                    "has_tests": row.has_tests, "has_ci": row.has_ci,
-                    "similarity": row.similarity,
-                })
-            top_for_answer = scored[:req.top_k]
-
-            # 4. Emit sources before generation starts
+            # Emit sources before generation starts
             source_list = [
                 SourceRepo(
                     name=r["name"], owner=r["owner"], forked_from=r["forked_from"],
                     description=r["description"], stars=r["stars"],
                     relevance_score=round(r["similarity"], 4),
                     problem_solved=r["problem_solved"],
-                    integration_tags=[],
+                    integration_tags=r.get("integration_tags") or [],
                 )
-                for r in top_for_answer
+                for r in qctx.sources
             ]
             yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in source_list], 'cache_hit': False})}\n\n"
 
-            # 5. Build context
-            context_parts = []
-            for i, repo in enumerate(top_for_answer, 1):
-                upstream = repo["forked_from"] or f"{repo['owner']}/{repo['name']}"
-                desc = _truncate(repo["description"])
-                readme = _truncate(repo["readme_summary"])
-                problem = _truncate(repo["problem_solved"])
-                parts = [f"name: {upstream}", f"stars: {repo['stars'] or 0}"]
-                if desc:
-                    parts.append(f"description: {desc}")
-                if readme:
-                    parts.append(f"summary: {readme}")
-                if problem:
-                    parts.append(f"problem_solved: {problem}")
-                category = repo.get("primary_category")
-                language = repo.get("language")
-                license_spdx = repo.get("license_spdx")
-                activity = repo.get("activity_score")
-                has_tests = repo.get("has_tests")
-                has_ci = repo.get("has_ci")
-                if category:
-                    parts.append(f"category: {category}")
-                if language:
-                    parts.append(f"language: {language}")
-                if license_spdx:
-                    parts.append(f"license: {license_spdx}")
-                if activity is not None:
-                    parts.append(f"activity_score: {activity}")
-                if has_tests is not None:
-                    parts.append(f"has_tests: {has_tests}")
-                if has_ci is not None:
-                    parts.append(f"has_ci: {has_ci}")
-                parts.append(f"relevance_score: {repo['similarity']:.4f}")
-                context_parts.append(
-                    f"<repo index=\"{i}\">\n" + "\n".join(parts) + "\n</repo>"
-                )
-            context = "\n\n".join(context_parts)
-
-            # Knowledge graph edges (with per-repo Redis caching)
-            if top_for_answer:
-                top_ids = [str(r["id"]) for r in top_for_answer[:5]]
-
-                # Check Redis cache for each repo's edges
-                stream_cached_edges = {}
-                stream_uncached_ids = []
-                for rid in top_ids:
-                    cached_edge_data = await cache.get(f"graph_edges:{rid}")
-                    if cached_edge_data is not None:
-                        stream_cached_edges[rid] = cached_edge_data
-                    else:
-                        stream_uncached_ids.append(rid)
-
-                # Query DB only for uncached repo edges
-                stream_new_edges: dict[str, list[dict]] = {}
-                if stream_uncached_ids:
-                    edge_result = await db.execute(
-                        text("""
-                            SELECT e.edge_type,
-                                   e.source_repo_id::text as source_id,
-                                   e.target_repo_id::text as target_id,
-                                   r1.forked_from as source_upstream, r1.name as source_name,
-                                   r2.forked_from as target_upstream, r2.name as target_name
-                            FROM repo_edges e
-                            JOIN repos r1 ON r1.id = e.source_repo_id
-                            JOIN repos r2 ON r2.id = e.target_repo_id
-                            WHERE e.source_repo_id::text = ANY(:ids) OR e.target_repo_id::text = ANY(:ids)
-                            LIMIT 20
-                        """),
-                        {"ids": stream_uncached_ids},
-                    )
-                    edge_rows = edge_result.fetchall()
-                    for er in edge_rows:
-                        edge_data = {
-                            "edge_type": er.edge_type,
-                            "source_name": er.source_upstream or er.source_name,
-                            "target_name": er.target_upstream or er.target_name,
-                        }
-                        for rid in stream_uncached_ids:
-                            if rid == er.source_id or rid == er.target_id:
-                                stream_new_edges.setdefault(rid, []).append(edge_data)
-                    # Cache each repo's edges individually
-                    for rid in stream_uncached_ids:
-                        edges_for_rid = stream_new_edges.get(rid, [])
-                        await cache.set(f"graph_edges:{rid}", edges_for_rid, ttl=3600)
-
-                # Merge and format as natural language context
-                all_stream_edges: list[dict] = []
-                for rid in top_ids:
-                    if rid in stream_cached_edges:
-                        all_stream_edges.extend(stream_cached_edges[rid])
-                    elif rid in stream_new_edges:
-                        all_stream_edges.extend(stream_new_edges[rid])
-
-                if all_stream_edges:
-                    seen_edges: set[tuple[str, str, str]] = set()
-                    unique_edges: list[dict] = []
-                    for e in all_stream_edges:
-                        key = (e["source_name"], e["target_name"], e["edge_type"])
-                        if key not in seen_edges:
-                            seen_edges.add(key)
-                            unique_edges.append(e)
-
-                    edge_context = "\n\nRelated repos: "
-                    edge_parts = []
-                    for e in unique_edges:
-                        label = _EDGE_TYPE_LABELS.get(e["edge_type"], e["edge_type"].lower())
-                        edge_parts.append(f"{e['target_name']} ({label})")
-                    edge_context += ", ".join(edge_parts)
-                    context += edge_context
-
-            # 5b. Load session history for multi-turn (KAN-158)
-            stream_history: list[dict] = []
-            if req.session_id:
-                stream_history = await _load_session_turns(req.session_id, db)
-
-            # 6. Daily cost cap check — reject before calling Claude if budget exhausted
+            # Daily cost cap check — reject before calling Claude if budget exhausted
             if not check_budget():
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Service temporarily unavailable — daily usage limit reached. Try again tomorrow.'})}\n\n"
                 return
-
-            stream_selected_model = _select_model(req.question, len(top_for_answer))
-            logger.info("Model selected: %s for question length %d, %d repos", stream_selected_model, len(req.question), len(top_for_answer))
 
             api_key = _get_anthropic_key()
             anthropic_client = anthropic.Anthropic(api_key=api_key)
 
             user_prompt = (
-                f"Here are the most relevant repos from the library:\n\n{context}\n\n"
+                f"Here are the most relevant repos from the library:\n\n{qctx.context_text}\n\n"
                 f"Question: {req.question}\n\n"
                 "Please answer the question based on the repos above."
             )
@@ -1986,7 +2027,7 @@ async def intelligence_ask_stream(
             def _stream_claude():
                 with anthropic_breaker:
                     return anthropic_client.messages.stream(
-                        model=stream_selected_model,
+                        model=qctx.model,
                         max_tokens=1024,
                         system=[{
                             "type": "text",
@@ -1994,7 +2035,7 @@ async def intelligence_ask_stream(
                             "cache_control": {"type": "ephemeral"},
                         }],
                         messages=[
-                            *stream_history,
+                            *qctx.session_history,
                             {"role": "user", "content": user_prompt},
                         ],
                     )
@@ -2036,16 +2077,16 @@ async def intelligence_ask_stream(
                     input_tokens = payload.usage.input_tokens
                     output_tokens = payload.usage.output_tokens
                     tokens_info = {'input': input_tokens, 'output': output_tokens, 'total': input_tokens + output_tokens}
-                    yield f"data: {json.dumps({'type': 'done', 'tokens': tokens_info, 'model': stream_selected_model})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done', 'tokens': tokens_info, 'model': qctx.model})}\n\n"
                     # Record estimated cost
-                    _stream_est_cost = 0.0005 if "haiku" in stream_selected_model else 0.01
-                    record_cost(_stream_est_cost, model=stream_selected_model)
+                    _stream_est_cost = 0.0005 if "haiku" in qctx.model else 0.01
+                    record_cost(_stream_est_cost, model=qctx.model)
                     # Cache the full LLM response in Redis (30 min TTL)
-                    asyncio.create_task(cache.set(stream_redis_key, {
+                    asyncio.create_task(cache.set(qctx.redis_cache_key, {
                         "answer": full_answer,
                         "sources": [s.model_dump() for s in source_list],
                         "tokens_used": tokens_info,
-                        "model": stream_selected_model,
+                        "model": qctx.model,
                     }, ttl=1800))
                     # Fire-and-forget log
                     asyncio.create_task(_log_query(
@@ -2054,12 +2095,12 @@ async def intelligence_ask_stream(
                         tokens_prompt=input_tokens, tokens_completion=output_tokens,
                         hashed_ip=_hash_ip(client_ip),
                         latency_ms=int((time.monotonic() - _started_at) * 1000),
-                        model=stream_selected_model,
-                        question_embedding=query_embedding,
+                        model=qctx.model,
+                        question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
                     ))
                     # Save turn to session for multi-turn continuity (KAN-158)
                     if req.session_id and full_answer:
-                        asyncio.create_task(_save_session_turn(req.session_id, req.question, full_answer, db))
+                        asyncio.create_task(_save_session_turn(req.session_id, req.question, full_answer))
                     break
                 elif event_type == "error":
                     yield f"data: {json.dumps({'type': 'error', 'message': payload})}\n\n"
