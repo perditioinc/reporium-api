@@ -181,6 +181,26 @@ _ROUTE_QUALITY_FILTER = re.compile(
     r"(?:which|what|show|list)\s+repos?\s+(?:have|with)\s+(?:tests?|ci|testing|continuous integration)(?:\s+and\s+(?:tests?|ci|testing|continuous integration))?",
     re.IGNORECASE,
 )
+_ROUTE_TECH_SEARCH = re.compile(
+    r"(?:what|which|show|list|find)\s+repos?\s+(?:use|using|with|for|support(?:ing)?|built\s+with)\s+(pytorch|tensorflow|jax|cuda|onnx|huggingface|transformers|langchain|llamaindex|openai|anthropic|fastapi|flask|django|nextjs|react|vue|streamlit|gradio)",
+    re.IGNORECASE,
+)
+_ROUTE_SKILL_SEARCH = re.compile(
+    r"(?:tools?|repos?|projects?)\s+(?:for|about|related to|helping with|that help with)\s+(prompt.?engineer(?:ing)?|model.?eval(?:uation)?|fine.?tun(?:e|ing)|data.?prepar?ation|deploy(?:ment)?|monitor(?:ing)?|inference|train(?:ing)?)",
+    re.IGNORECASE,
+)
+_ROUTE_SIMILARITY = re.compile(
+    r"(?:repos?|projects?|tools?)\s+(?:similar|like|comparable|alternatives?)\s+(?:to\s+)?(\S+)",
+    re.IGNORECASE,
+)
+_ROUTE_DEPENDENCY = re.compile(
+    r"what\s+(?:depends on|uses|extends|forks?|is built on|requires)\s+(\S+)",
+    re.IGNORECASE,
+)
+_ROUTE_TEMPORAL = re.compile(
+    r"(?:what(?:'s| is| was)?|show|list)\s+(?:new|changed|updated|added|modified)\s+(?:this|last|past)\s+(week|month|day)",
+    re.IGNORECASE,
+)
 
 
 async def _try_smart_route(question: str, db: AsyncSession) -> dict | None:
@@ -681,6 +701,168 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             }
             return result
 
+    # --- Technology/framework search ---
+    m = _ROUTE_TECH_SEARCH.search(q)
+    if m:
+        tech = m.group(1).strip().lower()
+        result = await db.execute(text("""
+            SELECT DISTINCT r.name, r.owner,
+                   COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
+                   r.primary_category, r.description
+            FROM repos r
+            LEFT JOIN repo_tags rt ON rt.repo_id = r.id
+            WHERE r.is_private = false
+              AND (
+                r.description ILIKE :term
+                OR r.readme_summary ILIKE :term
+                OR LOWER(rt.tag) = :exact_term
+              )
+            ORDER BY COALESCE(r.parent_stars, r.stargazers_count, 0) DESC
+            LIMIT 10
+        """), {"term": f"%{tech}%", "exact_term": tech})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            return {
+                "answer": f"Repos using or supporting **{tech}** ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "tech_search",
+            }
+        return {
+            "answer": f"No repos found matching the technology \"{tech}\".",
+            "sources": [],
+            "route": "tech_search",
+        }
+
+    # --- Skill-based search ---
+    m = _ROUTE_SKILL_SEARCH.search(q)
+    if m:
+        skill = m.group(1).strip().lower()
+        result = await db.execute(text("""
+            SELECT r.name, r.owner,
+                   COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
+                   r.primary_category, r.description
+            FROM repo_ai_dev_skills sk
+            JOIN repos r ON r.id = sk.repo_id
+            WHERE r.is_private = false
+              AND sk.skill_name ILIKE :skill
+            ORDER BY COALESCE(r.parent_stars, r.stargazers_count, 0) DESC
+            LIMIT 10
+        """), {"skill": f"%{skill}%"})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            return {
+                "answer": f"Repos for **{skill}** ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "skill_search",
+            }
+        return {
+            "answer": f"No repos found for the skill \"{skill}\".",
+            "sources": [],
+            "route": "skill_search",
+        }
+
+    # --- Similarity redirect ---
+    m = _ROUTE_SIMILARITY.search(q)
+    if m:
+        repo_name = m.group(1).strip().lower()
+        # Look up the repo and its embedding, then do pgvector similarity search
+        result = await db.execute(text("""
+            SELECT r.id, r.name, r.owner, e.embedding_vec
+            FROM repos r
+            JOIN repo_embeddings e ON e.repo_id = r.id
+            WHERE r.is_private = false
+              AND LOWER(r.name) = :name
+              AND e.embedding_vec IS NOT NULL
+            LIMIT 1
+        """), {"name": repo_name})
+        source_row = result.first()
+        if source_row:
+            result = await db.execute(text("""
+                SELECT r.name, r.owner,
+                       COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
+                       r.primary_category, r.description,
+                       1 - (e.embedding_vec <=> (
+                           SELECT e2.embedding_vec FROM repo_embeddings e2 WHERE e2.repo_id = CAST(:source_id AS uuid)
+                       )) AS similarity
+                FROM repo_embeddings e
+                JOIN repos r ON r.id = e.repo_id
+                WHERE r.is_private = false
+                  AND e.embedding_vec IS NOT NULL
+                  AND r.id != CAST(:source_id AS uuid)
+                ORDER BY e.embedding_vec <=> (
+                    SELECT e2.embedding_vec FROM repo_embeddings e2 WHERE e2.repo_id = CAST(:source_id AS uuid)
+                )
+                LIMIT 5
+            """), {"source_id": str(source_row.id)})
+            rows = result.fetchall()
+            if rows:
+                parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars, similarity: {r.similarity:.2f}" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+                return {
+                    "answer": f"Repos similar to **{source_row.owner}/{source_row.name}** ({len(rows)} shown):\n\n" + "\n".join(parts),
+                    "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": round(float(r.similarity), 4), "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                    "route": "similarity_redirect",
+                }
+        # Fall through to LLM if repo not found
+
+    # --- Dependency/relationship queries ---
+    m = _ROUTE_DEPENDENCY.search(q)
+    if m:
+        target_name = m.group(1).strip().lower()
+        result = await db.execute(text("""
+            SELECT r_src.name, r_src.owner,
+                   COALESCE(r_src.parent_stars, r_src.stargazers_count, 0) as stars,
+                   r_src.primary_category, r_src.description,
+                   e.edge_type
+            FROM repo_edges e
+            JOIN repos r_tgt ON r_tgt.id = e.target_repo_id
+            JOIN repos r_src ON r_src.id = e.source_repo_id
+            WHERE r_src.is_private = false
+              AND LOWER(r_tgt.name) = :target_name
+              AND e.edge_type IN ('DEPENDS_ON', 'EXTENDS', 'FORK_OF')
+            ORDER BY COALESCE(r_src.parent_stars, r_src.stargazers_count, 0) DESC
+            LIMIT 10
+        """), {"target_name": target_name})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** ({r.edge_type.lower().replace('_', ' ')}) — {r.stars:,} stars" for r in rows]
+            return {
+                "answer": f"Repos that depend on, extend, or fork **{target_name}** ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "dependency_search",
+            }
+
+    # --- Temporal queries ---
+    m = _ROUTE_TEMPORAL.search(q)
+    if m:
+        period = m.group(1).strip().lower()
+        interval_map = {"day": 1, "week": 7, "month": 30}
+        days = interval_map.get(period, 7)
+        result = await db.execute(text("""
+            SELECT name, owner,
+                   COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   primary_category, description, ingested_at
+            FROM repos
+            WHERE is_private = false
+              AND ingested_at > NOW() - MAKE_INTERVAL(days => :days)
+            ORDER BY ingested_at DESC
+            LIMIT 10
+        """), {"days": days})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            return {
+                "answer": f"Repos added or updated in the last {period} ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "temporal_search",
+            }
+        return {
+            "answer": f"No repos were added or updated in the last {period}.",
+            "sources": [],
+            "route": "temporal_search",
+        }
+
     return None  # No smart route matched — fall through to LLM
 
 
@@ -748,9 +930,11 @@ def _vec_to_pg(arr) -> str:
     return "[" + ",".join(f"{x:.8f}" for x in arr.tolist()) + "]"
 
 
-# claude-sonnet-4-20250514 pricing (per 1M tokens)
-_COST_PER_M_INPUT = 3.00
-_COST_PER_M_OUTPUT = 15.00
+# Per-model pricing (per 1M tokens) — keeps cost estimation accurate across tiers
+_MODEL_PRICING = {
+    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    "claude-haiku-4-5-20250414": {"input": 0.80, "output": 4.00},
+}
 
 
 def _hash_ip(ip: str | None) -> str | None:
@@ -760,10 +944,9 @@ def _hash_ip(ip: str | None) -> str | None:
     return hashlib.sha256(ip.encode()).hexdigest()
 
 
-def _estimate_cost(prompt_tokens: int, completion_tokens: int) -> float:
-    return (prompt_tokens / 1_000_000 * _COST_PER_M_INPUT) + (
-        completion_tokens / 1_000_000 * _COST_PER_M_OUTPUT
-    )
+def _estimate_cost(input_tokens: int, output_tokens: int, model: str = "claude-sonnet-4-20250514") -> float:
+    pricing = _MODEL_PRICING.get(model, _MODEL_PRICING["claude-sonnet-4-20250514"])
+    return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
 
 
 async def _log_query(
@@ -822,7 +1005,7 @@ async def _log_query(
                     "sources": json.dumps(sources),
                     "tokens_prompt": tokens_prompt,
                     "tokens_completion": tokens_completion,
-                    "cost_usd": _estimate_cost(tokens_prompt, tokens_completion),
+                    "cost_usd": _estimate_cost(tokens_prompt, tokens_completion, model=model),
                     "hashed_ip": hashed_ip,
                     "latency_ms": latency_ms,
                     "model": model,
@@ -1357,9 +1540,10 @@ async def _prepare_query(
     )
     rows = result.fetchall()
 
-    # Adaptive top_k: stop including repos when similarity drops below 0.35
+    # Adaptive top_k: stop including repos when similarity drops below threshold
+    # 0.45 ≈ moderately related; below this, repos add noise more than value
     if rows and len(rows) > 3:
-        filtered = [r for r in rows if r.similarity >= 0.35]
+        filtered = [r for r in rows if r.similarity >= 0.45]
         if len(filtered) >= 3:  # keep at least 3
             rows = filtered
 

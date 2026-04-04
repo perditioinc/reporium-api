@@ -182,7 +182,8 @@ async def test_ask_without_session_id_is_backward_compatible(client: AsyncClient
              patch("app.routers.intelligence.anthropic.Anthropic") as MockClient, \
              patch("app.routers.intelligence.get_embedding_model") as mock_model, \
              patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(return_value=None)), \
-             patch("app.routers.intelligence._log_query", new=AsyncMock()):
+             patch("app.routers.intelligence._log_query", new=AsyncMock()), \
+             patch("app.routers.intelligence._try_smart_route", new=AsyncMock(return_value=None)):
             mock_model.return_value.encode.return_value = np.zeros(384)
             MockClient.return_value.messages.create.return_value = claude_resp
             resp = await client.post(
