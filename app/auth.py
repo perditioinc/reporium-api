@@ -70,6 +70,31 @@ async def require_ingest_key(
     raise HTTPException(status_code=403, detail="Invalid ingest key")
 
 
+# ---------------------------------------------------------------------------
+# App token - lightweight guard on expensive LLM endpoints
+# ---------------------------------------------------------------------------
+
+_APP_TOKEN_HEADER = APIKeyHeader(name="X-App-Token", auto_error=False)
+
+
+async def require_app_token(
+    x_app_token: str | None = Security(_APP_TOKEN_HEADER),
+) -> None:
+    """
+    Lightweight app verification for expensive endpoints.
+    The token is a simple shared secret set via APP_API_TOKEN env var.
+    Not full auth — just prevents random scripts from hitting LLM endpoints.
+    """
+    expected = os.getenv("APP_API_TOKEN", "")
+    if not expected:
+        if _IS_PRODUCTION:
+            logger.error("APP_API_TOKEN not set in production — rejecting")
+            raise HTTPException(status_code=500, detail="Server misconfiguration")
+        return  # Dev mode
+    if x_app_token != expected:
+        raise HTTPException(status_code=403, detail="App token required")
+
+
 async def require_pubsub_push(
     request: Request,
     credentials: HTTPAuthorizationCredentials | None = Security(HTTPBearer(auto_error=False)),

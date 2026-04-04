@@ -25,12 +25,14 @@ import logging
 import os
 
 import anthropic
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from app.auth import require_app_token
 from app.cache import cache
 from app.circuit_breaker import anthropic_breaker
+from app.cost_tracker import check_budget, record_cost
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/intelligence", tags=["Intelligence"])
@@ -128,17 +130,27 @@ def _build_query_params(r: NLFilterResponse) -> str:
 
 
 @router.post("/nl-filter", response_model=NLFilterResponse)
-@_limiter.limit("30/minute")
-async def nl_filter(request: Request, body: NLFilterRequest) -> NLFilterResponse:
+@_limiter.limit("15/minute")
+async def nl_filter(
+    request: Request,
+    body: NLFilterRequest,
+    _app: None = Depends(require_app_token),
+) -> NLFilterResponse:
     """
     Translate a natural language query into structured filter params.
     Single Haiku call — ~$0.0005 per request. Results cached 1 hour by query hash.
-    Public endpoint, rate-limited to 30 req/min per IP.
+    Requires X-App-Token header, rate-limited to 15 req/min per IP.
     """
     cache_key = f"nl_filter:{hash(body.query.lower().strip())}"
     cached = await cache.get(cache_key)
     if cached:
         return NLFilterResponse(**cached)
+
+    if not check_budget():
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable — daily usage limit reached. Try again tomorrow.",
+        )
 
     prompt = _NL_FILTER_PROMPT.format(
         query=body.query,
@@ -158,6 +170,7 @@ async def nl_filter(request: Request, body: NLFilterRequest) -> NLFilterResponse
 
         with anthropic_breaker:
             response = await asyncio.to_thread(_call_haiku)
+        record_cost(0.0005, model="claude-haiku-4-5")
         raw = response.content[0].text.strip()
 
         # Strip markdown fences if present

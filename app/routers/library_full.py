@@ -12,7 +12,9 @@ import time
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends, Query, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -546,6 +548,7 @@ _TAXONOMY_RAW_TO_CANONICAL: dict[str, str] = {
 }
 
 router = APIRouter(tags=["Library"])
+_limiter = Limiter(key_func=get_remote_address)
 
 # In-memory cache: two tiers
 #   _cache["page_{page}_{page_size}"] → per-page enriched repos (5 min TTL)
@@ -1322,7 +1325,9 @@ async def _fetch_aggregates(db: AsyncSession) -> dict:
 
 
 @router.get("/library/full", response_model=dict)
+@_limiter.limit("5/minute")
 async def library_full(
+    request: Request,
     response: Response,
     db: AsyncSession = Depends(get_db),
     page: int = Query(default=1, ge=1, description="1-based page number"),
