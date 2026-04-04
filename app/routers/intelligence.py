@@ -52,6 +52,278 @@ _INJECTION_PATTERNS = re.compile(
 _MAX_CONTENT_LEN = 400  # max chars per repo field in context
 _SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.08  # cosine distance ≤ 0.08 ≈ similarity ≥ 0.92
 
+# ---------------------------------------------------------------------------
+# KAN-124: Smart routing — answer questions with SQL when possible, skip LLM
+# ---------------------------------------------------------------------------
+# Question patterns that can be answered without calling Claude.
+# Each rule: (compiled regex, handler function name, route label)
+# Handler functions receive (question: str, match: re.Match, db: AsyncSession)
+# and return (answer: str, sources: list[dict]) or None to fall through to LLM.
+
+_ROUTE_COUNT = re.compile(
+    r"^how many (repos?|repositories|tools?|projects?|libraries?)(\s.*)?\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_COUNT_CATEGORY = re.compile(
+    r"^how many (repos?|repositories|tools?|projects?|libraries?)\s+(are |in |for |about |with |use |have )?(the )?(category\s+)?(?P<category>.+?)(\s+category)?\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_LIST_CATEGORIES = re.compile(
+    r"^(what|list|show|which)\s+(are\s+)?(the\s+)?(categories|topics|groups)(\s+available)?\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_TOP_STARRED = re.compile(
+    r"^(what|which|show|list)\s+(are\s+)?(the\s+)?(?:top|most[- ]starred|popular|best)\s+(\d+\s+)?(repos?|repositories|tools?|projects?)?\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_REPO_INFO = re.compile(
+    r"^(what is|tell me about|describe|info about|show me|explain)\s+(?:the\s+)?(?:repo(?:sitory)?\s+)?(?P<name>[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)?)\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_COUNT_LANGUAGE = re.compile(
+    r"^how many\s+(?:repos?|repositories|tools?|projects?)\s+(?:are\s+)?(?:written\s+)?(?:in|use|using)\s+(?P<lang>[a-zA-Z0-9#+]+)\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_LIST_LANGUAGES = re.compile(
+    r"^(what|which|list|show)\s+(?:are\s+)?(?:the\s+)?(?:programming\s+)?languages?\s+(?:are\s+)?(?:used|available|supported|represented)\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_COUNT_TAGS = re.compile(
+    r"^how many\s+(?:repos?|repositories|tools?|projects?)\s+(?:are\s+)?(?:tagged\s+(?:with\s+)?|have\s+(?:the\s+)?tag\s+)(?P<tag>[a-zA-Z0-9_-]+)\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_STATS = re.compile(
+    r"^(what are|show|give me|tell me)\s+(?:the\s+)?(?:overall\s+)?(?:library\s+)?stats\s*\?*$",
+    re.IGNORECASE,
+)
+
+
+async def _try_smart_route(question: str, db: AsyncSession) -> dict | None:
+    """
+    Attempt to answer the question with a pure SQL query.
+    Returns a dict with {"answer": str, "sources": list, "route": str} or None.
+    """
+    q = question.strip()
+
+    # --- Total count ---
+    m = _ROUTE_COUNT.match(q)
+    if m and not _ROUTE_COUNT_CATEGORY.match(q) and not _ROUTE_COUNT_LANGUAGE.match(q) and not _ROUTE_COUNT_TAGS.match(q):
+        result = await db.execute(text(
+            "SELECT COUNT(*) FROM repos WHERE is_private = false"
+        ))
+        count = result.scalar()
+        return {
+            "answer": f"There are **{count:,}** public repositories tracked in Reporium.",
+            "sources": [],
+            "route": "count_total",
+        }
+
+    # --- Count by category ---
+    m = _ROUTE_COUNT_CATEGORY.match(q)
+    if m:
+        cat_query = m.group("category").strip().lower()
+        result = await db.execute(text("""
+            SELECT primary_category, COUNT(*) as cnt
+            FROM repos
+            WHERE is_private = false
+              AND LOWER(primary_category) LIKE :cat
+            GROUP BY primary_category
+            ORDER BY cnt DESC
+        """), {"cat": f"%{cat_query}%"})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{row.primary_category}**: {row.cnt} repos" for row in rows]
+            total = sum(row.cnt for row in rows)
+            return {
+                "answer": f"Found **{total:,}** repos matching \"{cat_query}\":\n\n" + "\n".join(parts),
+                "sources": [],
+                "route": "count_category",
+            }
+        return {
+            "answer": f"No repos found with a category matching \"{cat_query}\". Try browsing categories on the home page.",
+            "sources": [],
+            "route": "count_category",
+        }
+
+    # --- List categories ---
+    m = _ROUTE_LIST_CATEGORIES.match(q)
+    if m:
+        result = await db.execute(text("""
+            SELECT primary_category, COUNT(*) as cnt
+            FROM repos
+            WHERE is_private = false AND primary_category IS NOT NULL
+            GROUP BY primary_category
+            ORDER BY cnt DESC
+        """))
+        rows = result.fetchall()
+        parts = [f"- **{row.primary_category}** ({row.cnt} repos)" for row in rows]
+        return {
+            "answer": f"Reporium tracks repos across **{len(rows)}** categories:\n\n" + "\n".join(parts),
+            "sources": [],
+            "route": "list_categories",
+        }
+
+    # --- Top starred repos ---
+    m = _ROUTE_TOP_STARRED.match(q)
+    if m:
+        limit = int(m.group(4).strip()) if m.group(4) else 10
+        limit = min(limit, 25)  # cap
+        result = await db.execute(text("""
+            SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   primary_category, description
+            FROM repos
+            WHERE is_private = false
+            ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+            LIMIT :limit
+        """), {"limit": limit})
+        rows = result.fetchall()
+        parts = []
+        sources = []
+        for row in rows:
+            stars_str = f"{row.stars:,}" if row.stars else "0"
+            cat_str = f" ({row.primary_category})" if row.primary_category else ""
+            parts.append(f"- **{row.owner}/{row.name}**{cat_str} — {stars_str} stars")
+            sources.append({
+                "name": row.name, "owner": row.owner,
+                "stars": row.stars, "relevance_score": 1.0,
+                "description": row.description,
+                "forked_from": None, "problem_solved": None,
+                "integration_tags": [],
+            })
+        return {
+            "answer": f"Top {limit} most-starred repos in Reporium:\n\n" + "\n".join(parts),
+            "sources": sources,
+            "route": "top_starred",
+        }
+
+    # --- Specific repo info ---
+    m = _ROUTE_REPO_INFO.match(q)
+    if m:
+        name = m.group("name").strip()
+        # Try exact match, then LIKE match
+        result = await db.execute(text("""
+            SELECT name, owner, description, primary_category,
+                   COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   language, forked_from, readme_summary, problem_solved,
+                   license_spdx
+            FROM repos
+            WHERE is_private = false
+              AND (LOWER(name) = LOWER(:name) OR LOWER(name) LIKE LOWER(:like_name))
+            ORDER BY CASE WHEN LOWER(name) = LOWER(:name) THEN 0 ELSE 1 END,
+                     COALESCE(parent_stars, stargazers_count, 0) DESC
+            LIMIT 1
+        """), {"name": name, "like_name": f"%{name}%"})
+        row = result.first()
+        if row:
+            parts = [f"**{row.owner}/{row.name}**"]
+            if row.primary_category:
+                parts.append(f"Category: {row.primary_category}")
+            if row.language:
+                parts.append(f"Language: {row.language}")
+            parts.append(f"Stars: {row.stars:,}")
+            if row.license_spdx:
+                parts.append(f"License: {row.license_spdx}")
+            if row.description:
+                parts.append(f"\n{row.description}")
+            if row.problem_solved:
+                parts.append(f"\n**What it solves:** {row.problem_solved}")
+            if row.readme_summary:
+                parts.append(f"\n**Summary:** {row.readme_summary[:300]}")
+            return {
+                "answer": "\n".join(parts),
+                "sources": [{
+                    "name": row.name, "owner": row.owner,
+                    "stars": row.stars, "relevance_score": 1.0,
+                    "description": row.description, "forked_from": row.forked_from,
+                    "problem_solved": row.problem_solved, "integration_tags": [],
+                }],
+                "route": "repo_info",
+            }
+        # Fall through to LLM if no match
+        return None
+
+    # --- Count by language ---
+    m = _ROUTE_COUNT_LANGUAGE.match(q)
+    if m:
+        lang = m.group("lang").strip()
+        result = await db.execute(text("""
+            SELECT COUNT(*) FROM repos
+            WHERE is_private = false AND LOWER(language) = LOWER(:lang)
+        """), {"lang": lang})
+        count = result.scalar()
+        return {
+            "answer": f"There are **{count:,}** repos written in {lang} tracked in Reporium.",
+            "sources": [],
+            "route": "count_language",
+        }
+
+    # --- List languages ---
+    m = _ROUTE_LIST_LANGUAGES.match(q)
+    if m:
+        result = await db.execute(text("""
+            SELECT language, COUNT(*) as cnt
+            FROM repos
+            WHERE is_private = false AND language IS NOT NULL
+            GROUP BY language
+            ORDER BY cnt DESC
+            LIMIT 20
+        """))
+        rows = result.fetchall()
+        parts = [f"- **{row.language}** ({row.cnt} repos)" for row in rows]
+        return {
+            "answer": f"Top programming languages across Reporium:\n\n" + "\n".join(parts),
+            "sources": [],
+            "route": "list_languages",
+        }
+
+    # --- Count by tag ---
+    m = _ROUTE_COUNT_TAGS.match(q)
+    if m:
+        tag = m.group("tag").strip().lower()
+        result = await db.execute(text("""
+            SELECT COUNT(*) FROM repos
+            WHERE is_private = false
+              AND EXISTS (
+                SELECT 1 FROM unnest(enriched_tags) t WHERE LOWER(t) = :tag
+              )
+        """), {"tag": tag})
+        count = result.scalar()
+        return {
+            "answer": f"There are **{count:,}** repos tagged with \"{tag}\" in Reporium.",
+            "sources": [],
+            "route": "count_tag",
+        }
+
+    # --- Overall stats ---
+    m = _ROUTE_STATS.match(q)
+    if m:
+        result = await db.execute(text("""
+            SELECT
+                COUNT(*) as total,
+                COUNT(DISTINCT primary_category) as categories,
+                COUNT(DISTINCT language) FILTER (WHERE language IS NOT NULL) as languages,
+                SUM(COALESCE(parent_stars, stargazers_count, 0)) as total_stars,
+                COUNT(*) FILTER (WHERE forked_from IS NOT NULL) as forked,
+                COUNT(*) FILTER (WHERE forked_from IS NULL) as original
+            FROM repos WHERE is_private = false
+        """))
+        row = result.first()
+        if row:
+            return {
+                "answer": (
+                    f"**Reporium Library Stats:**\n\n"
+                    f"- **{row.total:,}** total public repos\n"
+                    f"- **{row.categories}** categories\n"
+                    f"- **{row.languages}** programming languages\n"
+                    f"- **{row.total_stars:,}** total stars\n"
+                    f"- **{row.original:,}** original repos, **{row.forked:,}** forks"
+                ),
+                "sources": [],
+                "route": "stats_overview",
+            }
+
+    return None  # No smart route matched — fall through to LLM
+
 
 def _sanitize_question(question: str) -> str:
     """Raise ValueError if the question contains injection patterns."""
@@ -593,6 +865,35 @@ async def _run_query(
     4. Return answer with source repos and relevance scores
     """
     _started_at = time.monotonic()
+
+    # 0. Smart routing — answer simple questions with SQL, no LLM call needed
+    smart_result = await _try_smart_route(req.question, db)
+    if smart_result is not None:
+        logger.info("ask: smart-routed via %s (no LLM)", smart_result["route"])
+        sources = _coerce_cached_sources(smart_result["sources"])
+        response = QueryResponse(
+            answer=smart_result["answer"],
+            sources=sources,
+            question=req.question,
+            model=f"smart-route:{smart_result['route']}",
+            answered_at=datetime.now(timezone.utc).isoformat(),
+            embedding_candidates=0,
+            cache_hit=False,
+            tokens_used={"input": 0, "output": 0, "total": 0},
+        )
+        asyncio.create_task(_log_query(
+            question=req.question,
+            answer=smart_result["answer"],
+            sources=smart_result["sources"],
+            tokens_prompt=0,
+            tokens_completion=0,
+            hashed_ip=_hash_ip(client_ip),
+            latency_ms=int((time.monotonic() - _started_at) * 1000),
+            model=f"smart-route:{smart_result['route']}",
+            cache_hit=False,
+        ))
+        return response
+
     model = get_embedding_model()
 
     # 1. Embed the question — model is pre-warmed at startup so this is fast
@@ -894,9 +1195,34 @@ async def intelligence_ask_stream(
 
     async def event_generator():
         _started_at = time.monotonic()
-        model = get_embedding_model()
 
         try:
+            # 0. Smart routing — answer simple questions with SQL, skip LLM entirely
+            smart_result = await _try_smart_route(req.question, db)
+            if smart_result is not None:
+                logger.info("ask/stream: smart-routed via %s (no LLM)", smart_result["route"])
+                sources = _coerce_cached_sources(smart_result["sources"])
+                yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in sources], 'cache_hit': False, 'route': smart_result['route']})}\n\n"
+                # Stream answer word-by-word
+                words = smart_result["answer"].split(" ")
+                for i, word in enumerate(words):
+                    chunk = word + (" " if i < len(words) - 1 else "")
+                    yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
+                    await asyncio.sleep(0)
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'route': smart_result['route']})}\n\n"
+                asyncio.create_task(_log_query(
+                    question=req.question, answer=smart_result["answer"],
+                    sources=smart_result["sources"],
+                    tokens_prompt=0, tokens_completion=0,
+                    hashed_ip=_hash_ip(client_ip),
+                    latency_ms=int((time.monotonic() - _started_at) * 1000),
+                    model=f"smart-route:{smart_result['route']}",
+                    cache_hit=False,
+                ))
+                return
+
+            model = get_embedding_model()
+
             # 1. Embed the question
             query_embedding = model.encode(req.question)
 

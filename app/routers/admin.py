@@ -1,5 +1,6 @@
 import json
 import logging
+from dataclasses import dataclass, field as dc_field
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -404,25 +405,167 @@ async def backfill_embeddings(
     return {"backfilled": backfilled, "vec_synced": synced, "errors": errors}
 
 
-# ── AI agent protocol tagging ─────────────────────────────────────────────────
-# Detects CLI, MCP, and A2A protocol indicators from repo name, description,
-# tags, and readme_summary. Zero LLM cost — pure keyword matching.
+# ── AI agent protocol & framework tagging ────────────────────────────────────
+# Detects protocols, AI frameworks, and SDK indicators from repo name,
+# description, readme_summary, and tags. Zero LLM cost — pure keyword matching.
+#
+# Keywords are split into two confidence tiers:
+#   "strong"  — Unambiguous identifiers. One match is enough to tag.
+#               e.g. "langchain", "crewai", "mcp-server"
+#   "weak"    — Generic words that ALSO happen to be library/concept names.
+#               e.g. "transformers", "datasets", "eval", "adapter"
+#               A weak keyword only fires when CORROBORATED by:
+#                 • at least ONE strong keyword for the same tag, OR
+#                 • at least TWO weak keywords for the same tag
+#
+# This eliminates false positives like tagging a generic CSV-parsing repo
+# "HuggingFace" just because its description mentions "datasets".
 
-_PROTOCOL_RULES: list[tuple[str, list[str]]] = [
-    ("MCP", [
+@dataclass
+class TagRule:
+    """One tagging rule with confidence-tiered keywords."""
+    tag: str
+    strong: list[str] = dc_field(default_factory=list)  # one match → tag
+    weak: list[str] = dc_field(default_factory=list)    # needs corroboration
+
+
+_TAG_RULES: list[TagRule] = [
+    # ── Protocols ──
+    TagRule("MCP", strong=[
         "mcp", "model context protocol", "mcp-server", "mcp server",
         "model-context-protocol", "mcp-client", "mcp plugin",
+        "mcp-tool", "modelcontextprotocol",
     ]),
-    ("CLI", [
-        "cli tool", "command-line", "command line interface",
-        "cli interface", "terminal tool", "cli app", "cli utility",
-        "command line tool",
+    TagRule("CLI", strong=[
+        "cli tool", "command-line tool", "command line interface",
+        "cli interface", "cli app", "cli utility", "cli framework",
+        "cli library",
+    ], weak=[
+        "command-line", "terminal tool",
     ]),
-    ("A2A", [
+    TagRule("A2A", strong=[
         "a2a", "agent-to-agent", "agent to agent", "a2a protocol",
-        "inter-agent", "multi-agent communication",
+        "inter-agent",
+    ], weak=[
+        "multi-agent communication", "agent communication", "agent protocol",
+    ]),
+    # ── AI Frameworks & SDKs ──
+    TagRule("LangChain", strong=[
+        "langchain", "lang-chain", "langchain-community", "langserve",
+        "langsmith", "langgraph",
+    ]),
+    TagRule("LlamaIndex", strong=[
+        "llamaindex", "llama-index", "llama_index", "gpt-index",
+    ]),
+    TagRule("CrewAI", strong=[
+        "crewai", "crew-ai", "crew ai",
+    ]),
+    TagRule("AutoGen", strong=[
+        "autogen", "pyautogen",
+    ], weak=[
+        "auto-gen", "ag2",
+    ]),
+    TagRule("Ollama", strong=[
+        "ollama",
+    ]),
+    TagRule("vLLM", strong=[
+        "vllm",
+    ], weak=[
+        "v-llm",
+    ]),
+    TagRule("HuggingFace", strong=[
+        "huggingface", "hugging face", "huggingface.co",
+        "from_pretrained",  # unmistakable HF API call
+    ], weak=[
+        "transformers", "diffusers", "datasets", "accelerate",
+        "peft", "trl", "tokenizer",
+    ]),
+    TagRule("OpenAI", strong=[
+        "openai", "openai api", "openai-python",
+    ], weak=[
+        "gpt-4", "gpt-3", "chatgpt", "whisper", "dall-e",
+    ]),
+    TagRule("Anthropic", strong=[
+        "anthropic", "anthropic api", "claude-api",
+    ], weak=[
+        "claude",
+    ]),
+    TagRule("Vercel AI SDK", strong=[
+        "ai sdk", "vercel ai", "@ai-sdk",
+    ]),
+    TagRule("Streamlit", strong=[
+        "streamlit",
+    ]),
+    TagRule("Gradio", strong=[
+        "gradio",
+    ]),
+    TagRule("FastAPI", strong=[
+        "fastapi",
+    ], weak=[
+        "fast-api",
+    ]),
+    TagRule("Docker", strong=[
+        "dockerfile", "docker-compose", "docker compose",
+    ], weak=[
+        "docker", "containerized",
+    ]),
+    TagRule("Kubernetes", strong=[
+        "kubernetes", "k8s",
+    ], weak=[
+        "helm chart",
+    ]),
+    # ── AI Patterns ──
+    TagRule("RAG", strong=[
+        "rag pipeline", "retrieval augmented", "retrieval-augmented",
+        "chromadb", "pinecone", "weaviate", "qdrant", "milvus",
+    ], weak=[
+        "vector search", "vector database", "vector store", "chroma",
+    ]),
+    TagRule("Fine-Tuning", strong=[
+        "fine-tune", "fine-tuning", "finetuning", "finetune",
+        "lora", "qlora", "rlhf", "dpo",
+    ], weak=[
+        "adapter", "sft",
+    ]),
+    TagRule("Agents", strong=[
+        "ai agent", "autonomous agent", "agent framework", "agentic",
+        "agent orchestration",
+    ], weak=[
+        "tool-use", "tool use", "function calling", "tool calling",
+        "multi-agent",
+    ]),
+    TagRule("Evaluation", strong=[
+        "llm eval", "llm evaluation", "llm benchmark", "llm judge",
+        "model evaluation", "red teaming", "evals framework",
+    ], weak=[
+        "eval", "evaluation", "benchmark", "leaderboard", "scoring",
+        "red team",
+    ]),
+    TagRule("Prompt Engineering", strong=[
+        "prompt engineering", "prompt template", "prompt management",
+        "prompt optimization", "dspy",
+    ], weak=[
+        "prompt chain",
     ]),
 ]
+
+
+def _match_tag_rule(rule: TagRule, search_text: str) -> bool:
+    """
+    Return True if the repo text qualifies for this tag.
+
+    Logic:
+      • Any strong keyword match → True immediately
+      • Weak keywords alone need corroboration:
+        – 2+ weak matches → True
+        – 1 weak match alone → False (too noisy)
+    """
+    strong_hits = sum(1 for kw in rule.strong if kw in search_text)
+    if strong_hits > 0:
+        return True
+
+    weak_hits = sum(1 for kw in rule.weak if kw in search_text)
+    return weak_hits >= 2
 
 
 @router.post("/admin/tags/protocols", response_model=dict)
@@ -434,8 +577,15 @@ async def tag_protocols(
 ):
     """
     Scan all public repos and tag with protocol indicators (MCP, CLI, A2A)
-    based on keyword matching in name, description, readme_summary, and tags.
-    Zero LLM cost — pure keyword matching.
+    and AI framework/SDK tags (LangChain, LlamaIndex, CrewAI, AutoGen,
+    Ollama, vLLM, HuggingFace, OpenAI, Anthropic, etc.) using confidence-
+    tiered keyword matching.
+
+    Strong keywords (e.g. "langchain", "crewai") tag on a single match.
+    Weak keywords (e.g. "transformers", "datasets", "eval") require 2+
+    matches to tag — prevents false positives on generic terms.
+
+    Zero LLM cost — pure keyword matching with noise filtering.
     """
     # Fetch repos with their text fields and existing tags
     result = await db.execute(text("""
@@ -449,7 +599,8 @@ async def tag_protocols(
     """))
     rows = result.fetchall()
 
-    tagged: dict[str, list[str]] = {}  # protocol → list of repo names
+    tagged: dict[str, list[str]] = {}  # tag → list of repo names
+    matched_by: dict[str, dict[str, str]] = {}  # tag → {repo: match_type}
     inserts = 0
     skipped = 0
 
@@ -459,10 +610,14 @@ async def tag_protocols(
             row.name, row.description, row.readme_summary, row.all_tags,
         ])).lower()
 
-        for protocol, keywords in _PROTOCOL_RULES:
-            if any(kw in search_text for kw in keywords):
+        for rule in _TAG_RULES:
+            if _match_tag_rule(rule, search_text):
+                # Determine which tier matched for diagnostics
+                strong_hit = any(kw in search_text for kw in rule.strong)
+                match_type = "strong" if strong_hit else "weak×2+"
                 if dry_run:
-                    tagged.setdefault(protocol, []).append(row.name)
+                    tagged.setdefault(rule.tag, []).append(row.name)
+                    matched_by.setdefault(rule.tag, {})[row.name] = match_type
                     continue
                 try:
                     async with db.begin_nested():
@@ -470,9 +625,10 @@ async def tag_protocols(
                             INSERT INTO repo_tags (repo_id, tag)
                             VALUES (:repo_id, :tag)
                             ON CONFLICT (repo_id, tag) DO NOTHING
-                        """), {"repo_id": str(row.id), "tag": protocol})
+                        """), {"repo_id": str(row.id), "tag": rule.tag})
                     inserts += 1
-                    tagged.setdefault(protocol, []).append(row.name)
+                    tagged.setdefault(rule.tag, []).append(row.name)
+                    matched_by.setdefault(rule.tag, {})[row.name] = match_type
                 except Exception:
                     skipped += 1
 
@@ -485,7 +641,17 @@ async def tag_protocols(
         "tagged_count": sum(len(v) for v in tagged.values()),
         "inserts": inserts,
         "skipped": skipped,
-        "protocols": {k: {"count": len(v), "repos": sorted(v)} for k, v in tagged.items()},
+        "tags": {
+            k: {
+                "count": len(v),
+                "repos": sorted(v),
+                "match_breakdown": {
+                    "strong": sum(1 for r in v if matched_by.get(k, {}).get(r) == "strong"),
+                    "weak_corroborated": sum(1 for r in v if matched_by.get(k, {}).get(r) == "weak×2+"),
+                },
+            }
+            for k, v in tagged.items()
+        },
     }
 
 

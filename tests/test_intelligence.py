@@ -317,7 +317,8 @@ async def test_run_query_returns_semantic_cache_hit_without_calling_anthropic():
     fake_model.encode.return_value = np.array([0.1, 0.2, 0.3])
     mock_log_query = AsyncMock()
 
-    with patch("app.routers.intelligence.get_embedding_model", return_value=fake_model), \
+    with patch("app.routers.intelligence._try_smart_route", new=AsyncMock(return_value=None)), \
+         patch("app.routers.intelligence.get_embedding_model", return_value=fake_model), \
          patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(return_value=(
              "Cached answer",
              _coerce_cached_sources([{"owner": "perditioinc", "name": "reporium", "relevance_score": 0.88}]),
