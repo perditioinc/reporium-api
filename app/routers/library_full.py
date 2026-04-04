@@ -547,8 +547,10 @@ _TAXONOMY_RAW_TO_CANONICAL: dict[str, str] = {
     "personalization": "Recommendation Systems",
 }
 
+from app.rate_limit import rate_limit_storage
+
 router = APIRouter(tags=["Library"])
-_limiter = Limiter(key_func=get_remote_address)
+_limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 # In-memory cache: two tiers
 #   _cache["page_{page}_{page_size}"] → per-page enriched repos (5 min TTL)

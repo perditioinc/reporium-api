@@ -34,9 +34,10 @@ from app.cost_tracker import check_budget, record_cost
 from app.database import async_session_factory, get_db
 from app.embeddings import get_embedding_model
 from app.models.session import AskSession
+from app.rate_limit import rate_limit_storage
 from app.utils import get_anthropic_key, vec_to_pg
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
-_limiter = Limiter(key_func=get_remote_address)
+_limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 # Patterns that indicate prompt injection attempts in user queries.
 # These try to override instructions, inject roles, or exfiltrate data.
@@ -54,15 +55,24 @@ _INJECTION_PATTERNS = re.compile(
 )
 
 _MAX_CONTENT_LEN = 400  # max chars per repo field in context
+
+# ---------------------------------------------------------------------------
+# KAN-197: Lazy singleton Anthropic client — avoids creating a new client per request
+# ---------------------------------------------------------------------------
+_anthropic_client: anthropic.Anthropic | None = None
+
+
+def _get_client() -> anthropic.Anthropic:
+    global _anthropic_client
+    if _anthropic_client is None:
+        from app.utils import get_anthropic_key
+        _anthropic_client = anthropic.Anthropic(api_key=get_anthropic_key())
+    return _anthropic_client
 _SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.12  # cosine distance ≤0.12 ≈ similarity ≥0.88 — balances hit rate vs quality
 
 # ---------------------------------------------------------------------------
 # KAN-124: Tiered model selection — Haiku for simple queries, Sonnet for complex
 # ---------------------------------------------------------------------------
-_SIMPLE_PATTERNS = re.compile(
-    r"\b(list|show|which|what is|how many)\b",
-    re.IGNORECASE,
-)
 _COMPLEX_PATTERNS = re.compile(
     r"\b(compare|analyze|explain why|difference|pros and cons|recommend|evaluate|assess)\b",
     re.IGNORECASE,
@@ -74,16 +84,14 @@ _MODEL_SONNET = "claude-sonnet-4-20250514"
 
 def _select_model(question: str, num_repos: int) -> str:
     """Return the appropriate Claude model based on question complexity heuristics."""
-    # Complex patterns always get Sonnet
-    if _COMPLEX_PATTERNS.search(question):
+    q = question.lower().strip()
+
+    # Complex questions → Sonnet (worth the cost)
+    if _COMPLEX_PATTERNS.search(q):
         return _MODEL_SONNET
-    # Simple heuristics: short question + few repos, or simple discovery words
-    if len(question) < 60 and num_repos <= 5:
-        return _MODEL_HAIKU
-    if _SIMPLE_PATTERNS.search(question):
-        return _MODEL_HAIKU
-    # Default: Sonnet (safe fallback)
-    return _MODEL_SONNET
+
+    # Everything else → Haiku (10x cheaper, good enough for most queries)
+    return _MODEL_HAIKU
 
 
 # ---------------------------------------------------------------------------
@@ -1034,7 +1042,19 @@ async def _load_session_turns(session_id: str, db: AsyncSession) -> list[dict]:
     for row in reversed(rows):
         turns.append({"role": "user", "content": row.question})
         turns.append({"role": "assistant", "content": row.answer})
-    return turns
+
+    # KAN-197: Cap session history at ~2000 tokens (~8000 chars) to prevent runaway costs
+    MAX_SESSION_CHARS = 8000
+    total_chars = 0
+    capped_history: list[dict] = []
+    for turn in reversed(turns):  # most recent first
+        turn_chars = len(turn.get("content", ""))
+        if total_chars + turn_chars > MAX_SESSION_CHARS:
+            break
+        capped_history.insert(0, turn)
+        total_chars += turn_chars
+
+    return capped_history
 
 
 async def _save_session_turn(session_id: str, question: str, answer: str) -> None:
@@ -1670,15 +1690,26 @@ async def _prepare_query(
             edge_context += ", ".join(edge_parts)
             context += edge_context
 
-    # 6. Load session history (KAN-158)
+    # 6. Load session history (KAN-158) with token budget cap
     history_messages: list[dict] = []
     if session_id:
-        history_messages = await _load_session_turns(session_id, db)
-        if history_messages:
+        raw_history = await _load_session_turns(session_id, db)
+        if raw_history:
+            # Cap session history at ~2000 tokens (~8000 chars) to prevent runaway costs
+            _MAX_SESSION_CHARS = 8000
+            total_chars = 0
+            for msg in reversed(raw_history):
+                msg_chars = len(msg.get("content", ""))
+                if total_chars + msg_chars > _MAX_SESSION_CHARS:
+                    break
+                history_messages.insert(0, msg)
+                total_chars += msg_chars
             logger.info(
-                "ask: loaded %d history turns for session %s",
-                len(history_messages) // 2,
+                "ask: loaded %d/%d history messages for session %s (%d chars)",
+                len(history_messages),
+                len(raw_history),
                 session_id,
+                total_chars,
             )
 
     t_context = time.perf_counter()
@@ -1764,14 +1795,13 @@ async def _run_query(
         return response
 
     # Daily cost cap check — reject before calling Claude if budget exhausted
-    if not check_budget():
+    if not await check_budget():
         raise HTTPException(
             status_code=503,
             detail="Service temporarily unavailable — daily usage limit reached. Try again tomorrow.",
         )
 
-    api_key = get_anthropic_key()
-    client = anthropic.Anthropic(api_key=api_key)
+    client = _get_client()
 
     user_prompt = (
         f"Answer the following question using only the repo data provided below.\n\n"
@@ -1822,9 +1852,9 @@ async def _run_query(
         "total": message.usage.input_tokens + message.usage.output_tokens,
     }
 
-    # Record estimated cost (Haiku ~$0.0005/call, Sonnet ~$0.01/call)
-    _est_cost = 0.0005 if "haiku" in qctx.model else 0.01
-    record_cost(_est_cost, model=qctx.model)
+    # Record actual token-based cost
+    _est_cost = _estimate_cost(message.usage.input_tokens, message.usage.output_tokens, qctx.model)
+    await record_cost(_est_cost, model=qctx.model)
 
     # Build response
     sources = []
@@ -2006,12 +2036,11 @@ async def intelligence_ask_stream(
             yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in source_list], 'cache_hit': False})}\n\n"
 
             # Daily cost cap check — reject before calling Claude if budget exhausted
-            if not check_budget():
+            if not await check_budget():
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Service temporarily unavailable — daily usage limit reached. Try again tomorrow.'})}\n\n"
                 return
 
-            api_key = get_anthropic_key()
-            anthropic_client = anthropic.Anthropic(api_key=api_key)
+            anthropic_client = _get_client()
 
             user_prompt = (
                 f"Here are the most relevant repos from the library:\n\n{qctx.context_text}\n\n"
@@ -2077,9 +2106,9 @@ async def intelligence_ask_stream(
                     output_tokens = payload.usage.output_tokens
                     tokens_info = {'input': input_tokens, 'output': output_tokens, 'total': input_tokens + output_tokens}
                     yield f"data: {json.dumps({'type': 'done', 'tokens': tokens_info, 'model': qctx.model})}\n\n"
-                    # Record estimated cost
-                    _stream_est_cost = 0.0005 if "haiku" in qctx.model else 0.01
-                    record_cost(_stream_est_cost, model=qctx.model)
+                    # Record actual token-based cost
+                    _stream_est_cost = _estimate_cost(input_tokens, output_tokens, qctx.model)
+                    await record_cost(_stream_est_cost, model=qctx.model)
                     # Cache the full LLM response in Redis (30 min TTL)
                     asyncio.create_task(cache.set(qctx.redis_cache_key, {
                         "answer": full_answer,
@@ -2166,6 +2195,7 @@ async def suggested_questions(
 async def portfolio_insights(
     request: Request,
     db: AsyncSession = Depends(get_db),
+    _app: None = Depends(require_app_token),
 ):
     """Curated intelligence feed for the portfolio dashboard."""
     return await _portfolio_insights(db)
@@ -2180,8 +2210,8 @@ async def portfolio_insights(
 @_limiter.limit("30/minute")
 async def compare_repos(
     request: Request,
-    a: str = Query(..., description="First repo name"),
-    b: str = Query(..., description="Second repo name"),
+    a: str = Query(..., max_length=100, description="First repo name"),
+    b: str = Query(..., max_length=100, description="Second repo name"),
     db: AsyncSession = Depends(get_db),
 ):
     """Structured side-by-side comparison of two repos."""
@@ -2290,6 +2320,10 @@ async def repo_ecosystem(
     db: AsyncSession = Depends(get_db),
 ):
     """Walk the dependency graph 2 levels deep from a repo."""
+    if len(name) > 100:
+        raise HTTPException(status_code=400, detail="Name too long")
+    if len(name) > 100:
+        raise HTTPException(status_code=400, detail="Name too long")
     cache_key = f"ecosystem:{name}"
     cached = await cache.get(cache_key)
     if cached:
@@ -2446,7 +2480,7 @@ async def momentum_repos(
 @_limiter.limit("30/minute")
 async def category_leaders(
     request: Request,
-    category: str = Query(...),
+    category: str = Query(..., max_length=100),
     limit: int = Query(5, ge=1, le=20),
     db: AsyncSession = Depends(get_db),
 ):
