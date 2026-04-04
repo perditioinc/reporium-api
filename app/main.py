@@ -14,6 +14,7 @@ from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
 
 from app.cache import cache
+from app.rate_limit import rate_limit_storage
 from app.database import async_session_factory, check_db_connection, engine
 from app.routers import admin, analytics, graph, ingest, intelligence, library, library_full, nl_filter, platform, recommendations, repos, search, taxonomy, trends, webhooks, wiki
 
@@ -66,7 +67,7 @@ _rate_limits = [] if os.environ.get("RATELIMIT_ENABLED", "1") == "0" else ["200 
 limiter = Limiter(
     key_func=get_remote_address,
     default_limits=_rate_limits,
-    storage_uri="memory://",
+    storage_uri=rate_limit_storage,
 )
 
 app = FastAPI(

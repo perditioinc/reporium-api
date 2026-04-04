@@ -21,10 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import CACHE_TTL_STATS, cache
 from app.database import get_db
+from app.rate_limit import rate_limit_storage
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Repos"])
-_limiter = Limiter(key_func=get_remote_address)
+_limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 _DEFAULT_SIMILAR_LIMIT = 8
 _DEFAULT_REC_LIMIT = 12

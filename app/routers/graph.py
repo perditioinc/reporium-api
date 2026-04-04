@@ -17,9 +17,10 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.rate_limit import rate_limit_storage
 
 router = APIRouter(tags=["Graph"])
-_limiter = Limiter(key_func=get_remote_address)
+_limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 
 @router.get("/graph/edges")
