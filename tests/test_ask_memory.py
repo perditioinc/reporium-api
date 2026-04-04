@@ -178,14 +178,14 @@ async def test_ask_without_session_id_is_backward_compatible(client: AsyncClient
 
     app.dependency_overrides[get_db] = override
     try:
-        with patch("app.routers.intelligence.get_anthropic_key", return_value="sk-test"), \
-             patch("app.routers.intelligence.anthropic.Anthropic") as MockClient, \
+        mock_client = MagicMock()
+        mock_client.messages.create.return_value = claude_resp
+        with patch("app.routers.intelligence._get_client", return_value=mock_client), \
              patch("app.routers.intelligence.get_embedding_model") as mock_model, \
              patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(return_value=None)), \
              patch("app.routers.intelligence._log_query", new=AsyncMock()), \
              patch("app.routers.intelligence._try_smart_route", new=AsyncMock(return_value=None)):
             mock_model.return_value.encode.return_value = np.zeros(384)
-            MockClient.return_value.messages.create.return_value = claude_resp
             resp = await client.post(
                 "/intelligence/ask",
                 json={"question": "What repos use LangChain?"},
@@ -218,14 +218,14 @@ async def test_ask_with_session_id_prepends_history_to_claude(client: AsyncClien
 
     app.dependency_overrides[get_db] = override
     try:
-        with patch("app.routers.intelligence.get_anthropic_key", return_value="sk-test"), \
-             patch("app.routers.intelligence.anthropic.Anthropic") as MockClient, \
+        mock_client = MagicMock()
+        mock_client.messages.create.side_effect = _fake_create
+        with patch("app.routers.intelligence._get_client", return_value=mock_client), \
              patch("app.routers.intelligence.get_embedding_model") as mock_model, \
              patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(return_value=None)), \
              patch("app.routers.intelligence._log_query", new=AsyncMock()), \
              patch("app.routers.intelligence._save_session_turn", new=AsyncMock()):
             mock_model.return_value.encode.return_value = np.zeros(384)
-            MockClient.return_value.messages.create.side_effect = _fake_create
             resp = await client.post(
                 "/intelligence/ask",
                 json={

@@ -175,13 +175,14 @@ def _patch_embedding_model():
 
 
 def _patch_anthropic(answer_text: str = CONTROLLED_ANSWER):
-    """Patch the Anthropic client constructor to return a controlled answer."""
+    """Patch _get_client() to return a mock client with a controlled answer."""
     mock_client = MagicMock()
     mock_client.messages.create.return_value = _make_anthropic_message(answer_text)
-    return patch("anthropic.Anthropic", return_value=mock_client)
+    return patch("app.routers.intelligence._get_client", return_value=mock_client)
 
 
 def _patch_anthropic_key():
+    """No-op kept for backward compat — _get_client bypasses get_anthropic_key."""
     return patch(
         "app.routers.intelligence.get_anthropic_key",
         return_value="sk-ant-test-key",

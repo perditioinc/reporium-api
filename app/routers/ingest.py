@@ -49,7 +49,9 @@ events_router = APIRouter(
     tags=["Ingest"],
     dependencies=[Depends(require_ingest_key), Depends(require_pubsub_push)],
 )
-limiter = Limiter(key_func=get_remote_address)
+from app.rate_limit import rate_limit_storage
+
+limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 MAX_BATCH = 100
 
