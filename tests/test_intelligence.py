@@ -420,7 +420,7 @@ async def test_run_query_raises_504_on_claude_timeout():
 
     with patch("app.routers.intelligence.get_embedding_model", return_value=fake_model), \
          patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(side_effect=_no_cache)), \
-         patch("app.routers.intelligence._get_anthropic_key", return_value="sk-fake"), \
+         patch("app.routers.intelligence.get_anthropic_key", return_value="sk-fake"), \
          patch("app.routers.intelligence.anthropic.Anthropic"), \
          patch("app.routers.intelligence.asyncio.wait_for", side_effect=_asyncio.TimeoutError):
         # Provide a minimal DB result so the vector search completes
