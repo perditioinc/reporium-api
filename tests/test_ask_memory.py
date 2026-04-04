@@ -131,12 +131,15 @@ async def test_load_session_turns_returns_empty_on_db_error():
 
 @pytest.mark.asyncio
 async def test_save_session_turn_does_not_raise_on_error():
-    """DB error during save is non-fatal."""
+    """DB error during save is non-fatal — _save_session_turn uses its own session."""
     mock_db = AsyncMock()
     mock_db.execute = AsyncMock(side_effect=Exception("DB write failed"))
+    mock_db.__aenter__ = AsyncMock(return_value=mock_db)
+    mock_db.__aexit__ = AsyncMock(return_value=False)
 
-    # Should not raise
-    await _save_session_turn(_SESSION_ID, "question", "answer", mock_db)
+    with patch("app.routers.intelligence.async_session_factory", return_value=mock_db):
+        # Should not raise
+        await _save_session_turn(_SESSION_ID, "question", "answer")
 
 
 @pytest.mark.asyncio
@@ -150,8 +153,11 @@ async def test_save_session_turn_increments_turn_number():
     insert_result = MagicMock()
     mock_db.execute = AsyncMock(side_effect=[scalar_result, insert_result])
     mock_db.commit = AsyncMock()
+    mock_db.__aenter__ = AsyncMock(return_value=mock_db)
+    mock_db.__aexit__ = AsyncMock(return_value=False)
 
-    await _save_session_turn(_SESSION_ID, "q", "a", mock_db)
+    with patch("app.routers.intelligence.async_session_factory", return_value=mock_db):
+        await _save_session_turn(_SESSION_ID, "q", "a")
 
     # Python computes next_turn = max_turn + 1 = 2 + 1 = 3
     calls = mock_db.execute.call_args_list
@@ -176,7 +182,8 @@ async def test_ask_without_session_id_is_backward_compatible(client: AsyncClient
              patch("app.routers.intelligence.anthropic.Anthropic") as MockClient, \
              patch("app.routers.intelligence.get_embedding_model") as mock_model, \
              patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(return_value=None)), \
-             patch("app.routers.intelligence._log_query", new=AsyncMock()):
+             patch("app.routers.intelligence._log_query", new=AsyncMock()), \
+             patch("app.routers.intelligence._try_smart_route", new=AsyncMock(return_value=None)):
             mock_model.return_value.encode.return_value = np.zeros(384)
             MockClient.return_value.messages.create.return_value = claude_resp
             resp = await client.post(
