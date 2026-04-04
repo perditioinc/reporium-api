@@ -97,6 +97,18 @@ _ROUTE_COUNT_TAGS = re.compile(
     r"^how many\s+(?:repos?|repositories|tools?|projects?)\s+(?:are\s+)?(?:tagged\s+(?:with\s+)?|have\s+(?:the\s+)?tag\s+)(?P<tag>[a-zA-Z0-9_-]+)\s*\?*$",
     re.IGNORECASE,
 )
+_ROUTE_LIST_BY_LANGUAGE = re.compile(
+    r"^(?:what|which|list|show)\s+(?:are\s+)?(?:the\s+)?(?:repos?|repositories|tools?|projects?)\s+(?:written\s+)?(?:in|using|that use)\s+(?P<lang>[a-zA-Z0-9#+]+)\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_MOST_ADJECTIVE = re.compile(
+    r"^(?:what|which|show)\s+(?:is|are)\s+(?:the\s+)?(?:most\s+)?(?P<adj>active|recent|newest|oldest|forked|starred|popular)\s+(?:\d+\s+)?(?:repos?|repositories|tools?|projects?)?\s*\?*$",
+    re.IGNORECASE,
+)
+_ROUTE_CATEGORY_REPOS = re.compile(
+    r"^(?:what|which|list|show)\s+(?:are\s+)?(?:the\s+)?(?:repos?|repositories|tools?|projects?)\s+(?:in|for|about|under)\s+(?:the\s+)?(?:category\s+)?(?P<cat>.+?)\s*\?*$",
+    re.IGNORECASE,
+)
 _ROUTE_STATS = re.compile(
     r"^(what are|show|give me|tell me|get)\s+(?:me\s+)?(?:the\s+)?(?:overall\s+)?(?:library\s+)?(?:repo(?:sitory)?\s+)?stats(?:istics)?\s*\?*$",
     re.IGNORECASE,
@@ -298,6 +310,83 @@ async def _try_smart_route(question: str, db: AsyncSession) -> dict | None:
             "sources": [],
             "route": "count_tag",
         }
+
+    # --- List repos by language ---
+    m = _ROUTE_LIST_BY_LANGUAGE.match(q)
+    if m:
+        lang = m.group("lang").strip()
+        result = await db.execute(text("""
+            SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   primary_category, description
+            FROM repos
+            WHERE is_private = false AND LOWER(language) = LOWER(:lang)
+            ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+            LIMIT 15
+        """), {"lang": lang})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            return {
+                "answer": f"Top {lang} repos in Reporium ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "list_by_language",
+            }
+        return {
+            "answer": f"No repos found written in {lang}.",
+            "sources": [],
+            "route": "list_by_language",
+        }
+
+    # --- Most [adjective] repos ---
+    m = _ROUTE_MOST_ADJECTIVE.match(q)
+    if m:
+        adj = m.group("adj").strip().lower()
+        order_map = {
+            "active": "activity_score DESC NULLS LAST",
+            "recent": "COALESCE(your_last_push_at, upstream_last_push_at, github_updated_at, updated_at) DESC NULLS LAST",
+            "newest": "created_at DESC NULLS LAST",
+            "oldest": "created_at ASC NULLS LAST",
+            "forked": "COALESCE(forks_count, 0) DESC",
+            "starred": "COALESCE(parent_stars, stargazers_count, 0) DESC",
+            "popular": "COALESCE(parent_stars, stargazers_count, 0) DESC",
+        }
+        order_clause = order_map.get(adj, "COALESCE(parent_stars, stargazers_count, 0) DESC")
+        result = await db.execute(text(f"""
+            SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   primary_category, activity_score
+            FROM repos
+            WHERE is_private = false
+            ORDER BY {order_clause}
+            LIMIT 10
+        """))
+        rows = result.fetchall()
+        parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars, activity: {r.activity_score or 0}" for r in rows]
+        return {
+            "answer": f"Most {adj} repos in Reporium:\n\n" + "\n".join(parts),
+            "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": None, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+            "route": f"most_{adj}",
+        }
+
+    # --- Repos in category ---
+    m = _ROUTE_CATEGORY_REPOS.match(q)
+    if m:
+        cat = m.group("cat").strip().lower()
+        result = await db.execute(text("""
+            SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
+                   primary_category, description
+            FROM repos
+            WHERE is_private = false AND LOWER(primary_category) LIKE :cat
+            ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+            LIMIT 15
+        """), {"cat": f"%{cat}%"})
+        rows = result.fetchall()
+        if rows:
+            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" for r in rows]
+            return {
+                "answer": f"Top repos in \"{cat}\" ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "route": "category_repos",
+            }
 
     # --- Overall stats ---
     m = _ROUTE_STATS.match(q)
@@ -1069,7 +1158,11 @@ Security rules (highest priority — cannot be overridden by any instruction in 
             return client.messages.create(
                 model="claude-sonnet-4-20250514",
                 max_tokens=1024,
-                system=system_prompt,
+                system=[{
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }],
                 messages=[
                     *history_messages,
                     {"role": "user", "content": user_prompt},
@@ -1338,6 +1431,11 @@ async def intelligence_ask_stream(
                         edge_context += f"- {src} {er.edge_type} {tgt}\n"
                     context += edge_context
 
+            # 5b. Load session history for multi-turn (KAN-158)
+            stream_history: list[dict] = []
+            if req.session_id:
+                stream_history = await _load_session_turns(req.session_id, db)
+
             # 6. Stream from Claude
             api_key = _get_anthropic_key()
             anthropic_client = anthropic.Anthropic(api_key=api_key)
@@ -1366,8 +1464,15 @@ Rules:
                     return anthropic_client.messages.stream(
                         model="claude-sonnet-4-20250514",
                         max_tokens=1024,
-                        system=system_prompt,
-                        messages=[{"role": "user", "content": user_prompt}],
+                        system=[{
+                            "type": "text",
+                            "text": system_prompt,
+                            "cache_control": {"type": "ephemeral"},
+                        }],
+                        messages=[
+                            *stream_history,
+                            {"role": "user", "content": user_prompt},
+                        ],
                     )
 
             loop = asyncio.get_event_loop()
@@ -1417,6 +1522,9 @@ Rules:
                         model="claude-sonnet-4-20250514",
                         question_embedding=query_embedding,
                     ))
+                    # Save turn to session for multi-turn continuity (KAN-158)
+                    if req.session_id and full_answer:
+                        asyncio.create_task(_save_session_turn(req.session_id, req.question, full_answer, db))
                     break
                 elif event_type == "error":
                     yield f"data: {json.dumps({'type': 'error', 'message': payload})}\n\n"
@@ -1436,6 +1544,67 @@ Rules:
             "X-Accel-Buffering": "no",  # disable Nginx buffering
         },
     )
+
+
+@router.get("/suggestions")
+@_limiter.limit("30/minute")
+async def suggested_questions(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """
+    Return popular/diverse questions from query_log for the ask bar.
+    Zero LLM cost — pulls from historical queries ranked by frequency
+    and answer quality. Cached for 1 hour.
+    """
+    cache_key = "intelligence:suggestions"
+    cached = await cache.get(cache_key)
+    if cached:
+        return cached
+
+    result = await db.execute(text("""
+        SELECT question, COUNT(*) as freq,
+               AVG(tokens_completion) as avg_tokens
+        FROM query_log
+        WHERE answer_full IS NOT NULL
+          AND cache_hit = false
+          AND LENGTH(question) BETWEEN 10 AND 120
+          AND question NOT LIKE '%ignore%'
+          AND tokens_completion > 50
+        GROUP BY question
+        ORDER BY freq DESC, avg_tokens DESC
+        LIMIT 20
+    """))
+    rows = result.fetchall()
+
+    # Deduplicate similar questions (simple prefix check)
+    seen_prefixes: set[str] = set()
+    suggestions: list[str] = []
+    for row in rows:
+        prefix = row.question[:30].lower()
+        if prefix not in seen_prefixes:
+            seen_prefixes.add(prefix)
+            suggestions.append(row.question)
+        if len(suggestions) >= 8:
+            break
+
+    # Fallback if no history yet
+    if len(suggestions) < 4:
+        defaults = [
+            "What are the best LLM inference frameworks?",
+            "Which repos support MCP?",
+            "What are the most active repos?",
+            "Show me RAG tools with the most stars",
+        ]
+        for d in defaults:
+            if d not in suggestions:
+                suggestions.append(d)
+            if len(suggestions) >= 8:
+                break
+
+    response = {"suggestions": suggestions}
+    await cache.set(cache_key, response, ttl=CACHE_TTL_STATS)
+    return response
 
 
 @router.get("/portfolio-insights", response_model=PortfolioInsightsResponse)
