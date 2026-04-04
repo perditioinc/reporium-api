@@ -54,7 +54,7 @@ _INJECTION_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-_MAX_CONTENT_LEN = 400  # max chars per repo field in context
+_MAX_CONTENT_LEN = 200  # max chars per repo field in context (reduced from 400 for cost)
 
 # ---------------------------------------------------------------------------
 # KAN-197: Lazy singleton Anthropic client — avoids creating a new client per request
@@ -68,7 +68,7 @@ def _get_client() -> anthropic.Anthropic:
         from app.utils import get_anthropic_key
         _anthropic_client = anthropic.Anthropic(api_key=get_anthropic_key())
     return _anthropic_client
-_SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.12  # cosine distance ≤0.12 ≈ similarity ≥0.88 — balances hit rate vs quality
+_SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.15  # cosine distance ≤0.15 ≈ similarity ≥0.85 — relaxed for more cache hits
 
 # ---------------------------------------------------------------------------
 # KAN-124: Tiered model selection — Haiku for simple queries, Sonnet for complex
@@ -1094,7 +1094,7 @@ async def _save_session_turn(session_id: str, question: str, answer: str) -> Non
 
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=3, max_length=500)
-    top_k: int = Field(default=10, ge=1, le=50)
+    top_k: int = Field(default=5, ge=1, le=50)
     session_id: str | None = Field(
         default=None,
         description=(
@@ -1248,7 +1248,17 @@ async def _find_semantic_cache_hit(
     return row.answer_full, _coerce_cached_sources(row.sources), row.model
 
 
+_SIGNAL_CACHE_TTL = 300  # 5 minutes — signals don't change frequently
+
+
 async def _taxonomy_gap_signals(db: AsyncSession, limit: int = 6) -> list[TaxonomyGapSignal]:
+    cache_key = f"signals:taxonomy_gaps:{limit}"
+    try:
+        cached = await cache.get(cache_key)
+        if cached:
+            return [TaxonomyGapSignal(**c) for c in cached]
+    except Exception:
+        pass
     result = await db.execute(
         text("""
             SELECT dimension, name, repo_count, trending_score, description
@@ -1260,7 +1270,7 @@ async def _taxonomy_gap_signals(db: AsyncSession, limit: int = 6) -> list[Taxono
         """),
         {"limit": limit},
     )
-    return [
+    gaps = [
         TaxonomyGapSignal(
             dimension=row.dimension,
             value=row.name,
@@ -1270,9 +1280,21 @@ async def _taxonomy_gap_signals(db: AsyncSession, limit: int = 6) -> list[Taxono
         )
         for row in result.fetchall()
     ]
+    try:
+        await cache.set(cache_key, [g.model_dump() for g in gaps], ttl=_SIGNAL_CACHE_TTL)
+    except Exception:
+        pass
+    return gaps
 
 
 async def _stale_repo_signals(db: AsyncSession, limit: int = 6) -> list[StaleRepoSignal]:
+    cache_key = f"signals:stale_repos:{limit}"
+    try:
+        cached = await cache.get(cache_key)
+        if cached:
+            return [StaleRepoSignal(**c) for c in cached]
+    except Exception:
+        pass
     result = await db.execute(
         text("""
             SELECT name,
@@ -1291,7 +1313,7 @@ async def _stale_repo_signals(db: AsyncSession, limit: int = 6) -> list[StaleRep
         """),
         {"limit": limit},
     )
-    return [
+    signals = [
         StaleRepoSignal(
             repo_name=row.name,
             owner=row.owner,
@@ -1303,9 +1325,21 @@ async def _stale_repo_signals(db: AsyncSession, limit: int = 6) -> list[StaleRep
         )
         for row in result.fetchall()
     ]
+    try:
+        await cache.set(cache_key, [s.model_dump() for s in signals], ttl=_SIGNAL_CACHE_TTL)
+    except Exception:
+        pass
+    return signals
 
 
 async def _velocity_leader_signals(db: AsyncSession, limit: int = 6) -> list[VelocityLeaderSignal]:
+    cache_key = f"signals:velocity_leaders:{limit}"
+    try:
+        cached = await cache.get(cache_key)
+        if cached:
+            return [VelocityLeaderSignal(**c) for c in cached]
+    except Exception:
+        pass
     result = await db.execute(
         text("""
             SELECT name, owner, github_url, commits_last_7_days, commits_last_30_days, activity_score
@@ -1317,7 +1351,7 @@ async def _velocity_leader_signals(db: AsyncSession, limit: int = 6) -> list[Vel
         """),
         {"limit": limit},
     )
-    return [
+    signals = [
         VelocityLeaderSignal(
             repo_name=row.name,
             owner=row.owner,
@@ -1328,6 +1362,11 @@ async def _velocity_leader_signals(db: AsyncSession, limit: int = 6) -> list[Vel
         )
         for row in result.fetchall()
     ]
+    try:
+        await cache.set(cache_key, [s.model_dump() for s in signals], ttl=_SIGNAL_CACHE_TTL)
+    except Exception:
+        pass
+    return signals
 
 
 async def _near_duplicate_signals(db: AsyncSession, limit: int = 4) -> list[DuplicateClusterSignal]:
