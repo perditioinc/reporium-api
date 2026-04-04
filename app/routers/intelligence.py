@@ -26,9 +26,10 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
-from app.auth import verify_api_key
+from app.auth import require_app_token, verify_api_key
 from app.cache import CACHE_TTL_STATS, cache
 from app.circuit_breaker import anthropic_breaker
+from app.cost_tracker import check_budget, record_cost
 from app.database import async_session_factory, get_db
 from app.embeddings import get_embedding_model
 from app.models.session import AskSession
@@ -1531,6 +1532,13 @@ async def _run_query(
                 effective_session_id,
             )
 
+    # Daily cost cap check — reject before calling Claude if budget exhausted
+    if not check_budget():
+        raise HTTPException(
+            status_code=503,
+            detail="Service temporarily unavailable — daily usage limit reached. Try again tomorrow.",
+        )
+
     # Select model based on question complexity
     selected_model = _select_model(req.question, len(top_for_answer))
     logger.info("Model selected: %s for question length %d, %d repos", selected_model, len(req.question), len(top_for_answer))
@@ -1590,6 +1598,10 @@ async def _run_query(
         "output": message.usage.output_tokens,
         "total": message.usage.input_tokens + message.usage.output_tokens,
     }
+
+    # Record estimated cost (Haiku ~$0.0005/call, Sonnet ~$0.01/call)
+    _est_cost = 0.0005 if "haiku" in selected_model else 0.01
+    record_cost(_est_cost, model=selected_model)
 
     # 5. Build response
     sources = []
@@ -1662,15 +1674,16 @@ async def intelligence_query(
 
 
 @router.post("/ask", response_model=QueryResponse)
-@_limiter.limit("10/minute;100/day")
+@_limiter.limit("6/minute;60/day")
 async def intelligence_ask(
     request: Request,  # required by SlowAPI for IP-based rate limiting
     req: QueryRequest,
     db: AsyncSession = Depends(get_db),
+    _app: None = Depends(require_app_token),
 ):
     """
-    Public endpoint — no auth required. Ask a natural language question about
-    the repo knowledge base. Rate limited to 10/minute and 100/day per IP.
+    Public endpoint — requires X-App-Token header. Ask a natural language question
+    about the repo knowledge base. Rate limited to 6/minute and 60/day per IP.
 
     Pass ``session_id`` (UUID) in the request body to enable conversational
     memory — the last 3 turns of that session will be prepended to context.
@@ -1679,21 +1692,22 @@ async def intelligence_ask(
 
 
 @router.post("/ask/stream")
-@_limiter.limit("10/minute;100/day")
+@_limiter.limit("6/minute;60/day")
 async def intelligence_ask_stream(
     request: Request,
     req: QueryRequest,
     db: AsyncSession = Depends(get_db),
+    _app: None = Depends(require_app_token),
 ) -> StreamingResponse:
     """
-    Public streaming endpoint — no auth required.
+    Streaming endpoint — requires X-App-Token header.
     Streams the answer as SSE events:
       data: {"type": "sources", "sources": [...]}   (sent immediately before generation)
       data: {"type": "token", "text": "..."}         (one per Claude streaming chunk)
       data: {"type": "done", "tokens": {...}}         (final event with usage stats)
       data: {"type": "error", "message": "..."}       (on failure)
 
-    Rate limited to 10/minute and 100/day per IP (same as /ask).
+    Rate limited to 6/minute and 60/day per IP (same as /ask).
     """
     client_ip = get_remote_address(request)
 
@@ -1948,7 +1962,11 @@ async def intelligence_ask_stream(
             if req.session_id:
                 stream_history = await _load_session_turns(req.session_id, db)
 
-            # 6. Stream from Claude (with tiered model selection)
+            # 6. Daily cost cap check — reject before calling Claude if budget exhausted
+            if not check_budget():
+                yield f"data: {json.dumps({'type': 'error', 'message': 'Service temporarily unavailable — daily usage limit reached. Try again tomorrow.'})}\n\n"
+                return
+
             stream_selected_model = _select_model(req.question, len(top_for_answer))
             logger.info("Model selected: %s for question length %d, %d repos", stream_selected_model, len(req.question), len(top_for_answer))
 
@@ -2019,6 +2037,9 @@ async def intelligence_ask_stream(
                     output_tokens = payload.usage.output_tokens
                     tokens_info = {'input': input_tokens, 'output': output_tokens, 'total': input_tokens + output_tokens}
                     yield f"data: {json.dumps({'type': 'done', 'tokens': tokens_info, 'model': stream_selected_model})}\n\n"
+                    # Record estimated cost
+                    _stream_est_cost = 0.0005 if "haiku" in stream_selected_model else 0.01
+                    record_cost(_stream_est_cost, model=stream_selected_model)
                     # Cache the full LLM response in Redis (30 min TTL)
                     asyncio.create_task(cache.set(stream_redis_key, {
                         "answer": full_answer,
@@ -2101,7 +2122,7 @@ async def suggested_questions(
 
 
 @router.get("/portfolio-insights", response_model=PortfolioInsightsResponse)
-@_limiter.limit("12/minute")
+@_limiter.limit("6/minute")
 async def portfolio_insights(
     request: Request,
     db: AsyncSession = Depends(get_db),
