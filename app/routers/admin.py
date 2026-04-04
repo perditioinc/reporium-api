@@ -409,18 +409,91 @@ async def backfill_embeddings(
 # tags, and readme_summary. Zero LLM cost — pure keyword matching.
 
 _PROTOCOL_RULES: list[tuple[str, list[str]]] = [
+    # --- Protocols ---
     ("MCP", [
         "mcp", "model context protocol", "mcp-server", "mcp server",
         "model-context-protocol", "mcp-client", "mcp plugin",
+        "mcp-tool", "modelcontextprotocol",
     ]),
     ("CLI", [
         "cli tool", "command-line", "command line interface",
         "cli interface", "terminal tool", "cli app", "cli utility",
-        "command line tool",
+        "command line tool", "cli framework", "cli library",
     ]),
     ("A2A", [
         "a2a", "agent-to-agent", "agent to agent", "a2a protocol",
-        "inter-agent", "multi-agent communication",
+        "inter-agent", "multi-agent communication", "agent communication",
+        "agent protocol",
+    ]),
+    # --- AI Frameworks & SDKs ---
+    ("LangChain", [
+        "langchain", "lang-chain", "langchain-community", "langserve",
+        "langsmith", "langgraph",
+    ]),
+    ("LlamaIndex", [
+        "llamaindex", "llama-index", "llama_index", "gpt-index",
+    ]),
+    ("CrewAI", [
+        "crewai", "crew-ai", "crew ai",
+    ]),
+    ("AutoGen", [
+        "autogen", "auto-gen", "pyautogen", "ag2",
+    ]),
+    ("Ollama", [
+        "ollama",
+    ]),
+    ("vLLM", [
+        "vllm", "v-llm",
+    ]),
+    ("HuggingFace", [
+        "huggingface", "hugging face", "transformers", "diffusers",
+        "datasets", "accelerate", "peft", "trl",
+    ]),
+    ("OpenAI", [
+        "openai", "gpt-4", "gpt-3", "chatgpt", "whisper", "dall-e",
+    ]),
+    ("Anthropic", [
+        "anthropic", "claude", "claude-api",
+    ]),
+    ("Vercel AI SDK", [
+        "ai sdk", "vercel ai", "@ai-sdk",
+    ]),
+    ("Streamlit", [
+        "streamlit",
+    ]),
+    ("Gradio", [
+        "gradio",
+    ]),
+    ("FastAPI", [
+        "fastapi", "fast-api",
+    ]),
+    ("Docker", [
+        "docker", "dockerfile", "docker-compose", "containerized",
+    ]),
+    ("Kubernetes", [
+        "kubernetes", "k8s", "helm chart",
+    ]),
+    ("RAG", [
+        "rag pipeline", "retrieval augmented", "retrieval-augmented",
+        "vector search", "vector database", "vector store",
+        "chromadb", "chroma", "pinecone", "weaviate", "qdrant", "milvus",
+    ]),
+    ("Fine-Tuning", [
+        "fine-tune", "fine-tuning", "finetuning", "finetune", "lora",
+        "qlora", "adapter", "sft", "rlhf", "dpo",
+    ]),
+    ("Agents", [
+        "ai agent", "autonomous agent", "agent framework", "tool-use",
+        "tool use", "function calling", "tool calling", "agentic",
+        "multi-agent", "agent orchestration",
+    ]),
+    ("Evaluation", [
+        "eval", "evaluation", "benchmark", "leaderboard", "scoring",
+        "llm judge", "red team",
+    ]),
+    ("Prompt Engineering", [
+        "prompt engineering", "prompt template", "prompt management",
+        "prompt chain", "prompt optimization", "dspy",
     ]),
 ]
 
@@ -434,7 +507,9 @@ async def tag_protocols(
 ):
     """
     Scan all public repos and tag with protocol indicators (MCP, CLI, A2A)
-    based on keyword matching in name, description, readme_summary, and tags.
+    and AI framework/SDK tags (LangChain, LlamaIndex, CrewAI, AutoGen,
+    Ollama, vLLM, HuggingFace, OpenAI, Anthropic, etc.) based on keyword
+    matching in name, description, readme_summary, and tags.
     Zero LLM cost — pure keyword matching.
     """
     # Fetch repos with their text fields and existing tags
