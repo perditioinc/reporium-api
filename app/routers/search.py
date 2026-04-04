@@ -12,8 +12,10 @@ from app.routers.library import _repo_to_summary
 from app.schemas.repo import RepoSemanticResult, RepoSummary
 from app.utils import vec_to_pg
 
+from app.rate_limit import rate_limit_storage
+
 router = APIRouter(tags=["Search"])
-limiter = Limiter(key_func=get_remote_address)
+limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 MAX_RESULTS = 20
 MAX_SEMANTIC_RESULTS = 50
