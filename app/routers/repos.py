@@ -24,8 +24,10 @@ from app.models.repo import (
 from app.routers.library import _repo_to_summary
 from app.schemas.repo import RepoDetail, RepoSummary
 
+from app.rate_limit import rate_limit_storage
+
 router = APIRouter(tags=["Repos"])
-_limiter = Limiter(key_func=get_remote_address)
+_limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 VALID_SORT = {"stars", "updated", "behind", "name"}
 VALID_SYNC = {"up-to-date", "behind", "ahead", "diverged"}

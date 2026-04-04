@@ -68,12 +68,11 @@ async def test_nl_filter_happy_path(client: AsyncClient):
     mock_resp = _mock_haiku_response(_GOOD_PARSE)
     breaker_mock = MagicMock(call=lambda fn: fn())
 
-    with patch("app.routers.nl_filter.get_anthropic_key", return_value="sk-test"), \
+    with patch("app.routers.nl_filter._get_client") as MockClient, \
          patch("app.routers.nl_filter.anthropic_breaker", breaker_mock), \
-         patch("anthropic.Anthropic") as MockAnthropic, \
          patch("app.routers.nl_filter.cache.get", return_value=None), \
          patch("app.routers.nl_filter.cache.set"):
-        MockAnthropic.return_value.messages.create.return_value = mock_resp
+        MockClient.return_value.messages.create.return_value = mock_resp
         resp = await client.post("/intelligence/nl-filter", json={"query": "Python RAG repos with 1000 stars"})
 
     assert resp.status_code == 200
@@ -99,12 +98,11 @@ async def test_nl_filter_invalid_category_nulled(client: AsyncClient):
     mock_resp = _mock_haiku_response(bad)
     breaker_mock = MagicMock(call=lambda fn: fn())
 
-    with patch("app.routers.nl_filter.get_anthropic_key", return_value="sk-test"), \
+    with patch("app.routers.nl_filter._get_client") as MockClient, \
          patch("app.routers.nl_filter.anthropic_breaker", breaker_mock), \
-         patch("anthropic.Anthropic") as MockAnthropic, \
          patch("app.routers.nl_filter.cache.get", return_value=None), \
          patch("app.routers.nl_filter.cache.set"):
-        MockAnthropic.return_value.messages.create.return_value = mock_resp
+        MockClient.return_value.messages.create.return_value = mock_resp
         resp = await client.post("/intelligence/nl-filter", json={"query": "Python RAG repos"})
 
     assert resp.status_code == 200
@@ -117,12 +115,11 @@ async def test_nl_filter_tags_truncated_to_five(client: AsyncClient):
     mock_resp = _mock_haiku_response(many_tags)
     breaker_mock = MagicMock(call=lambda fn: fn())
 
-    with patch("app.routers.nl_filter.get_anthropic_key", return_value="sk-test"), \
+    with patch("app.routers.nl_filter._get_client") as MockClient, \
          patch("app.routers.nl_filter.anthropic_breaker", breaker_mock), \
-         patch("anthropic.Anthropic") as MockAnthropic, \
          patch("app.routers.nl_filter.cache.get", return_value=None), \
          patch("app.routers.nl_filter.cache.set"):
-        MockAnthropic.return_value.messages.create.return_value = mock_resp
+        MockClient.return_value.messages.create.return_value = mock_resp
         resp = await client.post("/intelligence/nl-filter", json={"query": "repos with lots of tags"})
 
     assert resp.status_code == 200
@@ -155,11 +152,10 @@ async def test_nl_filter_json_parse_error_returns_502(client: AsyncClient):
     bad_msg.content = [MagicMock(text="this is not json at all")]
     breaker_mock = MagicMock(call=lambda fn: fn())
 
-    with patch("app.routers.nl_filter.get_anthropic_key", return_value="sk-test"), \
+    with patch("app.routers.nl_filter._get_client") as MockClient, \
          patch("app.routers.nl_filter.anthropic_breaker", breaker_mock), \
-         patch("anthropic.Anthropic") as MockAnthropic, \
          patch("app.routers.nl_filter.cache.get", return_value=None):
-        MockAnthropic.return_value.messages.create.return_value = bad_msg
+        MockClient.return_value.messages.create.return_value = bad_msg
         resp = await client.post("/intelligence/nl-filter", json={"query": "active Python repos"})
 
     assert resp.status_code == 502
