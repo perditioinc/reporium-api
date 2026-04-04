@@ -54,6 +54,47 @@ _MAX_CONTENT_LEN = 400  # max chars per repo field in context
 _SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.12  # cosine distance ≤0.12 ≈ similarity ≥0.88 — balances hit rate vs quality
 
 # ---------------------------------------------------------------------------
+# KAN-124: Tiered model selection — Haiku for simple queries, Sonnet for complex
+# ---------------------------------------------------------------------------
+_SIMPLE_PATTERNS = re.compile(
+    r"\b(list|show|which|what is|how many)\b",
+    re.IGNORECASE,
+)
+_COMPLEX_PATTERNS = re.compile(
+    r"\b(compare|analyze|explain why|difference|pros and cons|recommend|evaluate|assess)\b",
+    re.IGNORECASE,
+)
+
+_MODEL_HAIKU = "claude-haiku-4-5-20250414"
+_MODEL_SONNET = "claude-sonnet-4-20250514"
+
+
+def _select_model(question: str, num_repos: int) -> str:
+    """Return the appropriate Claude model based on question complexity heuristics."""
+    # Complex patterns always get Sonnet
+    if _COMPLEX_PATTERNS.search(question):
+        return _MODEL_SONNET
+    # Simple heuristics: short question + few repos, or simple discovery words
+    if len(question) < 60 and num_repos <= 5:
+        return _MODEL_HAIKU
+    if _SIMPLE_PATTERNS.search(question):
+        return _MODEL_HAIKU
+    # Default: Sonnet (safe fallback)
+    return _MODEL_SONNET
+
+
+# ---------------------------------------------------------------------------
+# KAN-124: Natural language edge type descriptions for knowledge graph context
+# ---------------------------------------------------------------------------
+_EDGE_TYPE_LABELS = {
+    "SIMILAR_TO": "similar approach",
+    "DEPENDS_ON": "dependency",
+    "FORK_OF": "fork",
+    "ALTERNATIVE_TO": "alternative",
+    "EXTENDS": "extends",
+}
+
+# ---------------------------------------------------------------------------
 # KAN-124: Smart routing — answer questions with SQL when possible, skip LLM
 # ---------------------------------------------------------------------------
 # Question patterns that can be answered without calling Claude.
@@ -915,6 +956,7 @@ class QueryResponse(BaseModel):
     answered_at: str
     embedding_candidates: int
     cache_hit: bool = False
+    cache_source: str | None = None
     tokens_used: dict
 
 
@@ -1243,6 +1285,36 @@ async def _run_query(
         ))
         return response
 
+    # 0b. Redis fast-path cache — check before embedding/pgvector (much faster)
+    redis_cache_key = f"llm_response:{hashlib.md5(req.question.lower().strip().encode()).hexdigest()}"
+    redis_cached = await cache.get(redis_cache_key)
+    if redis_cached is not None:
+        logger.info("ask: Redis cache hit for question")
+        cached_sources = _coerce_cached_sources(redis_cached.get("sources", []))
+        response = QueryResponse(
+            answer=redis_cached["answer"],
+            sources=cached_sources,
+            question=req.question,
+            model=redis_cached.get("model", "redis-cache"),
+            answered_at=datetime.now(timezone.utc).isoformat(),
+            embedding_candidates=0,
+            cache_hit=True,
+            cache_source="redis",
+            tokens_used=redis_cached.get("tokens_used", {"input": 0, "output": 0, "total": 0}),
+        )
+        asyncio.create_task(_log_query(
+            question=req.question,
+            answer=redis_cached["answer"],
+            sources=redis_cached.get("sources", []),
+            tokens_prompt=0,
+            tokens_completion=0,
+            hashed_ip=_hash_ip(client_ip),
+            latency_ms=int((time.monotonic() - _started_at) * 1000),
+            model=redis_cached.get("model", "redis-cache"),
+            cache_hit=True,
+        ))
+        return response
+
     model = get_embedding_model()
 
     # 1. Embed the question — model is pre-warmed at startup so this is fast
@@ -1259,19 +1331,18 @@ async def _run_query(
             answered_at=datetime.now(timezone.utc).isoformat(),
             embedding_candidates=0,
             cache_hit=True,
+            cache_source="semantic",
             tokens_used={"input": 0, "output": 0, "total": 0},
         )
         asyncio.create_task(_log_query(
             question=req.question,
             answer=cached_answer,
             sources=[source.model_dump() for source in cached_sources],
-            tokens_prompt=0,
-            tokens_completion=0,
+            tokens_prompt=0, tokens_completion=0,
             hashed_ip=_hash_ip(client_ip),
             latency_ms=int((time.monotonic() - _started_at) * 1000),
             model=cached_model or "semantic-cache",
-            question_embedding=query_embedding,
-            cache_hit=True,
+            question_embedding=query_embedding, cache_hit=True,
         ))
         return response
 
@@ -1371,32 +1442,80 @@ async def _run_query(
 
     context = "\n\n".join(context_parts)
 
-    # Also check knowledge graph edges for related repos
+    # Also check knowledge graph edges for related repos (with per-repo Redis caching)
     if top_for_answer:
         top_ids = [str(r["id"]) for r in top_for_answer[:5]]
-        # Cast uuid cols to text so asyncpg can match against a Python list of strings.
-        # Never interpolate IDs directly — pass as a bound parameter list.
-        edge_result = await db.execute(
-            text("""
-                SELECT e.edge_type, e.weight, e.evidence,
-                       r1.name as source_name, r1.forked_from as source_upstream,
-                       r2.name as target_name, r2.forked_from as target_upstream
-                FROM repo_edges e
-                JOIN repos r1 ON r1.id = e.source_repo_id
-                JOIN repos r2 ON r2.id = e.target_repo_id
-                WHERE e.source_repo_id::text = ANY(:ids)
-                   OR e.target_repo_id::text = ANY(:ids)
-                LIMIT 20;
-            """),
-            {"ids": top_ids},
-        )
-        edge_rows = edge_result.fetchall()
-        if edge_rows:
-            edge_context = "\n\nKnowledge graph relationships:\n"
+
+        # Check Redis cache for each repo's edges
+        cached_edges = {}
+        uncached_ids = []
+        for rid in top_ids:
+            cached_edge_data = await cache.get(f"graph_edges:{rid}")
+            if cached_edge_data is not None:
+                cached_edges[rid] = cached_edge_data
+            else:
+                uncached_ids.append(rid)
+
+        # Query DB only for uncached repo edges
+        new_edges: dict[str, list[dict]] = {}
+        if uncached_ids:
+            edge_result = await db.execute(
+                text("""
+                    SELECT e.edge_type, e.weight, e.evidence,
+                           e.source_repo_id::text as source_id,
+                           e.target_repo_id::text as target_id,
+                           r1.name as source_name, r1.forked_from as source_upstream,
+                           r2.name as target_name, r2.forked_from as target_upstream
+                    FROM repo_edges e
+                    JOIN repos r1 ON r1.id = e.source_repo_id
+                    JOIN repos r2 ON r2.id = e.target_repo_id
+                    WHERE e.source_repo_id::text = ANY(:ids)
+                       OR e.target_repo_id::text = ANY(:ids)
+                    LIMIT 20;
+                """),
+                {"ids": uncached_ids},
+            )
+            edge_rows = edge_result.fetchall()
+            # Group edges by repo ID for caching
             for er in edge_rows:
-                src = er.source_upstream or er.source_name
-                tgt = er.target_upstream or er.target_name
-                edge_context += f"- {src} {er.edge_type} {tgt} (evidence: {er.evidence})\n"
+                edge_data = {
+                    "edge_type": er.edge_type,
+                    "source_name": er.source_upstream or er.source_name,
+                    "target_name": er.target_upstream or er.target_name,
+                }
+                for rid in uncached_ids:
+                    if rid == er.source_id or rid == er.target_id:
+                        new_edges.setdefault(rid, []).append(edge_data)
+            # Cache each repo's edges individually
+            for rid in uncached_ids:
+                edges_for_rid = new_edges.get(rid, [])
+                await cache.set(f"graph_edges:{rid}", edges_for_rid, ttl=3600)
+
+        # Merge cached and newly fetched edges, format as natural language context
+        all_edge_data: list[dict] = []
+        for rid in top_ids:
+            if rid in cached_edges:
+                all_edge_data.extend(cached_edges[rid])
+            elif rid in new_edges:
+                all_edge_data.extend(new_edges[rid])
+
+        if all_edge_data:
+            # Deduplicate edges by (source, target, type)
+            seen_edges: set[tuple[str, str, str]] = set()
+            unique_edges: list[dict] = []
+            for e in all_edge_data:
+                key = (e["source_name"], e["target_name"], e["edge_type"])
+                if key not in seen_edges:
+                    seen_edges.add(key)
+                    unique_edges.append(e)
+
+            # Format as natural language related repos context
+            edge_context = "\n\nRelated repos: "
+            edge_parts = []
+            for e in unique_edges:
+                label = _EDGE_TYPE_LABELS.get(e["edge_type"], e["edge_type"].lower())
+                edge_parts.append(f"{e['target_name']} ({label})")
+            edge_context += ", ".join(edge_parts)
             context += edge_context
 
     # 4. Call Claude
@@ -1411,6 +1530,10 @@ async def _run_query(
                 len(history_messages) // 2,
                 effective_session_id,
             )
+
+    # Select model based on question complexity
+    selected_model = _select_model(req.question, len(top_for_answer))
+    logger.info("Model selected: %s for question length %d, %d repos", selected_model, len(req.question), len(top_for_answer))
 
     api_key = _get_anthropic_key()
     client = anthropic.Anthropic(api_key=api_key)
@@ -1431,7 +1554,7 @@ async def _run_query(
     def _call_claude():
         with anthropic_breaker:
             return client.messages.create(
-                model="claude-sonnet-4-20250514",
+                model=selected_model,
                 max_tokens=1024,
                 system=[{
                     "type": "text",
@@ -1486,12 +1609,20 @@ async def _run_query(
         answer=answer,
         sources=sources,
         question=req.question,
-        model="claude-sonnet-4-20250514",
+        model=selected_model,
         answered_at=datetime.now(timezone.utc).isoformat(),
         embedding_candidates=len(scored),
         cache_hit=False,
         tokens_used=tokens_used,
     )
+
+    # Cache the full LLM response in Redis for fast-path on repeat questions (30 min TTL)
+    asyncio.create_task(cache.set(redis_cache_key, {
+        "answer": answer,
+        "sources": [source.model_dump() for source in sources],
+        "tokens_used": tokens_used,
+        "model": selected_model,
+    }, ttl=1800))
 
     # Fire-and-forget — log after response is built, never blocks the caller
     asyncio.create_task(_log_query(
@@ -1502,7 +1633,7 @@ async def _run_query(
         tokens_completion=message.usage.output_tokens,
         hashed_ip=_hash_ip(client_ip),
         latency_ms=int((time.monotonic() - _started_at) * 1000),
-        model="claude-sonnet-4-20250514",
+        model=selected_model,
         question_embedding=query_embedding,
     ))
 
@@ -1594,6 +1725,30 @@ async def intelligence_ask_stream(
                 ))
                 return
 
+            # 0b. Redis fast-path cache
+            stream_redis_key = f"llm_response:{hashlib.md5(req.question.lower().strip().encode()).hexdigest()}"
+            stream_redis_cached = await cache.get(stream_redis_key)
+            if stream_redis_cached is not None:
+                logger.info("ask/stream: Redis cache hit")
+                redis_sources = _coerce_cached_sources(stream_redis_cached.get("sources", []))
+                yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in redis_sources], 'cache_hit': True, 'cache_source': 'redis'})}\n\n"
+                words = stream_redis_cached["answer"].split(" ")
+                for i, word in enumerate(words):
+                    chunk = word + (" " if i < len(words) - 1 else "")
+                    yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
+                    await asyncio.sleep(0)
+                yield f"data: {json.dumps({'type': 'done', 'tokens': stream_redis_cached.get('tokens_used', {'input': 0, 'output': 0, 'total': 0}), 'cache_hit': True, 'cache_source': 'redis', 'model': stream_redis_cached.get('model', 'redis-cache')})}\n\n"
+                asyncio.create_task(_log_query(
+                    question=req.question, answer=stream_redis_cached["answer"],
+                    sources=stream_redis_cached.get("sources", []),
+                    tokens_prompt=0, tokens_completion=0,
+                    hashed_ip=_hash_ip(client_ip),
+                    latency_ms=int((time.monotonic() - _started_at) * 1000),
+                    model=stream_redis_cached.get("model", "redis-cache"),
+                    cache_hit=True,
+                ))
+                return
+
             model = get_embedding_model()
 
             # 1. Embed the question
@@ -1604,14 +1759,14 @@ async def intelligence_ask_stream(
             if cached is not None:
                 cached_answer, cached_sources, cached_model = cached
                 # Emit sources
-                yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in cached_sources], 'cache_hit': True})}\n\n"
+                yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in cached_sources], 'cache_hit': True, 'cache_source': 'semantic'})}\n\n"
                 # Stream answer word-by-word (simulate streaming for cache hits)
                 words = cached_answer.split(" ")
                 for i, word in enumerate(words):
                     chunk = word + (" " if i < len(words) - 1 else "")
                     yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
                     await asyncio.sleep(0)  # yield control
-                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'cache_hit': True})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'cache_hit': True, 'cache_source': 'semantic'})}\n\n"
                 asyncio.create_task(_log_query(
                     question=req.question, answer=cached_answer,
                     sources=[s.model_dump() for s in cached_sources],
@@ -1716,28 +1871,76 @@ async def intelligence_ask_stream(
                 )
             context = "\n\n".join(context_parts)
 
-            # Knowledge graph edges
+            # Knowledge graph edges (with per-repo Redis caching)
             if top_for_answer:
                 top_ids = [str(r["id"]) for r in top_for_answer[:5]]
-                edge_result = await db.execute(
-                    text("""
-                        SELECT e.edge_type, r1.forked_from as source_upstream, r1.name as source_name,
-                               r2.forked_from as target_upstream, r2.name as target_name
-                        FROM repo_edges e
-                        JOIN repos r1 ON r1.id = e.source_repo_id
-                        JOIN repos r2 ON r2.id = e.target_repo_id
-                        WHERE e.source_repo_id::text = ANY(:ids) OR e.target_repo_id::text = ANY(:ids)
-                        LIMIT 20
-                    """),
-                    {"ids": top_ids},
-                )
-                edge_rows = edge_result.fetchall()
-                if edge_rows:
-                    edge_context = "\n\nKnowledge graph relationships:\n"
+
+                # Check Redis cache for each repo's edges
+                stream_cached_edges = {}
+                stream_uncached_ids = []
+                for rid in top_ids:
+                    cached_edge_data = await cache.get(f"graph_edges:{rid}")
+                    if cached_edge_data is not None:
+                        stream_cached_edges[rid] = cached_edge_data
+                    else:
+                        stream_uncached_ids.append(rid)
+
+                # Query DB only for uncached repo edges
+                stream_new_edges: dict[str, list[dict]] = {}
+                if stream_uncached_ids:
+                    edge_result = await db.execute(
+                        text("""
+                            SELECT e.edge_type,
+                                   e.source_repo_id::text as source_id,
+                                   e.target_repo_id::text as target_id,
+                                   r1.forked_from as source_upstream, r1.name as source_name,
+                                   r2.forked_from as target_upstream, r2.name as target_name
+                            FROM repo_edges e
+                            JOIN repos r1 ON r1.id = e.source_repo_id
+                            JOIN repos r2 ON r2.id = e.target_repo_id
+                            WHERE e.source_repo_id::text = ANY(:ids) OR e.target_repo_id::text = ANY(:ids)
+                            LIMIT 20
+                        """),
+                        {"ids": stream_uncached_ids},
+                    )
+                    edge_rows = edge_result.fetchall()
                     for er in edge_rows:
-                        src = er.source_upstream or er.source_name
-                        tgt = er.target_upstream or er.target_name
-                        edge_context += f"- {src} {er.edge_type} {tgt}\n"
+                        edge_data = {
+                            "edge_type": er.edge_type,
+                            "source_name": er.source_upstream or er.source_name,
+                            "target_name": er.target_upstream or er.target_name,
+                        }
+                        for rid in stream_uncached_ids:
+                            if rid == er.source_id or rid == er.target_id:
+                                stream_new_edges.setdefault(rid, []).append(edge_data)
+                    # Cache each repo's edges individually
+                    for rid in stream_uncached_ids:
+                        edges_for_rid = stream_new_edges.get(rid, [])
+                        await cache.set(f"graph_edges:{rid}", edges_for_rid, ttl=3600)
+
+                # Merge and format as natural language context
+                all_stream_edges: list[dict] = []
+                for rid in top_ids:
+                    if rid in stream_cached_edges:
+                        all_stream_edges.extend(stream_cached_edges[rid])
+                    elif rid in stream_new_edges:
+                        all_stream_edges.extend(stream_new_edges[rid])
+
+                if all_stream_edges:
+                    seen_edges: set[tuple[str, str, str]] = set()
+                    unique_edges: list[dict] = []
+                    for e in all_stream_edges:
+                        key = (e["source_name"], e["target_name"], e["edge_type"])
+                        if key not in seen_edges:
+                            seen_edges.add(key)
+                            unique_edges.append(e)
+
+                    edge_context = "\n\nRelated repos: "
+                    edge_parts = []
+                    for e in unique_edges:
+                        label = _EDGE_TYPE_LABELS.get(e["edge_type"], e["edge_type"].lower())
+                        edge_parts.append(f"{e['target_name']} ({label})")
+                    edge_context += ", ".join(edge_parts)
                     context += edge_context
 
             # 5b. Load session history for multi-turn (KAN-158)
@@ -1745,7 +1948,10 @@ async def intelligence_ask_stream(
             if req.session_id:
                 stream_history = await _load_session_turns(req.session_id, db)
 
-            # 6. Stream from Claude
+            # 6. Stream from Claude (with tiered model selection)
+            stream_selected_model = _select_model(req.question, len(top_for_answer))
+            logger.info("Model selected: %s for question length %d, %d repos", stream_selected_model, len(req.question), len(top_for_answer))
+
             api_key = _get_anthropic_key()
             anthropic_client = anthropic.Anthropic(api_key=api_key)
 
@@ -1762,7 +1968,7 @@ async def intelligence_ask_stream(
             def _stream_claude():
                 with anthropic_breaker:
                     return anthropic_client.messages.stream(
-                        model="claude-sonnet-4-20250514",
+                        model=stream_selected_model,
                         max_tokens=1024,
                         system=[{
                             "type": "text",
@@ -1811,7 +2017,15 @@ async def intelligence_ask_stream(
                 elif event_type == "done":
                     input_tokens = payload.usage.input_tokens
                     output_tokens = payload.usage.output_tokens
-                    yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': input_tokens, 'output': output_tokens, 'total': input_tokens + output_tokens}})}\n\n"
+                    tokens_info = {'input': input_tokens, 'output': output_tokens, 'total': input_tokens + output_tokens}
+                    yield f"data: {json.dumps({'type': 'done', 'tokens': tokens_info, 'model': stream_selected_model})}\n\n"
+                    # Cache the full LLM response in Redis (30 min TTL)
+                    asyncio.create_task(cache.set(stream_redis_key, {
+                        "answer": full_answer,
+                        "sources": [s.model_dump() for s in source_list],
+                        "tokens_used": tokens_info,
+                        "model": stream_selected_model,
+                    }, ttl=1800))
                     # Fire-and-forget log
                     asyncio.create_task(_log_query(
                         question=req.question, answer=full_answer,
@@ -1819,7 +2033,7 @@ async def intelligence_ask_stream(
                         tokens_prompt=input_tokens, tokens_completion=output_tokens,
                         hashed_ip=_hash_ip(client_ip),
                         latency_ms=int((time.monotonic() - _started_at) * 1000),
-                        model="claude-sonnet-4-20250514",
+                        model=stream_selected_model,
                         question_embedding=query_embedding,
                     ))
                     # Save turn to session for multi-turn continuity (KAN-158)
