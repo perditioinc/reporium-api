@@ -33,6 +33,7 @@ from app.auth import require_app_token
 from app.cache import cache
 from app.circuit_breaker import anthropic_breaker
 from app.cost_tracker import check_budget, record_cost
+from app.utils import get_anthropic_key
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/intelligence", tags=["Intelligence"])
@@ -76,21 +77,6 @@ Rules:
 - tags: extract meaningful keywords (e.g. "rag", "langchain", "fine-tuning") — max 5
 - exclude_archived: true if query mentions "active", "maintained", "recent", "working"
 - interpretation: be concise, use · as separator"""
-
-
-def _get_anthropic_key() -> str:
-    key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-    if key:
-        return key
-    try:
-        from google.cloud import secretmanager
-        client = secretmanager.SecretManagerServiceClient()
-        project = os.getenv("GCP_PROJECT", "perditio-platform")
-        name = f"projects/{project}/secrets/anthropic-api-key/versions/latest"
-        response = client.access_secret_version(request={"name": name})
-        return response.payload.data.decode("UTF-8").strip()
-    except Exception:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
 
 
 class NLFilterRequest(BaseModel):
@@ -158,7 +144,7 @@ async def nl_filter(
     )
 
     try:
-        api_key = _get_anthropic_key()
+        api_key = get_anthropic_key()
 
         def _call_haiku():
             client = anthropic.Anthropic(api_key=api_key)

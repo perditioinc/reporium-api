@@ -10,6 +10,7 @@ from app.embeddings import get_embedding_model
 from app.models.repo import Repo
 from app.routers.library import _repo_to_summary
 from app.schemas.repo import RepoSemanticResult, RepoSummary
+from app.utils import vec_to_pg
 
 router = APIRouter(tags=["Search"])
 limiter = Limiter(key_func=get_remote_address)
@@ -57,17 +58,13 @@ async def search_repos(
     return [_repo_to_summary(r) for r in repos]
 
 
-def _vec_to_pg(arr) -> str:
-    return "[" + ",".join(f"{x:.8f}" for x in arr.tolist()) + "]"
-
-
 async def _semantic_candidate_rows(
     db: AsyncSession,
     *,
     query_embedding,
     limit: int,
 ):
-    vec_str = _vec_to_pg(query_embedding)
+    vec_str = vec_to_pg(query_embedding)
     result = await db.execute(
         text("""
             SELECT r.id AS repo_id,
