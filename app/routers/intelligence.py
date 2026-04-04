@@ -1910,6 +1910,7 @@ async def _run_query(
 
 
 @router.post("/query", response_model=QueryResponse)
+@_limiter.limit("20/minute;200/hour")
 async def intelligence_query(
     request: Request,
     req: QueryRequest,
