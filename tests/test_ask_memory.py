@@ -131,12 +131,15 @@ async def test_load_session_turns_returns_empty_on_db_error():
 
 @pytest.mark.asyncio
 async def test_save_session_turn_does_not_raise_on_error():
-    """DB error during save is non-fatal."""
+    """DB error during save is non-fatal — _save_session_turn uses its own session."""
     mock_db = AsyncMock()
     mock_db.execute = AsyncMock(side_effect=Exception("DB write failed"))
+    mock_db.__aenter__ = AsyncMock(return_value=mock_db)
+    mock_db.__aexit__ = AsyncMock(return_value=False)
 
-    # Should not raise
-    await _save_session_turn(_SESSION_ID, "question", "answer", mock_db)
+    with patch("app.routers.intelligence.async_session_factory", return_value=mock_db):
+        # Should not raise
+        await _save_session_turn(_SESSION_ID, "question", "answer")
 
 
 @pytest.mark.asyncio
@@ -150,8 +153,11 @@ async def test_save_session_turn_increments_turn_number():
     insert_result = MagicMock()
     mock_db.execute = AsyncMock(side_effect=[scalar_result, insert_result])
     mock_db.commit = AsyncMock()
+    mock_db.__aenter__ = AsyncMock(return_value=mock_db)
+    mock_db.__aexit__ = AsyncMock(return_value=False)
 
-    await _save_session_turn(_SESSION_ID, "q", "a", mock_db)
+    with patch("app.routers.intelligence.async_session_factory", return_value=mock_db):
+        await _save_session_turn(_SESSION_ID, "q", "a")
 
     # Python computes next_turn = max_turn + 1 = 2 + 1 = 3
     calls = mock_db.execute.call_args_list
