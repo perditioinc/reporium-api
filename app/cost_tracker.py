@@ -13,7 +13,7 @@ def _today_key() -> str:
 
 
 async def check_budget() -> bool:
-    """Returns True if under daily cap. Falls back to allowing if Redis unavailable."""
+    """Returns True if under daily cap. Fails closed if Redis unavailable."""
     try:
         from app.cache import cache
         val = await cache.get(_today_key())
@@ -21,7 +21,8 @@ async def check_budget() -> bool:
             return True
         return float(val) < _DAILY_CAP
     except Exception:
-        return True  # Fail open if Redis is down
+        logger.error("Redis unavailable for budget check — rejecting LLM call")
+        return False  # Fail closed: block LLM calls when we can't verify budget
 
 
 async def record_cost(cost_usd: float, model: str = "unknown"):
