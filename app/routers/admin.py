@@ -478,7 +478,7 @@ async def tag_protocols(
 
     if not dry_run and inserts > 0:
         await db.commit()
-        await invalidate_library_cache()
+        invalidate_library_cache()
 
     return {
         "dry_run": dry_run,
