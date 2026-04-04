@@ -8,6 +8,7 @@ If the secret is not set, verification is skipped (dev-safe).
 
 import hashlib
 import hmac
+import json
 import logging
 import os
 
@@ -16,17 +17,22 @@ from fastapi import APIRouter, Header, HTTPException, Request, Response
 router = APIRouter(tags=["Webhooks"])
 logger = logging.getLogger(__name__)
 
+_IS_PRODUCTION = os.getenv("ENVIRONMENT") == "production"
+
 
 def _verify_signature(body: bytes, signature_header: str | None) -> bool:
     """
     Verify GitHub HMAC-SHA256 signature.
-    Returns True if signature is valid or if no secret is configured.
+    Returns True if signature is valid or if no secret is configured (dev only).
     Returns False if secret is configured but signature doesn't match.
+    In production, missing secret rejects all requests.
     """
     secret = os.getenv("GITHUB_WEBHOOK_SECRET", "")
     if not secret:
-        # Dev-safe: skip verification when secret is not configured
-        return True
+        if _IS_PRODUCTION:
+            logger.error("GITHUB_WEBHOOK_SECRET not set in production — rejecting")
+            return False
+        return True  # Dev-safe: skip verification only in non-production
 
     if not signature_header:
         return False
@@ -102,6 +108,6 @@ async def github_webhook(
     # Unknown/unsupported event — return 200 to avoid GitHub retries
     logger.info("Unhandled GitHub event type: %s", event_type)
     return Response(
-        content=f'{{"status":"ignored","event":"{event_type}"}}',
+        content=json.dumps({"status": "ignored", "event": event_type}),
         media_type="application/json",
     )

@@ -186,9 +186,9 @@ _ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://reporium.*\.vercel\.app",
+    allow_origin_regex=r"https://reporium(-[a-z0-9]+)*\.vercel\.app",
     allow_methods=["GET", "POST"],
-    allow_headers=["*"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Ingest-Key", "X-App-Token", "Accept"],
 )
 
 
@@ -252,7 +252,8 @@ if __name__ == "__main__":
 
 
 @app.get("/health")
-async def health():
+@limiter.limit("60/minute")
+async def health(request: Request):
     from sqlalchemy import text
 
     db_error: str | None = None
@@ -269,7 +270,7 @@ async def health():
             content={
                 "status": "degraded",
                 "db": "error",
-                "detail": db_error,
+                "detail": "database check failed",
             },
         )
 

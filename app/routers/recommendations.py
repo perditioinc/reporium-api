@@ -12,8 +12,10 @@ No Anthropic API calls — $0.00 per request.
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +24,7 @@ from app.database import get_db
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["Repos"])
+_limiter = Limiter(key_func=get_remote_address)
 
 _DEFAULT_SIMILAR_LIMIT = 8
 _DEFAULT_REC_LIMIT = 12
@@ -102,7 +105,9 @@ def _row_to_similar(row) -> SimilarRepo:
 # ---------------------------------------------------------------------------
 
 @router.get("/intelligence/similar/{name}", response_model=SimilarReposResponse)
+@_limiter.limit("30/minute")
 async def similar_repos(
+    request: Request,
     name: str,
     limit: int = Query(default=_DEFAULT_SIMILAR_LIMIT, ge=1, le=24),
     min_similarity: float = Query(default=_MIN_SIMILARITY, ge=0.0, le=1.0),
@@ -150,7 +155,9 @@ async def similar_repos(
 # ---------------------------------------------------------------------------
 
 @router.get("/intelligence/recommended", response_model=RecommendedReposResponse)
+@_limiter.limit("30/minute")
 async def recommended_repos(
+    request: Request,
     seeds: str = Query(
         ...,
         description="Comma-separated list of recently-viewed repo names (max 5)",

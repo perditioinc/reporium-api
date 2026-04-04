@@ -769,6 +769,7 @@ async def bootstrap_taxonomy(
 @router.get("/admin/health/data", response_model=dict)
 async def data_integrity_health(
     db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
     _admin_key: None = Depends(require_admin_key),
 ):
     """
@@ -868,7 +869,7 @@ async def data_integrity_health(
 @router.get(
     "/admin/runs",
     summary="List recent ingestion runs",
-    dependencies=[Depends(require_admin_key)],
+    dependencies=[Depends(require_admin_key), Depends(verify_api_key)],
 )
 async def list_runs(
     limit: int = Query(50, ge=1, le=200),
@@ -917,7 +918,7 @@ async def trigger_enrichment(
 @router.post(
     "/admin/runs",
     summary="Record a completed ingestion run",
-    dependencies=[Depends(require_admin_key)],
+    dependencies=[Depends(require_admin_key), Depends(verify_api_key)],
     status_code=201,
 )
 async def record_run(
