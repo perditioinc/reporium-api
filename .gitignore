@@ -49,3 +49,4 @@ migrations/versions/*.pyc
 *.pem
 *.key
 *.cert
+.claude/worktrees/
