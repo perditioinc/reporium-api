@@ -10,17 +10,22 @@ category-matching script.  The new approach uses the existing 384-dim
 nomic-embed-text embeddings and the HNSW index for fast ANN queries.
 """
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, Query, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 
 router = APIRouter(tags=["Graph"])
+_limiter = Limiter(key_func=get_remote_address)
 
 
 @router.get("/graph/edges")
+@_limiter.limit("20/minute")
 async def get_graph_edges(
+    request: Request,
     limit: int = Query(default=500, ge=1, le=10000),
     min_similarity: float = Query(default=0.55, ge=0.0, le=1.0,
                                   description="Minimum cosine similarity threshold"),
