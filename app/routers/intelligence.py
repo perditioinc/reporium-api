@@ -15,6 +15,7 @@ import os
 import re
 import time
 from datetime import datetime, timezone
+from uuid import UUID
 
 import anthropic
 import numpy as np
@@ -350,7 +351,11 @@ async def _try_smart_route(question: str, db: AsyncSession) -> dict | None:
             "starred": "COALESCE(parent_stars, stargazers_count, 0) DESC",
             "popular": "COALESCE(parent_stars, stargazers_count, 0) DESC",
         }
-        order_clause = order_map.get(adj, "COALESCE(parent_stars, stargazers_count, 0) DESC")
+        # KAN-124 (#4): Explicit allowlist guard — even if the regex is loosened
+        # later, only known adjectives can reach the f-string SQL interpolation.
+        if adj not in order_map:
+            return None
+        order_clause = order_map[adj]
         result = await db.execute(text(f"""
             SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
                    primary_category, activity_score
@@ -499,6 +504,9 @@ async def _log_query(
     cache_hit: bool = False,
 ) -> None:
     """Fire-and-forget: write one row to query_log. Never raises."""
+    # KAN-124 (#2): query_log stores user questions in plaintext. A periodic
+    # cleanup job should purge old rows to limit data-retention exposure, e.g.:
+    #   DELETE FROM query_log WHERE created_at < NOW() - INTERVAL '90 days';
     try:
         async with async_session_factory() as session:
             await session.execute(
@@ -594,6 +602,9 @@ async def _save_session_turn(
     session_id: str, question: str, answer: str, db: AsyncSession
 ) -> None:
     """Append one turn to ask_sessions. Fire-and-forget — never raises."""
+    # KAN-124 (#2): ask_sessions stores user questions and answers in plaintext.
+    # Like query_log, it needs a periodic TTL cleanup job, e.g.:
+    #   DELETE FROM ask_sessions WHERE created_at < NOW() - INTERVAL '90 days';
     try:
         # Determine the next turn number for this session
         result = await db.execute(
@@ -634,6 +645,17 @@ class QueryRequest(BaseModel):
             "prepended to Claude's context for conversational continuity."
         ),
     )
+
+    @field_validator("session_id")
+    @classmethod
+    def validate_session_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        try:
+            UUID(v)
+        except (ValueError, AttributeError):
+            raise ValueError("session_id must be a valid UUID")
+        return v
 
     @field_validator("question")
     @classmethod
