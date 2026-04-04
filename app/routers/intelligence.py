@@ -77,9 +77,14 @@ _ROUTE_TOP_STARRED = re.compile(
     re.IGNORECASE,
 )
 _ROUTE_REPO_INFO = re.compile(
-    r"^(what is|tell me about|describe|info about|show me|explain)\s+(?:the\s+)?(?:repo(?:sitory)?\s+)?(?P<name>[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)?)\s*\?*$",
+    r"^(what is|tell me about|describe|info about|explain)\s+(?:the\s+)?(?:repo(?:sitory)?\s+)?(?P<name>[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)?)\s*\?*$",
     re.IGNORECASE,
 )
+# Words that look like repo names but aren't — prevent false repo lookups
+_REPO_INFO_BLACKLIST = {
+    "stats", "statistics", "categories", "languages", "tags", "reporium",
+    "this", "that", "it", "everything", "all", "nothing", "the",
+}
 _ROUTE_COUNT_LANGUAGE = re.compile(
     r"^how many\s+(?:repos?|repositories|tools?|projects?)\s+(?:are\s+)?(?:written\s+)?(?:in|use|using)\s+(?P<lang>[a-zA-Z0-9#+]+)\s*\?*$",
     re.IGNORECASE,
@@ -93,7 +98,7 @@ _ROUTE_COUNT_TAGS = re.compile(
     re.IGNORECASE,
 )
 _ROUTE_STATS = re.compile(
-    r"^(what are|show|give me|tell me)\s+(?:the\s+)?(?:overall\s+)?(?:library\s+)?stats\s*\?*$",
+    r"^(what are|show|give me|tell me|get)\s+(?:me\s+)?(?:the\s+)?(?:overall\s+)?(?:library\s+)?(?:repo(?:sitory)?\s+)?stats(?:istics)?\s*\?*$",
     re.IGNORECASE,
 )
 
@@ -200,45 +205,45 @@ async def _try_smart_route(question: str, db: AsyncSession) -> dict | None:
     m = _ROUTE_REPO_INFO.match(q)
     if m:
         name = m.group("name").strip()
-        # Try exact match, then LIKE match
-        result = await db.execute(text("""
-            SELECT name, owner, description, primary_category,
-                   COALESCE(parent_stars, stargazers_count, 0) as stars,
-                   language, forked_from, readme_summary, problem_solved,
-                   license_spdx
-            FROM repos
-            WHERE is_private = false
-              AND (LOWER(name) = LOWER(:name) OR LOWER(name) LIKE LOWER(:like_name))
-            ORDER BY CASE WHEN LOWER(name) = LOWER(:name) THEN 0 ELSE 1 END,
-                     COALESCE(parent_stars, stargazers_count, 0) DESC
-            LIMIT 1
-        """), {"name": name, "like_name": f"%{name}%"})
-        row = result.first()
-        if row:
-            parts = [f"**{row.owner}/{row.name}**"]
-            if row.primary_category:
-                parts.append(f"Category: {row.primary_category}")
-            if row.language:
-                parts.append(f"Language: {row.language}")
-            parts.append(f"Stars: {row.stars:,}")
-            if row.license_spdx:
-                parts.append(f"License: {row.license_spdx}")
-            if row.description:
-                parts.append(f"\n{row.description}")
-            if row.problem_solved:
-                parts.append(f"\n**What it solves:** {row.problem_solved}")
-            if row.readme_summary:
-                parts.append(f"\n**Summary:** {row.readme_summary[:300]}")
-            return {
-                "answer": "\n".join(parts),
-                "sources": [{
-                    "name": row.name, "owner": row.owner,
-                    "stars": row.stars, "relevance_score": 1.0,
-                    "description": row.description, "forked_from": row.forked_from,
-                    "problem_solved": row.problem_solved, "integration_tags": [],
-                }],
-                "route": "repo_info",
-            }
+        if name.lower() not in _REPO_INFO_BLACKLIST:
+            result = await db.execute(text("""
+                SELECT name, owner, description, primary_category,
+                       COALESCE(parent_stars, stargazers_count, 0) as stars,
+                       language, forked_from, readme_summary, problem_solved,
+                       license_spdx
+                FROM repos
+                WHERE is_private = false
+                  AND (LOWER(name) = LOWER(:name) OR LOWER(name) LIKE LOWER(:like_name))
+                ORDER BY CASE WHEN LOWER(name) = LOWER(:name) THEN 0 ELSE 1 END,
+                         COALESCE(parent_stars, stargazers_count, 0) DESC
+                LIMIT 1
+            """), {"name": name, "like_name": f"%{name}%"})
+            row = result.first()
+            if row:
+                parts = [f"**{row.owner}/{row.name}**"]
+                if row.primary_category:
+                    parts.append(f"Category: {row.primary_category}")
+                if row.language:
+                    parts.append(f"Language: {row.language}")
+                parts.append(f"Stars: {row.stars:,}")
+                if row.license_spdx:
+                    parts.append(f"License: {row.license_spdx}")
+                if row.description:
+                    parts.append(f"\n{row.description}")
+                if row.problem_solved:
+                    parts.append(f"\n**What it solves:** {row.problem_solved}")
+                if row.readme_summary:
+                    parts.append(f"\n**Summary:** {row.readme_summary[:300]}")
+                return {
+                    "answer": "\n".join(parts),
+                    "sources": [{
+                        "name": row.name, "owner": row.owner,
+                        "stars": row.stars, "relevance_score": 1.0,
+                        "description": row.description, "forked_from": row.forked_from,
+                        "problem_solved": row.problem_solved, "integration_tags": [],
+                    }],
+                    "route": "repo_info",
+                }
         # Fall through to LLM if no match
         return None
 
