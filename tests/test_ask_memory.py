@@ -178,7 +178,7 @@ async def test_ask_without_session_id_is_backward_compatible(client: AsyncClient
 
     app.dependency_overrides[get_db] = override
     try:
-        with patch("app.routers.intelligence._get_anthropic_key", return_value="sk-test"), \
+        with patch("app.routers.intelligence.get_anthropic_key", return_value="sk-test"), \
              patch("app.routers.intelligence.anthropic.Anthropic") as MockClient, \
              patch("app.routers.intelligence.get_embedding_model") as mock_model, \
              patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(return_value=None)), \
@@ -218,7 +218,7 @@ async def test_ask_with_session_id_prepends_history_to_claude(client: AsyncClien
 
     app.dependency_overrides[get_db] = override
     try:
-        with patch("app.routers.intelligence._get_anthropic_key", return_value="sk-test"), \
+        with patch("app.routers.intelligence.get_anthropic_key", return_value="sk-test"), \
              patch("app.routers.intelligence.anthropic.Anthropic") as MockClient, \
              patch("app.routers.intelligence.get_embedding_model") as mock_model, \
              patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(return_value=None)), \
