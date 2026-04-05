@@ -58,6 +58,10 @@ async def lifespan(app: FastAPI):
     loop = _asyncio.get_event_loop()
     await loop.run_in_executor(None, _get_embedding_model)
     logger.info("Embedding model pre-warmed at startup")
+    # Start query_log retention purge loop (fire-and-forget background task).
+    from app.retention import retention_loop
+    _asyncio.create_task(retention_loop())
+    logger.info("Retention purge loop scheduled")
     yield
     await cache.disconnect()
     await engine.dispose()
@@ -198,11 +202,15 @@ async def log_requests(request: Request, call_next):
     start = time.perf_counter()
     response = await call_next(request)
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    # Redact query strings — they may contain user input, API keys, or PII
+    safe_path = request.url.path
+    if request.url.query:
+        safe_path = f"{safe_path}?<redacted>"
     logger.info(
         "request",
         extra={
             "method": request.method,
-            "path": request.url.path,
+            "path": safe_path,
             "status_code": response.status_code,
             "duration_ms": duration_ms,
         },

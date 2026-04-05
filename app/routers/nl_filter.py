@@ -39,17 +39,13 @@ from app.utils import get_anthropic_key
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# KAN-197: Lazy singleton Anthropic client
+# KAN-197 / Issue #215: Lazy singleton Anthropic client lives in app.utils.
+# This thin wrapper is preserved so existing tests that patch
+# ``app.routers.nl_filter._get_client`` still work.
 # ---------------------------------------------------------------------------
-_anthropic_client: anthropic.Anthropic | None = None
-
-
 def _get_client() -> anthropic.Anthropic:
-    global _anthropic_client
-    if _anthropic_client is None:
-        from app.utils import get_anthropic_key
-        _anthropic_client = anthropic.Anthropic(api_key=get_anthropic_key())
-    return _anthropic_client
+    from app.utils import get_anthropic_client
+    return get_anthropic_client()
 
 
 # Per-model pricing (per 1M tokens)

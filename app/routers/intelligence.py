@@ -16,6 +16,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Literal
 from uuid import UUID
 
 import anthropic
@@ -35,7 +36,7 @@ from app.database import async_session_factory, get_db
 from app.embeddings import get_embedding_model
 from app.models.session import AskSession
 from app.rate_limit import rate_limit_storage
-from app.utils import get_anthropic_key, vec_to_pg
+from app.utils import get_anthropic_key, log_nonfatal, vec_to_pg
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
 _limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
@@ -57,17 +58,13 @@ _INJECTION_PATTERNS = re.compile(
 _MAX_CONTENT_LEN = 200  # max chars per repo field in context (reduced from 400 for cost)
 
 # ---------------------------------------------------------------------------
-# KAN-197: Lazy singleton Anthropic client — avoids creating a new client per request
+# KAN-197 / Issue #215: Lazy singleton Anthropic client.
+# The singleton itself lives in app.utils; this thin wrapper is preserved so
+# existing tests that patch ``app.routers.intelligence._get_client`` still work.
 # ---------------------------------------------------------------------------
-_anthropic_client: anthropic.Anthropic | None = None
-
-
 def _get_client() -> anthropic.Anthropic:
-    global _anthropic_client
-    if _anthropic_client is None:
-        from app.utils import get_anthropic_key
-        _anthropic_client = anthropic.Anthropic(api_key=get_anthropic_key())
-    return _anthropic_client
+    from app.utils import get_anthropic_client
+    return get_anthropic_client()
 _SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.15  # cosine distance ≤0.15 ≈ similarity ≥0.85 — relaxed for more cache hits
 
 # ---------------------------------------------------------------------------
@@ -1003,7 +1000,7 @@ async def _log_query(
             )
             await session.commit()
     except Exception:
-        logger.exception("query_log insert failed (non-fatal)")
+        log_nonfatal("query_log insert")
 
 
 # ---------------------------------------------------------------------------
@@ -1034,7 +1031,7 @@ async def _load_session_turns(session_id: str, db: AsyncSession) -> list[dict]:
         )
         rows = result.fetchall()
     except Exception:
-        logger.exception("_load_session_turns failed (non-fatal) for session %s", session_id)
+        log_nonfatal("_load_session_turns", session_id=session_id)
         return []
 
     # Rows are newest-first; reverse to oldest-first for correct message order
@@ -1089,7 +1086,7 @@ async def _save_session_turn(session_id: str, question: str, answer: str) -> Non
             )
             await db.commit()
     except Exception:
-        logger.exception("Failed to save session turn")
+        log_nonfatal("_save_session_turn", session_id=session_id)
 
 
 class QueryRequest(BaseModel):
@@ -1141,6 +1138,26 @@ class QueryResponse(BaseModel):
     cache_hit: bool = False
     cache_source: str | None = None
     tokens_used: dict
+
+
+class StreamEvent(BaseModel):
+    """
+    Schema for SSE events emitted by the /ask/stream endpoint.
+
+    Each event is serialized as ``data: <json>\\n\\n``. The ``type`` field
+    discriminates the payload:
+
+    - ``sources``: initial event carrying the retrieved ``sources`` list
+    - ``token``: incremental answer chunk in ``text``
+    - ``done``: terminal success event carrying ``tokens`` usage and ``model``
+    - ``error``: terminal failure event carrying ``message``
+    """
+    type: Literal["sources", "token", "done", "error"]
+    sources: list[dict] | None = None
+    text: str | None = None
+    message: str | None = None
+    tokens: dict | None = None
+    model: str | None = None
 
 
 class TaxonomyGapSignal(BaseModel):
@@ -1222,11 +1239,27 @@ def _coerce_cached_sources(raw_sources: object) -> list[SourceRepo]:
     return coerced
 
 
+def _validate_query_embedding(query_embedding) -> np.ndarray:
+    """Validate an embedding used for pgvector similarity search.
+
+    Rejects wrong-shape, NaN, and Infinity values to prevent corrupt or
+    hostile inputs from reaching the DB layer.
+    """
+    if not isinstance(query_embedding, np.ndarray):
+        query_embedding = np.asarray(query_embedding, dtype=np.float32)
+    if query_embedding.shape != (384,):
+        raise ValueError(f"Invalid embedding shape: {query_embedding.shape}")
+    if np.any(np.isnan(query_embedding)) or np.any(np.isinf(query_embedding)):
+        raise ValueError("Embedding contains NaN or Infinity")
+    return query_embedding
+
+
 async def _find_semantic_cache_hit(
     db: AsyncSession,
     *,
     question_embedding: np.ndarray,
 ) -> tuple[str, list[SourceRepo], str | None] | None:
+    question_embedding = _validate_query_embedding(question_embedding)
     result = await db.execute(
         text("""
             SELECT answer_full, sources, model
@@ -1537,7 +1570,8 @@ async def _prepare_query(
 
     embed_model = get_embedding_model()
 
-    # 1. Embed the question — model is pre-warmed at startup so this is fast
+    # 1. Embed the question — model is pre-warmed at startup so this is fast.
+    # Issue #208: Embedding is computed once per request in _prepare_query().
     query_embedding = embed_model.encode(question)
 
     # 2. Semantic cache check
@@ -1563,6 +1597,7 @@ async def _prepare_query(
 
     t_embed = time.perf_counter()
 
+    query_embedding = _validate_query_embedding(query_embedding)
     vec_str = vec_to_pg(query_embedding)
 
     # 3. pgvector HNSW index scan — O(log N) instead of O(N) Python loop
@@ -1994,13 +2029,18 @@ async def intelligence_ask_stream(
 ) -> StreamingResponse:
     """
     Streaming endpoint — requires X-App-Token header.
-    Streams the answer as SSE events:
+    Streams the answer as SSE events. Each event payload conforms to the
+    :class:`StreamEvent` Pydantic schema defined above:
       data: {"type": "sources", "sources": [...]}   (sent immediately before generation)
       data: {"type": "token", "text": "..."}         (one per Claude streaming chunk)
-      data: {"type": "done", "tokens": {...}}         (final event with usage stats)
+      data: {"type": "done", "tokens": {...}, "model": "..."}  (final event with usage stats)
       data: {"type": "error", "message": "..."}       (on failure)
 
     Rate limited to 6/minute and 60/day per IP (same as /ask).
+
+    Backpressure: the generator detects client disconnects (via
+    ``request.is_disconnected()`` and ``GeneratorExit``) and aborts the
+    upstream Anthropic stream to avoid burning tokens on an abandoned client.
     """
     client_ip = get_remote_address(request)
 
@@ -2112,22 +2152,41 @@ async def intelligence_ask_stream(
 
             # Use a queue to bridge the sync streaming iterator to async
             import queue
+            import threading
             token_queue: queue.Queue = queue.Queue()
+            # Shared cancel flag — flipped when the client disconnects so the
+            # worker thread exits the Anthropic iterator on the next chunk and
+            # stops consuming tokens.
+            cancel_event = threading.Event()
 
             def _run_stream():
                 try:
                     with _stream_claude() as stream:
                         for text_chunk in stream.text_stream:
+                            if cancel_event.is_set():
+                                # Abort cleanly — the context manager will
+                                # close the underlying HTTP stream.
+                                return
                             token_queue.put(("token", text_chunk))
+                        if cancel_event.is_set():
+                            return
                         msg = stream.get_final_message()
                         token_queue.put(("done", msg))
                 except Exception as e:
-                    token_queue.put(("error", str(e)))
+                    if not cancel_event.is_set():
+                        token_queue.put(("error", str(e)))
 
             # Run the blocking streamer in a thread
             future = loop.run_in_executor(None, _run_stream)
 
             while True:
+                # Backpressure: bail out early if the client has gone away so
+                # we don't keep paying Anthropic for tokens nobody is reading.
+                if await request.is_disconnected():
+                    logger.info("Stream client disconnected")
+                    cancel_event.set()
+                    break
+
                 try:
                     item = await loop.run_in_executor(
                         None,
@@ -2135,6 +2194,7 @@ async def intelligence_ask_stream(
                     )
                 except queue.Empty:
                     yield f"data: {json.dumps({'type': 'error', 'message': 'Stream timed out'})}\n\n"
+                    cancel_event.set()
                     break
 
                 event_type, payload = item
@@ -2176,6 +2236,18 @@ async def intelligence_ask_stream(
 
             await future  # ensure thread cleanup
 
+        except GeneratorExit:
+            # Client disconnected (FastAPI/Starlette closes the generator).
+            # Signal the worker thread to abort the Anthropic stream so we
+            # stop accruing token cost, then re-raise per async-generator
+            # protocol.
+            logger.info("Stream client disconnected")
+            try:
+                cancel_event.set()
+            except NameError:
+                # Disconnect happened before the stream was set up.
+                pass
+            raise
         except Exception as e:
             logger.error("Streaming ask error: %s", str(e), exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'message': 'Internal server error. Please try again.'})}\n\n"
@@ -2553,3 +2625,274 @@ async def category_leaders(
     if not rows:
         raise HTTPException(status_code=404, detail=f"No repos found for category '{category}'")
     return {"category": category, "repos": rows}
+
+
+# ---------------------------------------------------------------------------
+# Issue #213: /category-momentum — categories ranked by repo addition velocity
+# Issue #214: /similar/{owner}/{name} — similar repos with SQL-based explanations
+# Both endpoints are $0 LLM cost (pure SQL + caching).
+# ---------------------------------------------------------------------------
+
+
+class CategoryMomentumItem(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    new_7d: int
+    new_30d: int
+    total_repos: int
+    momentum_score: int
+
+
+class CategoryMomentumResponse(BaseModel):
+    generated_at: str
+    categories: list[CategoryMomentumItem]
+
+
+@router.get("/category-momentum", response_model=CategoryMomentumResponse)
+@_limiter.limit("30/minute")
+async def category_momentum(
+    request: Request,
+    limit: int = Query(20, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+) -> CategoryMomentumResponse:
+    """
+    Categories ranked by repo addition velocity (new repos in the last 7/30 days).
+
+    Uses repo_categories (category_id, category_name) joined to repos.ingested_at
+    (Reporium has no repos.created_at — ingested_at is when the repo was added).
+    Pure SQL, $0 LLM cost. Cached for 1 hour.
+    """
+    cache_key = f"intelligence:category_momentum:v1:{limit}"
+    try:
+        cached = await cache.get(cache_key)
+        if cached:
+            return CategoryMomentumResponse(**cached)
+    except Exception:
+        pass
+
+    result = await db.execute(
+        text("""
+            SELECT rc.category_id AS id,
+                   MIN(rc.category_name) AS name,
+                   COUNT(CASE WHEN r.ingested_at > NOW() - INTERVAL '7 days' THEN 1 END)::int AS new_7d,
+                   COUNT(CASE WHEN r.ingested_at > NOW() - INTERVAL '30 days' THEN 1 END)::int AS new_30d,
+                   COUNT(*)::int AS total_repos
+            FROM repo_categories rc
+            JOIN repos r ON r.id = rc.repo_id AND r.is_private = false
+            GROUP BY rc.category_id
+            HAVING COUNT(CASE WHEN r.ingested_at > NOW() - INTERVAL '30 days' THEN 1 END) > 0
+            ORDER BY new_7d DESC, new_30d DESC
+            LIMIT :limit
+        """),
+        {"limit": limit},
+    )
+    categories = [
+        CategoryMomentumItem(
+            id=str(row.id),
+            name=row.name,
+            description=None,
+            new_7d=int(row.new_7d or 0),
+            new_30d=int(row.new_30d or 0),
+            total_repos=int(row.total_repos or 0),
+            momentum_score=int(row.new_7d or 0) * 4 + int(row.new_30d or 0),
+        )
+        for row in result.fetchall()
+    ]
+
+    response = CategoryMomentumResponse(
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        categories=categories,
+    )
+    try:
+        await cache.set(cache_key, response.model_dump(), ttl=3600)
+    except Exception:
+        pass
+    return response
+
+
+class SimilarExplanation(BaseModel):
+    shared_categories: list[str]
+    shared_tags: list[str]
+    same_language: bool
+
+
+class SimilarRepoItem(BaseModel):
+    owner: str
+    name: str
+    github_url: str
+    score: int
+    explanation: SimilarExplanation
+
+
+class SimilarTarget(BaseModel):
+    owner: str
+    name: str
+
+
+class SimilarReposResponse(BaseModel):
+    target: SimilarTarget
+    similar: list[SimilarRepoItem]
+
+
+@router.get("/similar/{owner}/{name}", response_model=SimilarReposResponse)
+@_limiter.limit("60/minute")
+async def similar_repos(
+    request: Request,
+    owner: str,
+    name: str,
+    limit: int = Query(10, ge=1, le=25),
+    db: AsyncSession = Depends(get_db),
+) -> SimilarReposResponse:
+    """
+    Similar repos with SQL-based explanations of WHY they match.
+
+    Scoring: len(shared_categories)*3 + len(shared_tags)*2 + (1 if same_language else 0).
+    Pure SQL, $0 LLM cost. Cached for 15 minutes.
+    """
+    cache_key = f"intelligence:similar:v1:{owner}/{name}:{limit}"
+    try:
+        cached = await cache.get(cache_key)
+        if cached:
+            return SimilarReposResponse(**cached)
+    except Exception:
+        pass
+
+    # 1. Find target repo
+    target_row = (
+        await db.execute(
+            text("""
+                SELECT id, owner, name, primary_language
+                FROM repos
+                WHERE owner = :owner AND name = :name AND is_private = false
+                LIMIT 1
+            """),
+            {"owner": owner, "name": name},
+        )
+    ).first()
+    if target_row is None:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    target_id = target_row.id
+    target_language = target_row.primary_language
+
+    # 2. Target categories + tags
+    target_cat_rows = (
+        await db.execute(
+            text("SELECT category_id, category_name FROM repo_categories WHERE repo_id = :rid"),
+            {"rid": target_id},
+        )
+    ).fetchall()
+    target_category_ids = {row.category_id for row in target_cat_rows}
+    target_category_names = {row.category_id: row.category_name for row in target_cat_rows}
+
+    target_tag_rows = (
+        await db.execute(
+            text("SELECT tag FROM repo_tags WHERE repo_id = :rid"),
+            {"rid": target_id},
+        )
+    ).fetchall()
+    target_tags = {row.tag for row in target_tag_rows}
+
+    # 3. Candidate repos sharing at least one category or tag
+    candidate_rows = (
+        await db.execute(
+            text("""
+                SELECT DISTINCT r.id, r.owner, r.name, r.github_url, r.primary_language
+                FROM repos r
+                WHERE r.is_private = false
+                  AND r.id <> :tid
+                  AND (
+                        r.id IN (SELECT repo_id FROM repo_categories WHERE category_id = ANY(:cat_ids))
+                     OR r.id IN (SELECT repo_id FROM repo_tags WHERE tag = ANY(:tags))
+                  )
+                LIMIT 20
+            """),
+            {
+                "tid": target_id,
+                "cat_ids": list(target_category_ids) if target_category_ids else [""],
+                "tags": list(target_tags) if target_tags else [""],
+            },
+        )
+    ).fetchall()
+
+    if not candidate_rows:
+        response = SimilarReposResponse(
+            target=SimilarTarget(owner=target_row.owner, name=target_row.name),
+            similar=[],
+        )
+        try:
+            await cache.set(cache_key, response.model_dump(), ttl=900)
+        except Exception:
+            pass
+        return response
+
+    candidate_ids = [row.id for row in candidate_rows]
+
+    # Batch-fetch categories and tags for all candidates
+    cand_cat_rows = (
+        await db.execute(
+            text(
+                "SELECT repo_id, category_id, category_name FROM repo_categories "
+                "WHERE repo_id = ANY(:ids)"
+            ),
+            {"ids": candidate_ids},
+        )
+    ).fetchall()
+    cand_cats: dict = {}
+    for row in cand_cat_rows:
+        cand_cats.setdefault(row.repo_id, []).append((row.category_id, row.category_name))
+
+    cand_tag_rows = (
+        await db.execute(
+            text("SELECT repo_id, tag FROM repo_tags WHERE repo_id = ANY(:ids)"),
+            {"ids": candidate_ids},
+        )
+    ).fetchall()
+    cand_tags: dict = {}
+    for row in cand_tag_rows:
+        cand_tags.setdefault(row.repo_id, []).append(row.tag)
+
+    # 4. Score each candidate
+    scored: list[SimilarRepoItem] = []
+    for row in candidate_rows:
+        these_cats = cand_cats.get(row.id, [])
+        these_tags = cand_tags.get(row.id, [])
+
+        shared_category_ids = {cid for cid, _ in these_cats if cid in target_category_ids}
+        shared_category_names = sorted(
+            {target_category_names[cid] for cid in shared_category_ids}
+        )
+        shared_tag_list = sorted(set(these_tags) & target_tags)
+        same_language = bool(
+            target_language and row.primary_language and target_language == row.primary_language
+        )
+        score = len(shared_category_names) * 3 + len(shared_tag_list) * 2 + (1 if same_language else 0)
+
+        scored.append(
+            SimilarRepoItem(
+                owner=row.owner,
+                name=row.name,
+                github_url=row.github_url,
+                score=score,
+                explanation=SimilarExplanation(
+                    shared_categories=shared_category_names,
+                    shared_tags=shared_tag_list,
+                    same_language=same_language,
+                ),
+            )
+        )
+
+    # 5. Top N by score desc
+    scored.sort(key=lambda item: item.score, reverse=True)
+    top = scored[:limit]
+
+    response = SimilarReposResponse(
+        target=SimilarTarget(owner=target_row.owner, name=target_row.name),
+        similar=top,
+    )
+    try:
+        await cache.set(cache_key, response.model_dump(), ttl=900)
+    except Exception:
+        pass
+    return response
