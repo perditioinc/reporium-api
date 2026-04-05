@@ -1,0 +1,375 @@
+# Golden set for /intelligence/ask numeric quality gate.
+#
+# Each entry drives one real call to the /intelligence/ask handler with a
+# controlled DB fixture (so we own the retrieved context) and a real Anthropic
+# model call (so we measure actual answer quality + token cost).
+#
+# Fields:
+#   question            — the user prompt sent to /intelligence/ask
+#   expected_themes     — substrings (case-insensitive) we expect in the answer
+#   expected_repos      — "owner/name" entries we expect to appear in sources
+#                         (optional — omit / leave empty for no repo check)
+#   difficulty          — simple | medium | complex (metadata only; the handler
+#                         routes internally via smart_route / Haiku / Sonnet)
+#   max_tokens_soft_budget — soft cap on total tokens for this single call,
+#                            summed across the suite for a global budget check
+#   fixture_repos       — the repos loaded into the mocked DB for this call
+#                         (owner, name, description, problem_solved, similarity,
+#                          stars, integration_tags)
+#   skip                — optional: if true the entry is excluded from the run
+#                         (used for entries that must return 422 / non-200)
+#   expect_status       — optional: non-200 status the call must return; when
+#                         set, quality scoring is skipped and the status check
+#                         is the only pass criterion
+#
+# Coverage:
+#   1–4   simple definitional single-repo questions
+#   5–8   medium multi-repo comparative questions
+#   9–12  category / list questions
+#   13–15 conversational / reasoning
+#   16–18 edge cases (empty / too short / too long / injection)
+
+- question: "What is PyTorch used for?"
+  expected_themes: ["pytorch", "deep learning", "tensor"]
+  expected_repos: ["pytorch/pytorch"]
+  difficulty: simple
+  max_tokens_soft_budget: 3500
+  fixture_repos:
+    - owner: pytorch
+      name: pytorch
+      description: "Tensors and Dynamic neural networks in Python with strong GPU acceleration"
+      problem_solved: "Flexible deep learning framework with dynamic computation graphs"
+      similarity: 0.94
+      stars: 78000
+      integration_tags: [pytorch, deep-learning, gpu, tensor]
+
+- question: "What does LangChain do?"
+  expected_themes: ["langchain", "llm", "chain"]
+  expected_repos: ["langchain-ai/langchain"]
+  difficulty: simple
+  max_tokens_soft_budget: 3500
+  fixture_repos:
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "Orchestrating LLMs with tools, memory, and retrieval"
+      similarity: 0.95
+      stars: 88000
+      integration_tags: [llm, rag, agents, langchain]
+
+- question: "What is FastAPI?"
+  expected_themes: ["fastapi", "python", "api"]
+  expected_repos: ["tiangolo/fastapi"]
+  difficulty: simple
+  max_tokens_soft_budget: 3500
+  fixture_repos:
+    - owner: tiangolo
+      name: fastapi
+      description: "FastAPI framework, high performance, easy to learn, fast to code, ready for production"
+      problem_solved: "Modern async Python web APIs with type hints"
+      similarity: 0.93
+      stars: 72000
+      integration_tags: [python, api, async, web-framework]
+
+- question: "What is Weaviate?"
+  expected_themes: ["vector", "database", "weaviate"]
+  expected_repos: ["weaviate/weaviate"]
+  difficulty: simple
+  max_tokens_soft_budget: 3500
+  fixture_repos:
+    - owner: weaviate
+      name: weaviate
+      description: "Weaviate is an open-source vector database"
+      problem_solved: "Store and search vector embeddings at scale"
+      similarity: 0.95
+      stars: 10000
+      integration_tags: [vector-database, embeddings, search]
+
+- question: "Compare LangChain and LlamaIndex for RAG applications."
+  expected_themes: ["langchain", "llamaindex", "rag", "retrieval"]
+  expected_repos: ["langchain-ai/langchain", "run-llama/llama_index"]
+  difficulty: medium
+  max_tokens_soft_budget: 4500
+  fixture_repos:
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "Orchestrating LLMs with tools, memory, and retrieval"
+      similarity: 0.93
+      stars: 88000
+      integration_tags: [llm, rag, agents]
+    - owner: run-llama
+      name: llama_index
+      description: "LlamaIndex is a data framework for LLM applications"
+      problem_solved: "Connecting LLMs to external data sources"
+      similarity: 0.91
+      stars: 33000
+      integration_tags: [rag, llm, data]
+
+- question: "Which is better for production NLP pipelines, Haystack or LangChain?"
+  expected_themes: ["haystack", "langchain", "production"]
+  expected_repos: ["deepset-ai/haystack", "langchain-ai/langchain"]
+  difficulty: medium
+  max_tokens_soft_budget: 4500
+  fixture_repos:
+    - owner: deepset-ai
+      name: haystack
+      description: "Open-source LLM framework to build production-ready NLP applications"
+      problem_solved: "End-to-end NLP pipelines with RAG support"
+      similarity: 0.90
+      stars: 15000
+      integration_tags: [rag, nlp, search]
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "Orchestrating LLMs with tools, memory, and retrieval"
+      similarity: 0.88
+      stars: 88000
+      integration_tags: [llm, rag, agents]
+
+- question: "Compare Pinecone and Weaviate as vector databases."
+  expected_themes: ["pinecone", "weaviate", "vector"]
+  expected_repos: ["weaviate/weaviate"]
+  difficulty: medium
+  max_tokens_soft_budget: 4500
+  fixture_repos:
+    - owner: weaviate
+      name: weaviate
+      description: "Weaviate is an open-source vector database"
+      problem_solved: "Store and search vector embeddings at scale"
+      similarity: 0.93
+      stars: 10000
+      integration_tags: [vector-database, embeddings, search]
+    - owner: pinecone-io
+      name: pinecone-python-client
+      description: "Official Pinecone Python client for the managed vector database"
+      problem_solved: "Managed vector search service"
+      similarity: 0.89
+      stars: 800
+      integration_tags: [vector-database, managed, embeddings]
+
+- question: "Compare PyTorch and TensorFlow for deep learning research."
+  expected_themes: ["pytorch", "tensorflow", "deep learning"]
+  expected_repos: ["pytorch/pytorch", "tensorflow/tensorflow"]
+  difficulty: medium
+  max_tokens_soft_budget: 4500
+  fixture_repos:
+    - owner: pytorch
+      name: pytorch
+      description: "Tensors and Dynamic neural networks in Python with strong GPU acceleration"
+      problem_solved: "Flexible deep learning framework with dynamic computation graphs"
+      similarity: 0.94
+      stars: 78000
+      integration_tags: [pytorch, deep-learning, gpu]
+    - owner: tensorflow
+      name: tensorflow
+      description: "An Open Source Machine Learning Framework for Everyone"
+      problem_solved: "Production-scale machine learning with static and dynamic graphs"
+      similarity: 0.92
+      stars: 182000
+      integration_tags: [tensorflow, deep-learning, ml]
+
+- question: "Show me vector database repositories."
+  expected_themes: ["vector", "database", "embedding"]
+  expected_repos: ["weaviate/weaviate", "qdrant/qdrant", "chroma-core/chroma"]
+  difficulty: medium
+  max_tokens_soft_budget: 4500
+  fixture_repos:
+    - owner: weaviate
+      name: weaviate
+      description: "Weaviate is an open-source vector database"
+      problem_solved: "Store and search vector embeddings at scale"
+      similarity: 0.95
+      stars: 10000
+      integration_tags: [vector-database, embeddings]
+    - owner: qdrant
+      name: qdrant
+      description: "Qdrant - High-performance, massive-scale Vector Database"
+      problem_solved: "Neural search engine with filtering and payloads"
+      similarity: 0.94
+      stars: 19000
+      integration_tags: [vector-database, rust, search]
+    - owner: chroma-core
+      name: chroma
+      description: "the AI-native open-source embedding database"
+      problem_solved: "Simple embedding store for LLM apps"
+      similarity: 0.92
+      stars: 13000
+      integration_tags: [vector-database, embeddings, python]
+
+- question: "List repositories related to LLM agent frameworks."
+  expected_themes: ["agent", "llm", "framework"]
+  expected_repos: ["langchain-ai/langchain", "microsoft/autogen"]
+  difficulty: medium
+  max_tokens_soft_budget: 4500
+  fixture_repos:
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "Orchestrating LLMs with tools, memory, and retrieval"
+      similarity: 0.92
+      stars: 88000
+      integration_tags: [llm, rag, agents]
+    - owner: microsoft
+      name: autogen
+      description: "A programming framework for agentic AI"
+      problem_solved: "Multi-agent conversational AI orchestration"
+      similarity: 0.91
+      stars: 26000
+      integration_tags: [agents, llm, multi-agent]
+    - owner: joaomdmoura
+      name: crewai
+      description: "Framework for orchestrating role-playing, autonomous AI agents"
+      problem_solved: "Role-based multi-agent collaboration"
+      similarity: 0.89
+      stars: 18000
+      integration_tags: [agents, llm, orchestration]
+
+- question: "What repositories support Retrieval Augmented Generation?"
+  expected_themes: ["retrieval", "rag", "generation"]
+  expected_repos: ["langchain-ai/langchain", "run-llama/llama_index"]
+  difficulty: medium
+  max_tokens_soft_budget: 4500
+  fixture_repos:
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "Orchestrating LLMs with tools, memory, and retrieval"
+      similarity: 0.93
+      stars: 88000
+      integration_tags: [llm, rag, agents]
+    - owner: run-llama
+      name: llama_index
+      description: "LlamaIndex is a data framework for LLM applications"
+      problem_solved: "Connecting LLMs to external data sources"
+      similarity: 0.92
+      stars: 33000
+      integration_tags: [rag, llm, data]
+
+- question: "Show me Python web frameworks."
+  expected_themes: ["python", "web", "framework"]
+  expected_repos: ["tiangolo/fastapi", "pallets/flask"]
+  difficulty: medium
+  max_tokens_soft_budget: 4500
+  fixture_repos:
+    - owner: tiangolo
+      name: fastapi
+      description: "FastAPI framework, high performance, easy to learn"
+      problem_solved: "Modern async Python web APIs with type hints"
+      similarity: 0.93
+      stars: 72000
+      integration_tags: [python, api, web-framework, async]
+    - owner: pallets
+      name: flask
+      description: "The Python micro framework for building web applications"
+      problem_solved: "Minimal WSGI web framework"
+      similarity: 0.90
+      stars: 66000
+      integration_tags: [python, web-framework, wsgi]
+    - owner: django
+      name: django
+      description: "The Web framework for perfectionists with deadlines"
+      problem_solved: "Batteries-included Python web framework"
+      similarity: 0.88
+      stars: 76000
+      integration_tags: [python, web-framework, orm]
+
+- question: "Why would I choose an open-source vector database over a managed one?"
+  expected_themes: ["open-source", "managed", "cost"]
+  expected_repos: ["weaviate/weaviate", "qdrant/qdrant"]
+  difficulty: complex
+  max_tokens_soft_budget: 5000
+  fixture_repos:
+    - owner: weaviate
+      name: weaviate
+      description: "Weaviate is an open-source vector database"
+      problem_solved: "Self-hosted vector search with no vendor lock-in"
+      similarity: 0.92
+      stars: 10000
+      integration_tags: [vector-database, open-source, self-hosted]
+    - owner: qdrant
+      name: qdrant
+      description: "Qdrant - High-performance, massive-scale Vector Database"
+      problem_solved: "Self-hostable high-performance vector search"
+      similarity: 0.91
+      stars: 19000
+      integration_tags: [vector-database, open-source, rust]
+
+- question: "Which repositories would help me build a multi-agent code review bot?"
+  expected_themes: ["agent", "code", "review"]
+  expected_repos: ["microsoft/autogen", "joaomdmoura/crewai"]
+  difficulty: complex
+  max_tokens_soft_budget: 5000
+  fixture_repos:
+    - owner: microsoft
+      name: autogen
+      description: "A programming framework for agentic AI"
+      problem_solved: "Multi-agent conversational AI orchestration"
+      similarity: 0.92
+      stars: 26000
+      integration_tags: [agents, llm, multi-agent]
+    - owner: joaomdmoura
+      name: crewai
+      description: "Framework for orchestrating role-playing, autonomous AI agents"
+      problem_solved: "Role-based multi-agent collaboration"
+      similarity: 0.91
+      stars: 18000
+      integration_tags: [agents, llm, orchestration]
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "Orchestrating LLMs with tools, memory, and retrieval"
+      similarity: 0.86
+      stars: 88000
+      integration_tags: [llm, agents, tools]
+
+- question: "Explain the trade-offs between fine-tuning and RAG for domain adaptation."
+  expected_themes: ["fine-tun", "rag", "retrieval"]
+  expected_repos: ["langchain-ai/langchain"]
+  difficulty: complex
+  max_tokens_soft_budget: 5000
+  fixture_repos:
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "RAG pipelines for grounding LLM output in domain data"
+      similarity: 0.89
+      stars: 88000
+      integration_tags: [llm, rag, agents]
+    - owner: huggingface
+      name: peft
+      description: "PEFT: State-of-the-art Parameter-Efficient Fine-Tuning"
+      problem_solved: "Efficient fine-tuning of large language models"
+      similarity: 0.88
+      stars: 15000
+      integration_tags: [fine-tuning, llm, peft]
+
+# ---------------------------------------------------------------------------
+# Edge cases — these assert HTTP behavior rather than quality scores.
+# ---------------------------------------------------------------------------
+
+- question: ""
+  difficulty: simple
+  max_tokens_soft_budget: 0
+  expect_status: 422
+  fixture_repos: []
+
+- question: "ab"
+  difficulty: simple
+  max_tokens_soft_budget: 0
+  expect_status: 422
+  fixture_repos: []
+
+- question: >-
+    This is a deliberately over-long question designed to exceed the
+    500-character maximum enforced by the QueryRequest schema so that the
+    golden-set harness verifies the endpoint rejects overly long input.
+    Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod
+    tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim
+    veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea
+    commodo consequat. Duis aute irure dolor in reprehenderit in voluptate
+    velit esse cillum dolore eu fugiat nulla pariatur.
+  difficulty: simple
+  max_tokens_soft_budget: 0
+  expect_status: 422
+  fixture_repos: []

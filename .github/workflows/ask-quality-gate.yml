@@ -1,0 +1,50 @@
+name: Ask Quality Gate
+on:
+  push:
+    branches: [dev, main]
+  pull_request:
+    branches: [dev, main]
+
+permissions:
+  contents: read
+
+jobs:
+  ask-quality-gate:
+    runs-on: ubuntu-latest
+    # Skip gracefully on forks / environments without the required secret.
+    if: ${{ github.event.pull_request.head.repo.fork == false || github.event_name == 'push' }}
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: reporium_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test
+      REDIS_URL: ""
+      INGESTION_API_KEY: test-api-key
+      GH_USERNAME: testuser
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run numeric golden-set gate for /intelligence/ask
+        if: ${{ env.ANTHROPIC_API_KEY != '' }}
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio==0.24.0 httpx pyyaml
+          pytest tests/test_ask_golden_numeric.py -v -s
