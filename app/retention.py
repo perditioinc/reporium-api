@@ -25,6 +25,41 @@ async def purge_old_query_logs(days: int = RETENTION_DAYS) -> int:
         return result.rowcount or 0
 
 
+async def purge_expired_ask_sessions(max_age_days: int = 90) -> int:
+    """Delete ``ask_sessions`` rows older than ``max_age_days`` days.
+
+    Closes issue #238. ``ask_sessions`` stores the user's question + the
+    model's answer verbatim for conversational memory; rows older than the
+    retention window must be purged to limit data-retention exposure.
+
+    Returns the number of rows deleted. Uses its own ``async_session_factory``
+    session and logs a summary at INFO level.
+
+    Recommended schedule: invoke
+    ``POST /admin/purge-ask-sessions?days=90`` once per day from an external
+    cron (Cloud Scheduler, GitHub Actions cron, etc.). We deliberately do not
+    start a background loop here — $0 infra policy keeps scheduling external.
+    """
+    async with async_session_factory() as db:
+        result = await db.execute(
+            text(
+                "DELETE FROM ask_sessions "
+                "WHERE created_at < NOW() - make_interval(days => :days) "
+                "RETURNING id"
+            ),
+            {"days": int(max_age_days)},
+        )
+        deleted_ids = result.fetchall()
+        await db.commit()
+        count = len(deleted_ids)
+        logger.info(
+            "ask_sessions retention purge complete: deleted %d rows older than %d days",
+            count,
+            max_age_days,
+        )
+        return count
+
+
 async def retention_loop() -> None:
     """Run purge every 24 hours. Fire and forget."""
     if os.getenv("ENABLE_RETENTION_PURGE", "true").lower() != "true":
