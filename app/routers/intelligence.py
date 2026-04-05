@@ -1070,6 +1070,16 @@ def _build_sources_block(repos: list[dict]) -> str:
 
 logger = logging.getLogger(__name__)
 
+
+def _task_done_callback(task: asyncio.Task) -> None:
+    """Log exceptions from fire-and-forget background tasks."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc:
+        logger.warning("Background task %s failed: %s", task.get_name(), exc, exc_info=False)
+
+
 router = APIRouter(prefix="/intelligence", tags=["Intelligence"])
 
 # Timeout (seconds) for the synchronous Anthropic API call.
@@ -2093,7 +2103,7 @@ async def _run_query(
             model=qctx.model,
             question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
             cache_hit=cached.get("cache_hit", False),
-        ))
+        )).add_done_callback(_task_done_callback)
         return response
 
     # KAN-ask-output-caps: low-similarity early-exit guard. If retrieval
@@ -2124,7 +2134,7 @@ async def _run_query(
                 "tokens_used": {"input": 0, "output": 0, "total": 0},
                 "model": "early-exit",
                 "negative": True,
-            }, ttl=300))
+            }, ttl=300)).add_done_callback(_task_done_callback)
         asyncio.create_task(_log_query(
             question=req.question,
             answer=_EARLY_EXIT_ANSWER,
@@ -2136,7 +2146,7 @@ async def _run_query(
             model="early-exit",
             question_embedding=None,
             cache_hit=False,
-        ))
+        )).add_done_callback(_task_done_callback)
         return early_response
 
     # Daily cost cap check — reject before calling Claude if budget exhausted
@@ -2270,10 +2280,10 @@ async def _run_query(
     }
     if _negative:
         _cache_payload["negative"] = True
-        asyncio.create_task(cache.set(qctx.redis_cache_key, _cache_payload, ttl=60))
+        asyncio.create_task(cache.set(qctx.redis_cache_key, _cache_payload, ttl=60)).add_done_callback(_task_done_callback)
         logger.info("ask: negative-cached low-quality answer (len=%d)", len(answer or ""))
     else:
-        asyncio.create_task(cache.set(qctx.redis_cache_key, _cache_payload, ttl=1800))
+        asyncio.create_task(cache.set(qctx.redis_cache_key, _cache_payload, ttl=1800)).add_done_callback(_task_done_callback)
 
     # Fire-and-forget — log after response is built, never blocks the caller.
     # For negative/low-quality answers, log with NULL embedding so the row is
@@ -2295,7 +2305,7 @@ async def _run_query(
         latency_ms=int((time.monotonic() - _started_at) * 1000),
         model=qctx.model,
         question_embedding=_log_embedding,
-    ))
+    )).add_done_callback(_task_done_callback)
 
     # Save this turn to the session store so future turns can reference it
     # (KAN-158). Skip persisting negative answers so follow-ups don't start
@@ -2303,7 +2313,7 @@ async def _run_query(
     if effective_session_id and not _negative:
         asyncio.create_task(
             _save_session_turn(effective_session_id, req.question, answer, token_hash)
-        )
+        ).add_done_callback(_task_done_callback)
 
     return response
 
@@ -2443,7 +2453,7 @@ async def intelligence_ask_stream(
                     model=qctx.model,
                     question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
                     cache_hit=cached.get("cache_hit", False),
-                ))
+                )).add_done_callback(_task_done_callback)
                 return
 
             # KAN-ask-output-caps: low-similarity early-exit guard for the
@@ -2470,7 +2480,7 @@ async def intelligence_ask_stream(
                         "tokens_used": {"input": 0, "output": 0, "total": 0},
                         "model": "early-exit",
                         "negative": True,
-                    }, ttl=300))
+                    }, ttl=300)).add_done_callback(_task_done_callback)
                 asyncio.create_task(_log_query(
                     question=req.question,
                     answer=_EARLY_EXIT_ANSWER,
@@ -2482,7 +2492,7 @@ async def intelligence_ask_stream(
                     model="early-exit",
                     question_embedding=None,
                     cache_hit=False,
-                ))
+                )).add_done_callback(_task_done_callback)
                 return
 
             # Emit sources before generation starts
@@ -2623,10 +2633,10 @@ async def intelligence_ask_stream(
                     }
                     if _stream_negative:
                         _stream_payload["negative"] = True
-                        asyncio.create_task(cache.set(qctx.redis_cache_key, _stream_payload, ttl=60))
+                        asyncio.create_task(cache.set(qctx.redis_cache_key, _stream_payload, ttl=60)).add_done_callback(_task_done_callback)
                         logger.info("ask/stream: negative-cached low-quality answer (len=%d)", len(full_answer or ""))
                     else:
-                        asyncio.create_task(cache.set(qctx.redis_cache_key, _stream_payload, ttl=1800))
+                        asyncio.create_task(cache.set(qctx.redis_cache_key, _stream_payload, ttl=1800)).add_done_callback(_task_done_callback)
                     # Fire-and-forget log
                     _stream_log_embedding = (
                         None
@@ -2641,13 +2651,13 @@ async def intelligence_ask_stream(
                         latency_ms=int((time.monotonic() - _started_at) * 1000),
                         model=qctx.model,
                         question_embedding=_stream_log_embedding,
-                    ))
+                    )).add_done_callback(_task_done_callback)
                     # Save turn to session for multi-turn continuity (KAN-158).
                     # Skip negative answers so follow-ups don't start from "I don't know".
                     if req.session_id and full_answer and not _stream_negative:
                         asyncio.create_task(
                             _save_session_turn(req.session_id, req.question, full_answer, token_hash)
-                        )
+                        ).add_done_callback(_task_done_callback)
                     break
                 elif event_type == "error":
                     yield f"data: {json.dumps({'type': 'error', 'message': payload})}\n\n"
