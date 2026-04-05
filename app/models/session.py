@@ -3,7 +3,7 @@
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Integer, Text, TIMESTAMP
+from sqlalchemy import Integer, String, Text, TIMESTAMP
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -19,6 +19,11 @@ class AskSession(Base):
     turn_number: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     question: Mapped[str] = mapped_column(Text, nullable=False)
     answer: Mapped[str] = mapped_column(Text, nullable=False)
+    # Issue #235: SHA-256 hex digest of the X-App-Token that created the
+    # session. Load queries filter by matching hash so one app token cannot
+    # read another's conversation history. NULL = legacy row (pre-migration),
+    # readable by any token for backward compatibility.
+    token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
