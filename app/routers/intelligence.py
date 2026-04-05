@@ -15,7 +15,7 @@ import os
 import re
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 from uuid import UUID
 
@@ -2893,6 +2893,224 @@ async def similar_repos(
     )
     try:
         await cache.set(cache_key, response.model_dump(), ttl=900)
+    except Exception:
+        pass
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Issue #226: /weekly-digest — weekly category-momentum summary
+# Pure SQL, $0 LLM cost. Summarises the top movers week-over-week by joining
+# repo_categories → repos.github_created_at. Cached for 1 hour.
+# ---------------------------------------------------------------------------
+
+
+class WeeklyDigestSampleRepo(BaseModel):
+    owner: str
+    name: str
+    stars: int
+
+
+class WeeklyDigestTopCategory(BaseModel):
+    id: str
+    name: str
+    new_7d: int
+    total_repos: int
+    sample_repos: list[WeeklyDigestSampleRepo]
+
+
+class WeeklyDigestNewRepo(BaseModel):
+    owner: str
+    name: str
+    category: str | None = None
+    stars: int
+    description: str | None = None
+
+
+class WeeklyDigestFastestGrowing(BaseModel):
+    id: str
+    name: str
+    new_7d: int
+    delta_pct: float
+
+
+class WeeklyDigestHighlights(BaseModel):
+    fastest_growing_category: WeeklyDigestFastestGrowing | None = None
+    total_new_repos_7d: int
+    new_categories_with_activity: list[str]
+
+
+class WeeklyDigestResponse(BaseModel):
+    generated_at: str
+    week_starting: str
+    highlights: WeeklyDigestHighlights
+    top_5_categories: list[WeeklyDigestTopCategory]
+    top_5_new_repos: list[WeeklyDigestNewRepo]
+
+
+async def _build_weekly_digest(db: AsyncSession) -> WeeklyDigestResponse:
+    """Build the weekly category-momentum digest using pure SQL.
+
+    Extracted from the route handler so tests can exercise the query logic
+    directly with an AsyncMock database session.
+    """
+    # Per-category 7d/30d counts + total, sorted by new_7d DESC.
+    cat_rows = (
+        await db.execute(
+            text(
+                """
+                SELECT rc.category_id AS id,
+                       MIN(rc.category_name) AS name,
+                       COUNT(CASE WHEN r.github_created_at > NOW() - INTERVAL '7 days' THEN 1 END)::int AS new_7d,
+                       COUNT(CASE WHEN r.github_created_at > NOW() - INTERVAL '30 days' THEN 1 END)::int AS new_30d,
+                       COUNT(*)::int AS total_repos
+                FROM repo_categories rc
+                JOIN repos r ON r.id = rc.repo_id AND r.is_private = false
+                GROUP BY rc.category_id
+                ORDER BY new_7d DESC, new_30d DESC, total_repos DESC
+                """
+            )
+        )
+    ).fetchall()
+
+    # Top 5 categories by new_7d with sample repos (highest-star recent adds).
+    top_category_ids = [row.id for row in cat_rows[:5] if (row.new_7d or 0) > 0]
+    samples_by_cat: dict[str, list[WeeklyDigestSampleRepo]] = {cid: [] for cid in top_category_ids}
+    if top_category_ids:
+        sample_rows = (
+            await db.execute(
+                text(
+                    """
+                    SELECT rc.category_id AS id,
+                           r.owner,
+                           r.name,
+                           COALESCE(r.stargazers_count, 0)::int AS stars,
+                           r.github_created_at
+                    FROM repo_categories rc
+                    JOIN repos r ON r.id = rc.repo_id AND r.is_private = false
+                    WHERE rc.category_id = ANY(:ids)
+                      AND r.github_created_at > NOW() - INTERVAL '7 days'
+                    ORDER BY rc.category_id, COALESCE(r.stargazers_count, 0) DESC
+                    """
+                ),
+                {"ids": top_category_ids},
+            )
+        ).fetchall()
+        for row in sample_rows:
+            bucket = samples_by_cat.setdefault(row.id, [])
+            if len(bucket) < 3:
+                bucket.append(
+                    WeeklyDigestSampleRepo(owner=row.owner, name=row.name, stars=int(row.stars or 0))
+                )
+
+    top_5_categories: list[WeeklyDigestTopCategory] = []
+    for row in cat_rows[:5]:
+        if (row.new_7d or 0) <= 0:
+            continue
+        top_5_categories.append(
+            WeeklyDigestTopCategory(
+                id=str(row.id),
+                name=row.name,
+                new_7d=int(row.new_7d or 0),
+                total_repos=int(row.total_repos or 0),
+                sample_repos=samples_by_cat.get(row.id, []),
+            )
+        )
+
+    # Top 5 newest repos by stars added in the last 7 days.
+    new_repo_rows = (
+        await db.execute(
+            text(
+                """
+                SELECT r.owner,
+                       r.name,
+                       r.description,
+                       COALESCE(r.stargazers_count, 0)::int AS stars,
+                       (
+                           SELECT rc.category_name
+                           FROM repo_categories rc
+                           WHERE rc.repo_id = r.id
+                           ORDER BY rc.is_primary DESC NULLS LAST, rc.category_name
+                           LIMIT 1
+                       ) AS category
+                FROM repos r
+                WHERE r.is_private = false
+                  AND r.github_created_at > NOW() - INTERVAL '7 days'
+                ORDER BY COALESCE(r.stargazers_count, 0) DESC, r.github_created_at DESC
+                LIMIT 5
+                """
+            )
+        )
+    ).fetchall()
+    top_5_new_repos = [
+        WeeklyDigestNewRepo(
+            owner=row.owner,
+            name=row.name,
+            category=row.category,
+            stars=int(row.stars or 0),
+            description=row.description,
+        )
+        for row in new_repo_rows
+    ]
+
+    # Highlights.
+    total_new_repos_7d = sum(int(row.new_7d or 0) for row in cat_rows)
+    new_categories_with_activity = [
+        str(row.id) for row in cat_rows if (row.new_7d or 0) > 0
+    ]
+
+    fastest_growing: WeeklyDigestFastestGrowing | None = None
+    if cat_rows and (cat_rows[0].new_7d or 0) > 0:
+        head = cat_rows[0]
+        base = int(head.total_repos or 0) - int(head.new_7d or 0)
+        delta_pct = (int(head.new_7d or 0) / base * 100.0) if base > 0 else 100.0
+        fastest_growing = WeeklyDigestFastestGrowing(
+            id=str(head.id),
+            name=head.name,
+            new_7d=int(head.new_7d or 0),
+            delta_pct=round(delta_pct, 2),
+        )
+
+    now = datetime.now(timezone.utc)
+    week_starting = (now - timedelta(days=now.weekday() + 7)).date().isoformat()
+
+    return WeeklyDigestResponse(
+        generated_at=now.isoformat(),
+        week_starting=week_starting,
+        highlights=WeeklyDigestHighlights(
+            fastest_growing_category=fastest_growing,
+            total_new_repos_7d=total_new_repos_7d,
+            new_categories_with_activity=new_categories_with_activity,
+        ),
+        top_5_categories=top_5_categories,
+        top_5_new_repos=top_5_new_repos,
+    )
+
+
+@router.get("/weekly-digest", response_model=WeeklyDigestResponse)
+@_limiter.limit("30/minute")
+async def weekly_digest(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+) -> WeeklyDigestResponse:
+    """Weekly category-momentum digest — top movers in the last 7 days.
+
+    Highlights the fastest-growing category, total new repo additions, and the
+    top 5 categories and top 5 starred new repos. Pure SQL, $0 LLM cost.
+    Cached for 1 hour.
+    """
+    cache_key = "intelligence:weekly_digest:v1"
+    try:
+        cached = await cache.get(cache_key)
+        if cached:
+            return WeeklyDigestResponse(**cached)
+    except Exception:
+        pass
+
+    response = await _build_weekly_digest(db)
+
+    try:
+        await cache.set(cache_key, response.model_dump(), ttl=3600)
     except Exception:
         pass
     return response
