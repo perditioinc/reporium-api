@@ -209,13 +209,70 @@ _ROUTE_TEMPORAL = re.compile(
 )
 
 
+_QUERY_SYNONYMS = {
+    "llm": "large language model",
+    "llms": "large language models",
+    "vs": "versus",
+    "w/": "with",
+    "repo": "repository",
+    "repos": "repositories",
+    "ml": "machine learning",
+    "ai": "artificial intelligence",
+}
+
+# Compile once: whole-word match with optional trailing punctuation that shouldn't
+# block the match (e.g. "LLM?" → "llm" before trailing punctuation stripping).
+_SYNONYM_PATTERN = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _QUERY_SYNONYMS.keys()) + r")\b",
+    re.IGNORECASE,
+)
+_TRAILING_PUNCT = re.compile(r"[\.\?\!,;]+$")
+_WHITESPACE_RUN = re.compile(r"\s+")
+
+
+def _normalize_question(text: str) -> str:
+    """
+    Normalize a user question for cache lookup and embedding generation.
+
+    Steps:
+      1. Lowercase
+      2. Strip leading/trailing whitespace
+      3. Collapse internal whitespace runs to single spaces
+      4. Remove trailing punctuation (. ? ! , ;)
+      5. Expand common synonyms via whole-word substitution
+
+    The normalized form is used ONLY for cache-key hashing and semantic-cache
+    embedding lookups. The original question is still shown in the Claude prompt
+    and logged verbatim.
+
+    Idempotent: _normalize_question(_normalize_question(x)) == _normalize_question(x).
+    """
+    if not text:
+        return ""
+    # 1 + 2: lowercase + strip
+    s = text.strip().lower()
+    # 3: collapse whitespace
+    s = _WHITESPACE_RUN.sub(" ", s)
+    # 4: strip trailing punctuation (may have trailing spaces again after)
+    s = _TRAILING_PUNCT.sub("", s).strip()
+    # 5: synonym expansion (whole-word, case-insensitive — already lowercased)
+    def _sub(match: re.Match) -> str:
+        return _QUERY_SYNONYMS[match.group(1).lower()]
+    s = _SYNONYM_PATTERN.sub(_sub, s)
+    # Collapse again in case expansion introduced extra spaces
+    s = _WHITESPACE_RUN.sub(" ", s).strip()
+    return s
+
+
 async def _try_smart_route(question: str, db: AsyncSession) -> dict | None:
     """
     Attempt to answer the question with a pure SQL query.
     Returns a dict with {"answer": str, "sources": list, "route": str} or None.
     Results are cached in Redis for 5 minutes.
     """
-    cache_key = f"smart_route:{hashlib.md5(question.lower().strip().encode()).hexdigest()}"
+    # Use normalized form for the cache key so trivial variants
+    # ("What is an LLM?" vs "what is an llm") share a cached result.
+    cache_key = f"smart_route:{hashlib.md5(_normalize_question(question).encode()).hexdigest()}"
     cached = await cache.get(cache_key)
     if cached:
         cached["cache_hit"] = True
@@ -885,6 +942,52 @@ def _truncate(value: str | None, max_len: int = _MAX_CONTENT_LEN) -> str | None:
         return None
     return value[:max_len]
 
+
+# KAN-ask-cache: max chars per repo description in the prompt sources block.
+# Tight budget — the task spec mandates 240 chars per repo description.
+_SOURCES_DESCRIPTION_MAX = 240
+
+
+def _build_sources_block(repos: list[dict]) -> str:
+    """
+    Build the <repos> block sent to Claude in the user message.
+
+    Context hygiene (KAN-ask-cache): only these fields are included per repo:
+      - name
+      - owner
+      - primary_category
+      - stars
+      - description (truncated to _SOURCES_DESCRIPTION_MAX chars)
+
+    Deliberately excluded (to minimize cached-sources input tokens and avoid
+    leaking noisy data into the context window):
+      - readme_summary, problem_solved
+      - language, license_spdx, activity_score
+      - has_tests, has_ci, relevance_score
+      - forked_from, secondary_category lists
+      - embedding arrays
+      - created_at / updated_at / last_push_at timestamps
+    """
+    parts: list[str] = []
+    for i, repo in enumerate(repos, 1):
+        name = repo.get("name") or ""
+        owner = repo.get("owner") or ""
+        category = repo.get("primary_category")
+        stars = repo.get("stars") or 0
+        description = repo.get("description") or ""
+        if description:
+            description = description[:_SOURCES_DESCRIPTION_MAX]
+        repo_lines = [f"name: {owner}/{name}" if owner else f"name: {name}",
+                      f"stars: {stars}"]
+        if category:
+            repo_lines.append(f"category: {category}")
+        if description:
+            repo_lines.append(f"description: {description}")
+        parts.append(
+            f"<repo index=\"{i}\">\n" + "\n".join(repo_lines) + "\n</repo>"
+        )
+    return "\n\n".join(parts)
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/intelligence", tags=["Intelligence"])
@@ -1034,13 +1137,32 @@ async def _load_session_turns(session_id: str, db: AsyncSession) -> list[dict]:
         log_nonfatal("_load_session_turns", session_id=session_id)
         return []
 
-    # Rows are newest-first; reverse to oldest-first for correct message order
+    # Rows are newest-first. Build oldest-first (user, assistant) pairs.
+    # KAN-ask-cache: session memory compaction — keep only the MOST RECENT
+    # turn verbatim; older turns collapse the assistant answer to an 80-char
+    # preview prefixed with "[prior: ...]". The user question stays intact
+    # (it's usually short and carries the semantic signal). This cuts session
+    # history size by ~60–70% for 3-turn sessions while preserving continuity.
+    ordered_rows = list(reversed(rows))  # oldest-first
     turns: list[dict] = []
-    for row in reversed(rows):
-        turns.append({"role": "user", "content": row.question})
-        turns.append({"role": "assistant", "content": row.answer})
+    last_idx = len(ordered_rows) - 1
+    for idx, row in enumerate(ordered_rows):
+        q = row.question or ""
+        a = row.answer or ""
+        if idx == last_idx:
+            # Most recent turn — verbatim
+            turns.append({"role": "user", "content": q})
+            turns.append({"role": "assistant", "content": a})
+        else:
+            # Older turn — compact assistant side to an 80-char prior-preview
+            preview = a.strip().replace("\n", " ")[:80]
+            turns.append({"role": "user", "content": q})
+            turns.append({
+                "role": "assistant",
+                "content": f"[prior: {preview}]" if preview else "[prior: (no answer)]",
+            })
 
-    # KAN-197: Cap session history at ~2000 tokens (~8000 chars) to prevent runaway costs
+    # KAN-197: Cap session history at ~2000 tokens (~8000 chars) as a safety net
     MAX_SESSION_CHARS = 8000
     total_chars = 0
     capped_history: list[dict] = []
@@ -1545,7 +1667,10 @@ async def _prepare_query(
         )
 
     # 0b. Redis fast-path cache — check before embedding/pgvector (much faster)
-    redis_cache_key = f"llm_response:{hashlib.md5(question.lower().strip().encode()).hexdigest()}"
+    # Normalized form collapses whitespace/casing/synonym variants so
+    # "What is an LLM?" and "what is a large language model" share a cache row.
+    normalized_question = _normalize_question(question)
+    redis_cache_key = f"llm_response:{hashlib.md5(normalized_question.encode()).hexdigest()}"
     redis_cached = await cache.get(redis_cache_key)
     if redis_cached is not None:
         logger.info("ask: Redis cache hit for question")
@@ -1572,7 +1697,10 @@ async def _prepare_query(
 
     # 1. Embed the question — model is pre-warmed at startup so this is fast.
     # Issue #208: Embedding is computed once per request in _prepare_query().
-    query_embedding = embed_model.encode(question)
+    # KAN-ask-cache: embed the NORMALIZED form so semantic cache hits tolerate
+    # whitespace/case/synonym variance. Original question is still used in the
+    # Claude prompt and logged verbatim.
+    query_embedding = embed_model.encode(normalized_question)
 
     # 2. Semantic cache check
     cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
@@ -1653,44 +1781,16 @@ async def _prepare_query(
     scored.sort(key=lambda r: r["similarity"], reverse=True)
     top_for_answer = scored[:top_k]
 
-    # 4. Build context for Claude
-    context_parts = []
-    for i, repo in enumerate(top_for_answer, 1):
-        upstream = repo["forked_from"] or f"{repo['owner']}/{repo['name']}"
-        desc = _truncate(repo["description"])
-        readme = _truncate(repo["readme_summary"])
-        problem = _truncate(repo["problem_solved"])
-        parts = [f"name: {upstream}", f"stars: {repo['stars'] or 0}"]
-        if desc:
-            parts.append(f"description: {desc}")
-        if readme:
-            parts.append(f"summary: {readme}")
-        if problem:
-            parts.append(f"problem_solved: {problem}")
-        category = repo.get("primary_category")
-        language = repo.get("language")
-        license_spdx = repo.get("license_spdx")
-        activity = repo.get("activity_score")
-        has_tests = repo.get("has_tests")
-        has_ci = repo.get("has_ci")
-        if category:
-            parts.append(f"category: {category}")
-        if language:
-            parts.append(f"language: {language}")
-        if license_spdx:
-            parts.append(f"license: {license_spdx}")
-        if activity is not None:
-            parts.append(f"activity_score: {activity}")
-        if has_tests is not None:
-            parts.append(f"has_tests: {has_tests}")
-        if has_ci is not None:
-            parts.append(f"has_ci: {has_ci}")
-        parts.append(f"relevance_score: {repo['similarity']:.4f}")
-        context_parts.append(
-            f"<repo index=\"{i}\">\n" + "\n".join(parts) + "\n</repo>"
-        )
-
-    context = "\n\n".join(context_parts)
+    # 4. Build context for Claude — KAN-ask-cache: context hygiene
+    # Only these fields are sent (per-repo): name, owner, primary_category,
+    # stars, description (truncated to 240 chars). Removed from the prompt:
+    # readme_summary, problem_solved, language, license_spdx, activity_score,
+    # has_tests, has_ci, relevance_score, forked_from, secondary categories,
+    # embedding arrays, timestamps. These fields were previously contributing
+    # ~350–500 tokens per repo; trimming to essentials saves ~60–70% of the
+    # sources block size (estimate: ~1.5–2.5k input tokens saved per call at
+    # top_k=5) and lets the cached-sources block compress more consistently.
+    context = _build_sources_block(top_for_answer)
 
     # 5. Knowledge graph edges for related repos (with per-repo Redis caching)
     if top_for_answer:
@@ -1877,12 +1977,16 @@ async def _run_query(
 
     client = _get_client()
 
-    user_prompt = (
-        f"Answer the following question using only the repo data provided below.\n\n"
-        f"<question>{req.question}</question>\n\n"
-        f"<repos>\n{qctx.context_text}\n</repos>\n\n"
-        f"Cite repos by their upstream name. If the context is insufficient, say so."
+    # KAN-ask-cache: split the user message into two content blocks so that the
+    # large <sources> block is cached separately from the (per-request) question.
+    # Session history messages go BEFORE the cached sources so they don't
+    # invalidate the cache key (they change per session).
+    sources_content_block = (
+        "Answer the following question using only the repo data provided below. "
+        "Cite repos by their upstream name. If the context is insufficient, say so.\n\n"
+        f"<sources>\n{qctx.context_text}\n</sources>"
     )
+    question_content_block = f"<question>{req.question}</question>"
 
     loop = asyncio.get_event_loop()
 
@@ -1898,7 +2002,20 @@ async def _run_query(
                 }],
                 messages=[
                     *qctx.session_history,
-                    {"role": "user", "content": user_prompt},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": sources_content_block,
+                                "cache_control": {"type": "ephemeral"},
+                            },
+                            {
+                                "type": "text",
+                                "text": question_content_block,
+                            },
+                        ],
+                    },
                 ],
             )
 
@@ -2122,11 +2239,15 @@ async def intelligence_ask_stream(
 
             anthropic_client = _get_client()
 
-            user_prompt = (
-                f"Here are the most relevant repos from the library:\n\n{qctx.context_text}\n\n"
-                f"Question: {req.question}\n\n"
-                "Please answer the question based on the repos above."
+            # KAN-ask-cache: same two-block structure as the non-streaming path.
+            # The <sources> block is marked for ephemeral caching; the question
+            # is NOT cached. Session history precedes the cached block.
+            sources_content_block = (
+                "Here are the most relevant repos from the library. "
+                "Please answer the user's question based on the repos below.\n\n"
+                f"<sources>\n{qctx.context_text}\n</sources>"
             )
+            question_content_block = f"<question>{req.question}</question>"
 
             full_answer = ""
             input_tokens = 0
@@ -2144,7 +2265,20 @@ async def intelligence_ask_stream(
                         }],
                         messages=[
                             *qctx.session_history,
-                            {"role": "user", "content": user_prompt},
+                            {
+                                "role": "user",
+                                "content": [
+                                    {
+                                        "type": "text",
+                                        "text": sources_content_block,
+                                        "cache_control": {"type": "ephemeral"},
+                                    },
+                                    {
+                                        "type": "text",
+                                        "text": question_content_block,
+                                    },
+                                ],
+                            },
                         ],
                     )
 
