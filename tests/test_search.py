@@ -1,3 +1,4 @@
+import numpy as np
 import pytest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -118,7 +119,7 @@ async def test_semantic_search_calls_distance_query_and_applies_limit():
         _ScalarsResult(repos),
     ])
     fake_model = MagicMock()
-    fake_model.encode.return_value = MagicMock(tolist=lambda: [0.1, 0.2, 0.3])
+    fake_model.encode.return_value = np.full(384, 0.1, dtype=np.float32)
 
     with patch("app.routers.search.get_embedding_model", return_value=fake_model):
         results = await _semantic_search(db, query="vector databases", limit=7)
@@ -144,7 +145,7 @@ async def test_semantic_search_falls_back_to_full_text_when_no_embeddings():
         _ScalarsResult(fallback_repos),  # full-text fallback returns results
     ])
     fake_model = MagicMock()
-    fake_model.encode.return_value = MagicMock(tolist=lambda: [0.1, 0.2, 0.3])
+    fake_model.encode.return_value = np.full(384, 0.1, dtype=np.float32)
 
     with patch("app.routers.search.get_embedding_model", return_value=fake_model):
         results = await _semantic_search(db, query="vector databases", limit=5)
@@ -172,7 +173,7 @@ async def test_semantic_search_returns_results_ordered_by_similarity():
         _ScalarsResult(repos),
     ])
     fake_model = MagicMock()
-    fake_model.encode.return_value = MagicMock(tolist=lambda: [0.1, 0.2, 0.3])
+    fake_model.encode.return_value = np.full(384, 0.1, dtype=np.float32)
 
     with patch("app.routers.search.get_embedding_model", return_value=fake_model):
         results = await _semantic_search(db, query="agent orchestration", limit=2)
