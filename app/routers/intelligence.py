@@ -36,7 +36,7 @@ from app.database import async_session_factory, get_db
 from app.embeddings import get_embedding_model
 from app.models.session import AskSession
 from app.rate_limit import rate_limit_storage
-from app.utils import get_anthropic_key, vec_to_pg
+from app.utils import get_anthropic_key, log_nonfatal, vec_to_pg
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
 _limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
@@ -58,17 +58,13 @@ _INJECTION_PATTERNS = re.compile(
 _MAX_CONTENT_LEN = 200  # max chars per repo field in context (reduced from 400 for cost)
 
 # ---------------------------------------------------------------------------
-# KAN-197: Lazy singleton Anthropic client — avoids creating a new client per request
+# KAN-197 / Issue #215: Lazy singleton Anthropic client.
+# The singleton itself lives in app.utils; this thin wrapper is preserved so
+# existing tests that patch ``app.routers.intelligence._get_client`` still work.
 # ---------------------------------------------------------------------------
-_anthropic_client: anthropic.Anthropic | None = None
-
-
 def _get_client() -> anthropic.Anthropic:
-    global _anthropic_client
-    if _anthropic_client is None:
-        from app.utils import get_anthropic_key
-        _anthropic_client = anthropic.Anthropic(api_key=get_anthropic_key())
-    return _anthropic_client
+    from app.utils import get_anthropic_client
+    return get_anthropic_client()
 _SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.15  # cosine distance ≤0.15 ≈ similarity ≥0.85 — relaxed for more cache hits
 
 # ---------------------------------------------------------------------------
@@ -1004,7 +1000,7 @@ async def _log_query(
             )
             await session.commit()
     except Exception:
-        logger.exception("query_log insert failed (non-fatal)")
+        log_nonfatal("query_log insert")
 
 
 # ---------------------------------------------------------------------------
@@ -1035,7 +1031,7 @@ async def _load_session_turns(session_id: str, db: AsyncSession) -> list[dict]:
         )
         rows = result.fetchall()
     except Exception:
-        logger.exception("_load_session_turns failed (non-fatal) for session %s", session_id)
+        log_nonfatal("_load_session_turns", session_id=session_id)
         return []
 
     # Rows are newest-first; reverse to oldest-first for correct message order
@@ -1090,7 +1086,7 @@ async def _save_session_turn(session_id: str, question: str, answer: str) -> Non
             )
             await db.commit()
     except Exception:
-        logger.exception("Failed to save session turn")
+        log_nonfatal("_save_session_turn", session_id=session_id)
 
 
 class QueryRequest(BaseModel):
@@ -1558,7 +1554,8 @@ async def _prepare_query(
 
     embed_model = get_embedding_model()
 
-    # 1. Embed the question — model is pre-warmed at startup so this is fast
+    # 1. Embed the question — model is pre-warmed at startup so this is fast.
+    # Issue #208: Embedding is computed once per request in _prepare_query().
     query_embedding = embed_model.encode(question)
 
     # 2. Semantic cache check
