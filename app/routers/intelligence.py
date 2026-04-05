@@ -1815,7 +1815,44 @@ async def _prepare_query(
     # KAN-ask-cache: embed the NORMALIZED form so semantic cache hits tolerate
     # whitespace/case/synonym variance. Original question is still used in the
     # Claude prompt and logged verbatim.
-    query_embedding = embed_model.encode(normalized_question)
+    # KAN-ask-timeout: guard against embedding model hangs (e.g. model not loaded,
+    # huge input, or CPU contention on Cloud Run cold starts).
+    try:
+        query_embedding = await asyncio.wait_for(
+            asyncio.get_event_loop().run_in_executor(
+                None, lambda: embed_model.encode(normalized_question)
+            ),
+            timeout=5.0,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "Embedding generation timed out after 5s for question (len=%d)",
+            len(normalized_question),
+        )
+        query_embedding = None  # fall through — return early-exit "not enough data"
+
+    # If embedding failed, return a graceful early-exit response so the caller
+    # doesn't proceed to pgvector search (which requires a valid embedding).
+    if query_embedding is None:
+        return QueryContext(
+            sources=[],
+            context_text="",
+            model="embedding-timeout",
+            session_history=[],
+            cache_result={
+                "answer": (
+                    "I'm sorry, I wasn't able to process your question quickly enough. "
+                    "Please try again in a moment."
+                ),
+                "sources": [],
+                "tokens_used": {"input": 0, "output": 0, "total": 0},
+                "cache_source": None,
+                "cache_hit": False,
+            },
+            query_embedding=None,
+            route_label=None,
+            redis_cache_key=redis_cache_key,
+        )
 
     # 2. Semantic cache check
     cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
@@ -2591,7 +2628,7 @@ async def intelligence_ask_stream(
                 try:
                     item = await loop.run_in_executor(
                         None,
-                        lambda: token_queue.get(timeout=35),
+                        lambda: token_queue.get(timeout=_CLAUDE_TIMEOUT_S),
                     )
                 except queue.Empty:
                     yield f"data: {json.dumps({'type': 'error', 'message': 'Stream timed out'})}\n\n"
