@@ -66,7 +66,15 @@ _MAX_CONTENT_LEN = 200  # max chars per repo field in context (reduced from 400 
 def _get_client() -> anthropic.Anthropic:
     from app.utils import get_anthropic_client
     return get_anthropic_client()
-_SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.15  # cosine distance ≤0.15 ≈ similarity ≥0.85 — relaxed for more cache hits
+_SEMANTIC_CACHE_DISTANCE_THRESHOLD = 0.15  # default; see _semantic_cache_threshold()
+
+
+def _semantic_cache_threshold() -> float:
+    # Feature flag: ASK_CACHE_RELAXED=1 widens the semantic-cache match
+    # radius from 0.15 (strict, ~85% similarity) to 0.25 (relaxed, ~75%).
+    # Enables live A/B testing without a code deploy.
+    import os
+    return 0.25 if os.getenv("ASK_CACHE_RELAXED", "").strip() == "1" else 0.15
 
 # ---------------------------------------------------------------------------
 # KAN-124: Tiered model selection — Haiku for simple queries, Sonnet for complex
@@ -269,7 +277,7 @@ async def _try_smart_route(question: str, db: AsyncSession) -> dict | None:
     """
     Attempt to answer the question with a pure SQL query.
     Returns a dict with {"answer": str, "sources": list, "route": str} or None.
-    Results are cached in Redis for 5 minutes.
+    Results are cached in Redis for 1 hour (KAN-ask-cache-effectiveness).
     """
     # Use normalized form for the cache key so trivial variants
     # ("What is an LLM?" vs "what is an llm") share a cached result.
@@ -281,7 +289,9 @@ async def _try_smart_route(question: str, db: AsyncSession) -> dict | None:
 
     result = await _try_smart_route_inner(question, db)
     if result is not None:
-        await cache.set(cache_key, result, ttl=300)
+        # KAN-ask-cache-effectiveness: bumped from 300s; smart-route answers
+        # come from SQL aggregates that change at most hourly.
+        await cache.set(cache_key, result, ttl=3600)
     return result
 
 
@@ -1444,7 +1454,7 @@ async def _find_semantic_cache_hit(
         """),
         {
             "vec": vec_to_pg(question_embedding),
-            "distance_threshold": _SEMANTIC_CACHE_DISTANCE_THRESHOLD,
+            "distance_threshold": _semantic_cache_threshold(),
         },
     )
     row = result.first()
