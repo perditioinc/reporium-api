@@ -79,6 +79,57 @@ _COMPLEX_PATTERNS = re.compile(
 _MODEL_HAIKU = "claude-haiku-4-5-20250414"
 _MODEL_SONNET = "claude-sonnet-4-20250514"
 
+# KAN-ask-output-caps: per-model output token caps. Golden-set avg answer is
+# ~280 tokens, so 512/768 leaves generous headroom while cutting the 1024
+# default nearly in half. Both call sites use ``_max_tokens_for(qctx.model)``.
+_MAX_OUTPUT_TOKENS = {
+    _MODEL_HAIKU: 512,
+    _MODEL_SONNET: 768,
+}
+
+
+def _max_tokens_for(model: str) -> int:
+    """Return the per-model ``max_tokens`` cap for Claude calls.
+
+    Falls back to 768 for unknown/unmapped models so we never regress to the
+    old 1024 default.
+    """
+    return _MAX_OUTPUT_TOKENS.get(model, 768)
+
+
+# KAN-ask-output-caps: stop sequences — abort generation when Claude tries to
+# emit closing answer tags or boilerplate disclaimers. Keeps outputs tight.
+_ASK_STOP_SEQUENCES = ["</answer>", "\n\nNote:", "\n\nDisclaimer:"]
+
+# KAN-ask-output-caps: low-quality answer markers — if Claude replies with one
+# of these phrases we cache the response for a short window only (and skip the
+# persistent semantic cache) so bad answers don't propagate.
+_LOW_QUALITY_MARKERS = (
+    "i don't know",
+    "i don't have enough",
+    "i cannot answer",
+    "not enough information",
+)
+
+
+def _is_low_quality_answer(answer: str) -> bool:
+    """Return True if the model's answer looks like a refusal / punt."""
+    if not answer or len(answer.strip()) < 50:
+        return True
+    lowered = answer.lower()
+    return any(marker in lowered for marker in _LOW_QUALITY_MARKERS)
+
+
+# KAN-ask-output-caps: retrieval confidence floor. If no retrieved source has
+# similarity >= this value, skip the LLM call entirely and return a canned
+# "not enough info" response. Saves ~100% of token cost on junk queries.
+_MIN_RETRIEVAL_SIMILARITY = 0.40
+_EARLY_EXIT_ANSWER = (
+    "I don't have enough relevant information in the Reporium knowledge base "
+    "to answer that question. Try asking about specific AI dev tools, libraries, "
+    "or repository categories."
+)
+
 
 def _select_model(question: str, num_repos: int) -> str:
     """Return the appropriate Claude model based on question complexity heuristics."""
@@ -1130,7 +1181,7 @@ async def _log_query(
 # KAN-158: Conversational memory helpers — session-scoped last-3-turns store
 # ---------------------------------------------------------------------------
 
-_MAX_SESSION_TURNS = 3  # turns prepended to Claude's messages array
+_MAX_SESSION_TURNS = 2  # turns prepended to Claude's messages array (KAN-ask-output-caps: dropped 3->2 to trim prompt tokens)
 
 
 async def _load_session_turns(
@@ -2035,6 +2086,49 @@ async def _run_query(
         ))
         return response
 
+    # KAN-ask-output-caps: low-similarity early-exit guard. If retrieval
+    # brought back nothing relevant (max similarity < 0.40) there is no point
+    # paying Claude to produce a confabulated answer — return a deterministic
+    # "insufficient info" response and cache it briefly so repeat junk queries
+    # don't re-embed.
+    if qctx.sources and max(s["similarity"] for s in qctx.sources) < _MIN_RETRIEVAL_SIMILARITY:
+        logger.info(
+            "ask: early-exit guard fired (max similarity %.3f < %.2f) — no Claude call",
+            max(s["similarity"] for s in qctx.sources),
+            _MIN_RETRIEVAL_SIMILARITY,
+        )
+        early_response = QueryResponse(
+            answer=_EARLY_EXIT_ANSWER,
+            sources=[],
+            question=req.question,
+            model="early-exit",
+            answered_at=datetime.now(timezone.utc).isoformat(),
+            embedding_candidates=qctx.embedding_candidates,
+            cache_hit=False,
+            tokens_used={"input": 0, "output": 0, "total": 0},
+        )
+        if qctx.redis_cache_key:
+            asyncio.create_task(cache.set(qctx.redis_cache_key, {
+                "answer": _EARLY_EXIT_ANSWER,
+                "sources": [],
+                "tokens_used": {"input": 0, "output": 0, "total": 0},
+                "model": "early-exit",
+                "negative": True,
+            }, ttl=300))
+        asyncio.create_task(_log_query(
+            question=req.question,
+            answer=_EARLY_EXIT_ANSWER,
+            sources=[],
+            tokens_prompt=0,
+            tokens_completion=0,
+            hashed_ip=_hash_ip(client_ip),
+            latency_ms=int((time.monotonic() - _started_at) * 1000),
+            model="early-exit",
+            question_embedding=None,
+            cache_hit=False,
+        ))
+        return early_response
+
     # Daily cost cap check — reject before calling Claude if budget exhausted
     if not await check_budget():
         raise HTTPException(
@@ -2061,7 +2155,8 @@ async def _run_query(
         with anthropic_breaker:
             return client.messages.create(
                 model=qctx.model,
-                max_tokens=1024,
+                max_tokens=_max_tokens_for(qctx.model),
+                stop_sequences=_ASK_STOP_SEQUENCES,
                 system=[{
                     "type": "text",
                     "text": _SYSTEM_PROMPT,
@@ -2152,15 +2247,33 @@ async def _run_query(
         tokens_used=tokens_used,
     )
 
-    # Cache the full LLM response in Redis for fast-path on repeat questions (30 min TTL)
-    asyncio.create_task(cache.set(qctx.redis_cache_key, {
+    # Cache the full LLM response in Redis for fast-path on repeat questions.
+    # KAN-ask-output-caps: low-quality answers (refusals / short) get a short
+    # TTL + "negative" marker and their log row is written with a NULL
+    # embedding so bad answers can't propagate via the semantic cache.
+    _negative = _is_low_quality_answer(answer)
+    _cache_payload = {
         "answer": answer,
         "sources": [source.model_dump() for source in sources],
         "tokens_used": tokens_used,
         "model": qctx.model,
-    }, ttl=1800))
+    }
+    if _negative:
+        _cache_payload["negative"] = True
+        asyncio.create_task(cache.set(qctx.redis_cache_key, _cache_payload, ttl=60))
+        logger.info("ask: negative-cached low-quality answer (len=%d)", len(answer or ""))
+    else:
+        asyncio.create_task(cache.set(qctx.redis_cache_key, _cache_payload, ttl=1800))
 
-    # Fire-and-forget — log after response is built, never blocks the caller
+    # Fire-and-forget — log after response is built, never blocks the caller.
+    # For negative answers, log with NULL embedding so the row is invisible
+    # to the pgvector-backed semantic cache lookup (which filters
+    # ``question_embedding_vec IS NOT NULL``).
+    _log_embedding = (
+        None
+        if _negative
+        else (np.array(qctx.query_embedding) if qctx.query_embedding else None)
+    )
     asyncio.create_task(_log_query(
         question=req.question,
         answer=answer,
@@ -2170,11 +2283,13 @@ async def _run_query(
         hashed_ip=_hash_ip(client_ip),
         latency_ms=int((time.monotonic() - _started_at) * 1000),
         model=qctx.model,
-        question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
+        question_embedding=_log_embedding,
     ))
 
-    # Save this turn to the session store so future turns can reference it (KAN-158)
-    if effective_session_id:
+    # Save this turn to the session store so future turns can reference it
+    # (KAN-158). Skip persisting negative answers so follow-ups don't start
+    # from "I don't know".
+    if effective_session_id and not _negative:
         asyncio.create_task(
             _save_session_turn(effective_session_id, req.question, answer, token_hash)
         )
@@ -2320,6 +2435,45 @@ async def intelligence_ask_stream(
                 ))
                 return
 
+            # KAN-ask-output-caps: low-similarity early-exit guard for the
+            # streaming path. Identical logic to the non-streaming _run_query
+            # branch — bail out before spending a Claude call when retrieval
+            # is clearly off-topic.
+            if qctx.sources and max(s["similarity"] for s in qctx.sources) < _MIN_RETRIEVAL_SIMILARITY:
+                logger.info(
+                    "ask/stream: early-exit guard fired (max similarity %.3f < %.2f)",
+                    max(s["similarity"] for s in qctx.sources),
+                    _MIN_RETRIEVAL_SIMILARITY,
+                )
+                yield f"data: {json.dumps({'type': 'sources', 'sources': [], 'cache_hit': False})}\n\n"
+                words = _EARLY_EXIT_ANSWER.split(" ")
+                for i, word in enumerate(words):
+                    chunk = word + (" " if i < len(words) - 1 else "")
+                    yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
+                    await asyncio.sleep(0)
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'model': 'early-exit'})}\n\n"
+                if qctx.redis_cache_key:
+                    asyncio.create_task(cache.set(qctx.redis_cache_key, {
+                        "answer": _EARLY_EXIT_ANSWER,
+                        "sources": [],
+                        "tokens_used": {"input": 0, "output": 0, "total": 0},
+                        "model": "early-exit",
+                        "negative": True,
+                    }, ttl=300))
+                asyncio.create_task(_log_query(
+                    question=req.question,
+                    answer=_EARLY_EXIT_ANSWER,
+                    sources=[],
+                    tokens_prompt=0,
+                    tokens_completion=0,
+                    hashed_ip=_hash_ip(client_ip),
+                    latency_ms=int((time.monotonic() - _started_at) * 1000),
+                    model="early-exit",
+                    question_embedding=None,
+                    cache_hit=False,
+                ))
+                return
+
             # Emit sources before generation starts
             source_list = [
                 SourceRepo(
@@ -2358,7 +2512,8 @@ async def intelligence_ask_stream(
                 with anthropic_breaker:
                     return anthropic_client.messages.stream(
                         model=qctx.model,
-                        max_tokens=1024,
+                        max_tokens=_max_tokens_for(qctx.model),
+                        stop_sequences=_ASK_STOP_SEQUENCES,
                         system=[{
                             "type": "text",
                             "text": _SYSTEM_PROMPT,
@@ -2444,14 +2599,29 @@ async def intelligence_ask_stream(
                     # Record actual token-based cost
                     _stream_est_cost = _estimate_cost(input_tokens, output_tokens, qctx.model)
                     await record_cost(_stream_est_cost, model=qctx.model)
-                    # Cache the full LLM response in Redis (30 min TTL)
-                    asyncio.create_task(cache.set(qctx.redis_cache_key, {
+                    # KAN-ask-output-caps: negative caching on low-quality
+                    # streamed answers — short TTL + "negative" flag, and
+                    # the log row is written with NULL embedding so semantic
+                    # cache cannot recycle it.
+                    _stream_negative = _is_low_quality_answer(full_answer)
+                    _stream_payload = {
                         "answer": full_answer,
                         "sources": [s.model_dump() for s in source_list],
                         "tokens_used": tokens_info,
                         "model": qctx.model,
-                    }, ttl=1800))
+                    }
+                    if _stream_negative:
+                        _stream_payload["negative"] = True
+                        asyncio.create_task(cache.set(qctx.redis_cache_key, _stream_payload, ttl=60))
+                        logger.info("ask/stream: negative-cached low-quality answer (len=%d)", len(full_answer or ""))
+                    else:
+                        asyncio.create_task(cache.set(qctx.redis_cache_key, _stream_payload, ttl=1800))
                     # Fire-and-forget log
+                    _stream_log_embedding = (
+                        None
+                        if _stream_negative
+                        else (np.array(qctx.query_embedding) if qctx.query_embedding else None)
+                    )
                     asyncio.create_task(_log_query(
                         question=req.question, answer=full_answer,
                         sources=[s.model_dump() for s in source_list],
@@ -2459,10 +2629,11 @@ async def intelligence_ask_stream(
                         hashed_ip=_hash_ip(client_ip),
                         latency_ms=int((time.monotonic() - _started_at) * 1000),
                         model=qctx.model,
-                        question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
+                        question_embedding=_stream_log_embedding,
                     ))
-                    # Save turn to session for multi-turn continuity (KAN-158)
-                    if req.session_id and full_answer:
+                    # Save turn to session for multi-turn continuity (KAN-158).
+                    # Skip negative answers so follow-ups don't start from "I don't know".
+                    if req.session_id and full_answer and not _stream_negative:
                         asyncio.create_task(
                             _save_session_turn(req.session_id, req.question, full_answer, token_hash)
                         )
