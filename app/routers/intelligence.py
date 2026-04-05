@@ -2124,7 +2124,7 @@ async def _run_query(
             hashed_ip=_hash_ip(client_ip),
             latency_ms=int((time.monotonic() - _started_at) * 1000),
             model="early-exit",
-            question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
+            question_embedding=None,
             cache_hit=False,
         ))
         return early_response
@@ -2249,8 +2249,8 @@ async def _run_query(
 
     # Cache the full LLM response in Redis for fast-path on repeat questions.
     # KAN-ask-output-caps: low-quality answers (refusals / short) get a short
-    # TTL + "negative" marker and are NOT written to the persistent semantic
-    # cache elsewhere, so bad answers can't propagate.
+    # TTL + "negative" marker and their log row is written with a NULL
+    # embedding so bad answers can't propagate via the semantic cache.
     _negative = _is_low_quality_answer(answer)
     _cache_payload = {
         "answer": answer,
@@ -2266,11 +2266,10 @@ async def _run_query(
         asyncio.create_task(cache.set(qctx.redis_cache_key, _cache_payload, ttl=1800))
 
     # Fire-and-forget — log after response is built, never blocks the caller.
-    # KAN-ask-output-caps: for low-quality answers, log with a NULL
-    # question_embedding so the row is invisible to the pgvector-backed
-    # semantic cache lookup (which filters ``question_embedding_vec IS NOT
-    # NULL``). This keeps observability while preventing bad answers from
-    # being recycled.
+    # For negative/low-quality answers, log with NULL embedding so the row is
+    # invisible to the pgvector-backed semantic cache lookup (which filters
+    # ``question_embedding_vec IS NOT NULL``). Keeps observability while
+    # preventing bad answers from being recycled.
     _log_embedding = (
         None
         if _negative
@@ -2289,8 +2288,8 @@ async def _run_query(
     ))
 
     # Save this turn to the session store so future turns can reference it
-    # (KAN-158). Skip persisting negative answers so follow-up turns don't
-    # start from "I don't know".
+    # (KAN-158). Skip persisting negative answers so follow-ups don't start
+    # from "I don't know".
     if effective_session_id and not _negative:
         asyncio.create_task(
             _save_session_turn(effective_session_id, req.question, answer, token_hash)
@@ -2634,8 +2633,7 @@ async def intelligence_ask_stream(
                         question_embedding=_stream_log_embedding,
                     ))
                     # Save turn to session for multi-turn continuity (KAN-158).
-                    # Skip persisting negative answers so follow-ups don't
-                    # start from "I don't know".
+                    # Skip negative answers so follow-ups don't start from "I don't know".
                     if req.session_id and full_answer and not _stream_negative:
                         asyncio.create_task(
                             _save_session_turn(req.session_id, req.question, full_answer, token_hash)
