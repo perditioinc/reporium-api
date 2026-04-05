@@ -2553,3 +2553,274 @@ async def category_leaders(
     if not rows:
         raise HTTPException(status_code=404, detail=f"No repos found for category '{category}'")
     return {"category": category, "repos": rows}
+
+
+# ---------------------------------------------------------------------------
+# Issue #213: /category-momentum — categories ranked by repo addition velocity
+# Issue #214: /similar/{owner}/{name} — similar repos with SQL-based explanations
+# Both endpoints are $0 LLM cost (pure SQL + caching).
+# ---------------------------------------------------------------------------
+
+
+class CategoryMomentumItem(BaseModel):
+    id: str
+    name: str
+    description: str | None = None
+    new_7d: int
+    new_30d: int
+    total_repos: int
+    momentum_score: int
+
+
+class CategoryMomentumResponse(BaseModel):
+    generated_at: str
+    categories: list[CategoryMomentumItem]
+
+
+@router.get("/category-momentum", response_model=CategoryMomentumResponse)
+@_limiter.limit("30/minute")
+async def category_momentum(
+    request: Request,
+    limit: int = Query(20, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+) -> CategoryMomentumResponse:
+    """
+    Categories ranked by repo addition velocity (new repos in the last 7/30 days).
+
+    Uses repo_categories (category_id, category_name) joined to repos.ingested_at
+    (Reporium has no repos.created_at — ingested_at is when the repo was added).
+    Pure SQL, $0 LLM cost. Cached for 1 hour.
+    """
+    cache_key = f"intelligence:category_momentum:v1:{limit}"
+    try:
+        cached = await cache.get(cache_key)
+        if cached:
+            return CategoryMomentumResponse(**cached)
+    except Exception:
+        pass
+
+    result = await db.execute(
+        text("""
+            SELECT rc.category_id AS id,
+                   MIN(rc.category_name) AS name,
+                   COUNT(CASE WHEN r.ingested_at > NOW() - INTERVAL '7 days' THEN 1 END)::int AS new_7d,
+                   COUNT(CASE WHEN r.ingested_at > NOW() - INTERVAL '30 days' THEN 1 END)::int AS new_30d,
+                   COUNT(*)::int AS total_repos
+            FROM repo_categories rc
+            JOIN repos r ON r.id = rc.repo_id AND r.is_private = false
+            GROUP BY rc.category_id
+            HAVING COUNT(CASE WHEN r.ingested_at > NOW() - INTERVAL '30 days' THEN 1 END) > 0
+            ORDER BY new_7d DESC, new_30d DESC
+            LIMIT :limit
+        """),
+        {"limit": limit},
+    )
+    categories = [
+        CategoryMomentumItem(
+            id=str(row.id),
+            name=row.name,
+            description=None,
+            new_7d=int(row.new_7d or 0),
+            new_30d=int(row.new_30d or 0),
+            total_repos=int(row.total_repos or 0),
+            momentum_score=int(row.new_7d or 0) * 4 + int(row.new_30d or 0),
+        )
+        for row in result.fetchall()
+    ]
+
+    response = CategoryMomentumResponse(
+        generated_at=datetime.now(timezone.utc).isoformat(),
+        categories=categories,
+    )
+    try:
+        await cache.set(cache_key, response.model_dump(), ttl=3600)
+    except Exception:
+        pass
+    return response
+
+
+class SimilarExplanation(BaseModel):
+    shared_categories: list[str]
+    shared_tags: list[str]
+    same_language: bool
+
+
+class SimilarRepoItem(BaseModel):
+    owner: str
+    name: str
+    github_url: str
+    score: int
+    explanation: SimilarExplanation
+
+
+class SimilarTarget(BaseModel):
+    owner: str
+    name: str
+
+
+class SimilarReposResponse(BaseModel):
+    target: SimilarTarget
+    similar: list[SimilarRepoItem]
+
+
+@router.get("/similar/{owner}/{name}", response_model=SimilarReposResponse)
+@_limiter.limit("60/minute")
+async def similar_repos(
+    request: Request,
+    owner: str,
+    name: str,
+    limit: int = Query(10, ge=1, le=25),
+    db: AsyncSession = Depends(get_db),
+) -> SimilarReposResponse:
+    """
+    Similar repos with SQL-based explanations of WHY they match.
+
+    Scoring: len(shared_categories)*3 + len(shared_tags)*2 + (1 if same_language else 0).
+    Pure SQL, $0 LLM cost. Cached for 15 minutes.
+    """
+    cache_key = f"intelligence:similar:v1:{owner}/{name}:{limit}"
+    try:
+        cached = await cache.get(cache_key)
+        if cached:
+            return SimilarReposResponse(**cached)
+    except Exception:
+        pass
+
+    # 1. Find target repo
+    target_row = (
+        await db.execute(
+            text("""
+                SELECT id, owner, name, primary_language
+                FROM repos
+                WHERE owner = :owner AND name = :name AND is_private = false
+                LIMIT 1
+            """),
+            {"owner": owner, "name": name},
+        )
+    ).first()
+    if target_row is None:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    target_id = target_row.id
+    target_language = target_row.primary_language
+
+    # 2. Target categories + tags
+    target_cat_rows = (
+        await db.execute(
+            text("SELECT category_id, category_name FROM repo_categories WHERE repo_id = :rid"),
+            {"rid": target_id},
+        )
+    ).fetchall()
+    target_category_ids = {row.category_id for row in target_cat_rows}
+    target_category_names = {row.category_id: row.category_name for row in target_cat_rows}
+
+    target_tag_rows = (
+        await db.execute(
+            text("SELECT tag FROM repo_tags WHERE repo_id = :rid"),
+            {"rid": target_id},
+        )
+    ).fetchall()
+    target_tags = {row.tag for row in target_tag_rows}
+
+    # 3. Candidate repos sharing at least one category or tag
+    candidate_rows = (
+        await db.execute(
+            text("""
+                SELECT DISTINCT r.id, r.owner, r.name, r.github_url, r.primary_language
+                FROM repos r
+                WHERE r.is_private = false
+                  AND r.id <> :tid
+                  AND (
+                        r.id IN (SELECT repo_id FROM repo_categories WHERE category_id = ANY(:cat_ids))
+                     OR r.id IN (SELECT repo_id FROM repo_tags WHERE tag = ANY(:tags))
+                  )
+                LIMIT 20
+            """),
+            {
+                "tid": target_id,
+                "cat_ids": list(target_category_ids) if target_category_ids else [""],
+                "tags": list(target_tags) if target_tags else [""],
+            },
+        )
+    ).fetchall()
+
+    if not candidate_rows:
+        response = SimilarReposResponse(
+            target=SimilarTarget(owner=target_row.owner, name=target_row.name),
+            similar=[],
+        )
+        try:
+            await cache.set(cache_key, response.model_dump(), ttl=900)
+        except Exception:
+            pass
+        return response
+
+    candidate_ids = [row.id for row in candidate_rows]
+
+    # Batch-fetch categories and tags for all candidates
+    cand_cat_rows = (
+        await db.execute(
+            text(
+                "SELECT repo_id, category_id, category_name FROM repo_categories "
+                "WHERE repo_id = ANY(:ids)"
+            ),
+            {"ids": candidate_ids},
+        )
+    ).fetchall()
+    cand_cats: dict = {}
+    for row in cand_cat_rows:
+        cand_cats.setdefault(row.repo_id, []).append((row.category_id, row.category_name))
+
+    cand_tag_rows = (
+        await db.execute(
+            text("SELECT repo_id, tag FROM repo_tags WHERE repo_id = ANY(:ids)"),
+            {"ids": candidate_ids},
+        )
+    ).fetchall()
+    cand_tags: dict = {}
+    for row in cand_tag_rows:
+        cand_tags.setdefault(row.repo_id, []).append(row.tag)
+
+    # 4. Score each candidate
+    scored: list[SimilarRepoItem] = []
+    for row in candidate_rows:
+        these_cats = cand_cats.get(row.id, [])
+        these_tags = cand_tags.get(row.id, [])
+
+        shared_category_ids = {cid for cid, _ in these_cats if cid in target_category_ids}
+        shared_category_names = sorted(
+            {target_category_names[cid] for cid in shared_category_ids}
+        )
+        shared_tag_list = sorted(set(these_tags) & target_tags)
+        same_language = bool(
+            target_language and row.primary_language and target_language == row.primary_language
+        )
+        score = len(shared_category_names) * 3 + len(shared_tag_list) * 2 + (1 if same_language else 0)
+
+        scored.append(
+            SimilarRepoItem(
+                owner=row.owner,
+                name=row.name,
+                github_url=row.github_url,
+                score=score,
+                explanation=SimilarExplanation(
+                    shared_categories=shared_category_names,
+                    shared_tags=shared_tag_list,
+                    same_language=same_language,
+                ),
+            )
+        )
+
+    # 5. Top N by score desc
+    scored.sort(key=lambda item: item.score, reverse=True)
+    top = scored[:limit]
+
+    response = SimilarReposResponse(
+        target=SimilarTarget(owner=target_row.owner, name=target_row.name),
+        similar=top,
+    )
+    try:
+        await cache.set(cache_key, response.model_dump(), ttl=900)
+    except Exception:
+        pass
+    return response
