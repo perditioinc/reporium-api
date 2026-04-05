@@ -79,6 +79,11 @@ class Settings(BaseSettings):
     # Mode
     environment: str = "development"  # development, production
 
+    # KAN-ask-spend: soft daily budget surfaced via /metrics/spend.
+    # Purely advisory — hard cap still lives in app.cost_tracker (Redis-backed).
+    # Not wired into deploy workflow env vars; defaults are fine for prod.
+    spend_daily_budget_usd: float = 10.0
+
     class Config:
         env_file = ".env"
 

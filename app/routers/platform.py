@@ -3,14 +3,21 @@
 import os
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_ingest_key, verify_api_key
+from app.config import settings
 from app.database import get_db
 from app.models.repo import Repo, RepoAIDevSkill, RepoCategory
-from app.slo_observer import slo_observer
+from app.rate_limit import rate_limit_storage
+from app.slo_observer import slo_observer, token_observer
+
+# Shared limiter — matches the pattern used in intelligence.py / nl_filter.py.
+_limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 # SLO targets documented in docs/SLOs.md. These are the thresholds the
 # /metrics/slo endpoint compares live values against. Keeping the dict here
@@ -125,11 +132,74 @@ async def metrics_slo() -> dict:
             "breaches": breaches,
         }
 
+    # KAN-ask-spend: surface a compact cost summary alongside latency/error SLOs
+    # so dashboards pulling /metrics/slo get token spend for free.
+    spend_snapshot = token_observer.get_spend_snapshot()
+    total_usd = spend_snapshot["total"]["usd"]
+    spend_status = _spend_status(total_usd, settings.spend_daily_budget_usd)
+    spend_summary = {
+        "usd_24h": total_usd,
+        "cache_hit_rate": spend_snapshot["total"]["cache_hit_rate"],
+        "status": spend_status,
+    }
+
     return {
         "window_seconds": 24 * 60 * 60,
         "source": "in_memory_histogram",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "routes": routes,
+        "spend_summary": spend_summary,
+    }
+
+
+def _spend_status(total_usd: float, budget_usd: float) -> str:
+    """
+    Map total spend against the soft daily budget:
+      < 80%  -> ok
+      80-100% -> warning
+      >= 100% -> breach
+    """
+    if budget_usd <= 0:
+        return "ok"
+    ratio = total_usd / budget_usd
+    if ratio >= 1.0:
+        return "breach"
+    if ratio >= 0.8:
+        return "warning"
+    return "ok"
+
+
+@router.get("/metrics/spend", response_model=dict)
+@_limiter.limit("30/minute")
+async def metrics_spend(request: Request) -> dict:
+    """
+    Live 24h LLM token-spend snapshot for cost observability.
+
+    Values come from an in-memory rolling accumulator populated by
+    /intelligence/ask and /intelligence/nl-filter. Same caveat as /metrics/slo:
+    single-process only, intended for dashboards and on-call debugging, NOT a
+    replacement for billing.
+
+    The top-level ``status`` field maps the total 24h spend against the soft
+    daily budget (``SPEND_DAILY_BUDGET_USD``, default $10):
+
+      < 80%    -> ok
+      80-100%  -> warning
+      >= 100%  -> breach
+    """
+    snapshot = token_observer.get_spend_snapshot()
+    budget = settings.spend_daily_budget_usd
+    total = snapshot["total"]
+    status = _spend_status(total["usd"], budget)
+
+    return {
+        "window_seconds": 24 * 60 * 60,
+        "source": "in_memory_accumulator",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "daily_budget_usd": budget,
+        "total": total,
+        "routes": snapshot["routes"],
+        "status": status,
     }
 
 
