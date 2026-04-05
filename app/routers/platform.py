@@ -9,7 +9,7 @@ from slowapi.util import get_remote_address
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.auth import require_ingest_key, verify_api_key
+from app.auth import require_ingest_key, require_metrics_access, verify_api_key
 from app.config import settings
 from app.database import get_db
 from app.models.repo import Repo, RepoAIDevSkill, RepoCategory
@@ -33,7 +33,10 @@ router = APIRouter(tags=["Platform"])
 
 
 @router.get("/metrics/latest", response_model=dict)
-async def metrics_latest(db: AsyncSession = Depends(get_db)) -> dict:
+async def metrics_latest(
+    db: AsyncSession = Depends(get_db),
+    _gate: None = Depends(require_metrics_access),
+) -> dict:
     """Platform metrics for reporium-metrics to consume."""
     total = (await db.execute(select(func.count(Repo.id)))).scalar_one()
 
@@ -72,7 +75,10 @@ async def metrics_latest(db: AsyncSession = Depends(get_db)) -> dict:
 
 
 @router.get("/audit/status", response_model=dict)
-async def audit_status(db: AsyncSession = Depends(get_db)) -> dict:
+async def audit_status(
+    db: AsyncSession = Depends(get_db),
+    _gate: None = Depends(require_metrics_access),
+) -> dict:
     """Platform health for reporium-roadmap to consume."""
     db_ok = False
     try:
@@ -100,7 +106,9 @@ async def audit_status(db: AsyncSession = Depends(get_db)) -> dict:
 
 
 @router.get("/metrics/slo", response_model=dict)
-async def metrics_slo() -> dict:
+async def metrics_slo(
+    _gate: None = Depends(require_metrics_access),
+) -> dict:
     """
     Live 24h SLO snapshot for the routes documented in docs/SLOs.md.
 
@@ -171,7 +179,10 @@ def _spend_status(total_usd: float, budget_usd: float) -> str:
 
 @router.get("/metrics/spend", response_model=dict)
 @_limiter.limit("30/minute")
-async def metrics_spend(request: Request) -> dict:
+async def metrics_spend(
+    request: Request,
+    _gate: None = Depends(require_metrics_access),
+) -> dict:
     """
     Live 24h LLM token-spend snapshot for cost observability.
 
