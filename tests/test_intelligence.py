@@ -221,7 +221,7 @@ async def test_log_query_writes_row():
             hashed_ip=_hash_ip("203.0.113.42"),
             latency_ms=3450,
             model="claude-sonnet-4-20250514",
-            question_embedding=np.array([0.1, 0.2, 0.3]),
+            question_embedding=np.full(384, 0.1, dtype=np.float32),
         )
 
     mock_session.execute.assert_awaited_once()
@@ -236,7 +236,7 @@ async def test_log_query_writes_row():
     assert params["latency_ms"] == 3450
     assert params["model"] == "claude-sonnet-4-20250514"
     assert params["cache_hit"] is False
-    assert params["question_embedding_vec"] == "[0.10000000,0.20000000,0.30000000]"
+    assert params["question_embedding_vec"] == "[" + ",".join(["0.10000000"] * 384) + "]"
     mock_session.commit.assert_awaited_once()
 
 
@@ -300,7 +300,9 @@ async def test_find_semantic_cache_hit_returns_cached_answer():
     db = AsyncMock()
     db.execute = AsyncMock(return_value=SimpleNamespace(first=lambda: row))
 
-    cached = await _find_semantic_cache_hit(db, question_embedding=np.array([0.1, 0.2, 0.3]))
+    cached = await _find_semantic_cache_hit(
+        db, question_embedding=np.full(384, 0.1, dtype=np.float32)
+    )
 
     assert cached is not None
     answer, sources, model = cached
@@ -314,7 +316,7 @@ async def test_find_semantic_cache_hit_returns_cached_answer():
 async def test_run_query_returns_semantic_cache_hit_without_calling_anthropic():
     db = AsyncMock()
     fake_model = MagicMock()
-    fake_model.encode.return_value = np.array([0.1, 0.2, 0.3])
+    fake_model.encode.return_value = np.full(384, 0.1, dtype=np.float32)
     mock_log_query = AsyncMock()
 
     with patch("app.routers.intelligence._try_smart_route", new=AsyncMock(return_value=None)), \
@@ -408,7 +410,7 @@ async def test_run_query_raises_504_on_claude_timeout():
 
     db = AsyncMock()
     fake_model = MagicMock()
-    fake_model.encode.return_value = np.array([0.1, 0.2, 0.3])
+    fake_model.encode.return_value = np.full(384, 0.1, dtype=np.float32)
 
     # Simulate no semantic cache hit so we proceed to the Claude call
     async def _no_cache(*args, **kwargs):
