@@ -241,13 +241,24 @@ async def test_ask_with_session_id_prepends_history_to_claude(client: AsyncClien
     # The messages array should have: prior user, prior assistant, current user
     # (prior rows are reversed: newest-first from DB → oldest-first in messages)
     # With 1 row returned (the prior turn), messages = [user, assistant, current_user]
+    # KAN-ask-cache: the current user message now uses a structured content list
+    # with two text blocks: <sources> (cached) + <question> (not cached).
     assert len(captured_messages) >= 3
     assert captured_messages[0]["role"] == "user"
     assert captured_messages[0]["content"] == "What is LangChain?"
     assert captured_messages[1]["role"] == "assistant"
     assert "LangChain" in captured_messages[1]["content"]
     assert captured_messages[-1]["role"] == "user"
-    assert "RAG" in captured_messages[-1]["content"]
+    current_content = captured_messages[-1]["content"]
+    # New two-block structured content (sources + question)
+    assert isinstance(current_content, list)
+    joined = " ".join(block.get("text", "") for block in current_content)
+    assert "RAG" in joined
+    # Exactly one block should carry ephemeral cache_control (the sources block)
+    cached_blocks = [b for b in current_content if b.get("cache_control")]
+    assert len(cached_blocks) == 1
+    assert cached_blocks[0]["cache_control"] == {"type": "ephemeral"}
+    assert "<sources>" in cached_blocks[0]["text"]
 
 
 @pytest.mark.asyncio
