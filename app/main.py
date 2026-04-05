@@ -49,6 +49,11 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Startup env validation: warn loudly if APP_API_TOKEN is missing in production.
+    _env = os.environ.get("ENV") or os.environ.get("ENVIRONMENT") or ""
+    if _env.lower() == "production" and not os.environ.get("APP_API_TOKEN"):
+        logger.critical("APP_API_TOKEN not set in production — /ask endpoint will reject all requests")
+
     await cache.connect()
     await check_db_connection()
     # Pre-warm the sentence-transformers model so the first /search/semantic
