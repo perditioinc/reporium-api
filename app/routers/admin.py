@@ -2,8 +2,10 @@ import json
 import logging
 from dataclasses import dataclass, field as dc_field
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -11,6 +13,7 @@ from app.auth import require_admin_key, verify_api_key
 from app.cache import cache
 from app.database import get_db
 from app.models.repo import IngestRun, Repo, RepoCategory, RepoEmbedding, RepoTag
+from app.rate_limit import rate_limit_storage
 from app.routers.library_full import invalidate_library_cache
 
 # ── 21-category taxonomy (mirrors ingestion/enrichment/taxonomy.py) ──────────
@@ -129,6 +132,7 @@ def _assign_categories_from_tags(tags: list[str]) -> list[dict]:
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Admin"])
+_limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 # Canonical noise-tag list from Reporium taxonomy Phase 4 cleanup rules.
 NOISE_TAGS = frozenset({
@@ -235,7 +239,9 @@ async def data_quality(
 
 
 @router.post("/admin/tags/prune", response_model=dict)
+@_limiter.limit("10/minute")
 async def prune_tags(
+    request: Request,
     dry_run: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
@@ -246,7 +252,9 @@ async def prune_tags(
 
 
 @router.post("/admin/quality/compute", response_model=dict)
+@_limiter.limit("10/minute")
 async def compute_quality_signals(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
     _admin_key: None = Depends(require_admin_key),
@@ -306,7 +314,9 @@ async def compute_quality_signals(
 
 
 @router.post("/admin/embeddings/backfill", response_model=dict)
+@_limiter.limit("10/minute")
 async def backfill_embeddings(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
     _admin_key: None = Depends(require_admin_key),
@@ -569,7 +579,9 @@ def _match_tag_rule(rule: TagRule, search_text: str) -> bool:
 
 
 @router.post("/admin/tags/protocols", response_model=dict)
+@_limiter.limit("10/minute")
 async def tag_protocols(
+    request: Request,
     dry_run: bool = Query(default=False, description="Preview without writing"),
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
@@ -656,7 +668,9 @@ async def tag_protocols(
 
 
 @router.post("/admin/taxonomy/bootstrap", response_model=dict)
+@_limiter.limit("10/minute")
 async def bootstrap_taxonomy(
+    request: Request,
     limit: int = Query(default=100, ge=1, le=500),
     dimension: str | None = Query(default=None),
     db: AsyncSession = Depends(get_db),
@@ -901,7 +915,9 @@ async def list_runs(
 
 
 @router.post("/admin/enrichment/trigger", response_model=dict)
+@_limiter.limit("10/minute")
 async def trigger_enrichment(
+    request: Request,
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
     _admin_key: None = Depends(require_admin_key),
@@ -921,7 +937,9 @@ async def trigger_enrichment(
     dependencies=[Depends(require_admin_key), Depends(verify_api_key)],
     status_code=201,
 )
+@_limiter.limit("10/minute")
 async def record_run(
+    request: Request,
     payload: dict,
     db: AsyncSession = Depends(get_db),
 ):
@@ -965,7 +983,9 @@ async def record_run(
 
 
 @router.post("/admin/backfill/categories", response_model=dict)
+@_limiter.limit("10/minute")
 async def backfill_categories(
+    request: Request,
     batch_size: int = Query(default=200, ge=1, le=1000),
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
@@ -1058,7 +1078,9 @@ class SecuritySignalsPatch(BaseModel):
     dependencies=[Depends(require_admin_key)],
     summary="Set security risk signals for a repo",
 )
+@_limiter.limit("10/minute")
 async def set_repo_security_signals(
+    request: Request,
     repo_name: str,
     payload: SecuritySignalsPatch,
     db: AsyncSession = Depends(get_db),
@@ -1108,7 +1130,9 @@ async def set_repo_security_signals(
     dependencies=[Depends(require_admin_key)],
     summary="Clear security risk signals for a repo",
 )
+@_limiter.limit("10/minute")
 async def clear_repo_security_signals(
+    request: Request,
     repo_name: str,
     db: AsyncSession = Depends(get_db),
 ):

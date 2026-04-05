@@ -1,3 +1,4 @@
+import numpy as np
 from fastapi import APIRouter, Depends, Query, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -60,12 +61,28 @@ async def search_repos(
     return [_repo_to_summary(r) for r in repos]
 
 
+def _validate_query_embedding(query_embedding) -> np.ndarray:
+    """Validate an embedding used for pgvector similarity search.
+
+    Rejects wrong-shape, NaN, and Infinity values to prevent corrupt or
+    hostile inputs from reaching the DB layer.
+    """
+    if not isinstance(query_embedding, np.ndarray):
+        query_embedding = np.asarray(query_embedding, dtype=np.float32)
+    if query_embedding.shape != (384,):
+        raise ValueError(f"Invalid embedding shape: {query_embedding.shape}")
+    if np.any(np.isnan(query_embedding)) or np.any(np.isinf(query_embedding)):
+        raise ValueError("Embedding contains NaN or Infinity")
+    return query_embedding
+
+
 async def _semantic_candidate_rows(
     db: AsyncSession,
     *,
     query_embedding,
     limit: int,
 ):
+    query_embedding = _validate_query_embedding(query_embedding)
     vec_str = vec_to_pg(query_embedding)
     result = await db.execute(
         text("""
