@@ -15,6 +15,7 @@ from slowapi.util import get_remote_address
 
 from app.cache import cache
 from app.rate_limit import rate_limit_storage
+from app.slo_observer import slo_observer
 from app.database import async_session_factory, check_db_connection, engine
 from app.routers import admin, analytics, graph, ingest, intelligence, library, library_full, nl_filter, platform, recommendations, repos, search, taxonomy, trends, webhooks, wiki
 
@@ -202,6 +203,11 @@ async def log_requests(request: Request, call_next):
     start = time.perf_counter()
     response = await call_next(request)
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    # Record against rolling SLO histogram (no-op for untracked routes).
+    try:
+        slo_observer.record(request.url.path, duration_ms, response.status_code)
+    except Exception:  # observer must never break the request path
+        pass
     # Redact query strings — they may contain user input, API keys, or PII
     safe_path = request.url.path
     if request.url.query:
