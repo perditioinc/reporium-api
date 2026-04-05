@@ -2,7 +2,7 @@ import uuid as _uuid_mod
 from datetime import datetime
 from uuid import UUID, uuid4
 
-from sqlalchemy import Boolean, Float, ForeignKey, Integer, Text, TIMESTAMP, UniqueConstraint
+from sqlalchemy import ARRAY, Boolean, Float, ForeignKey, Integer, Text, TIMESTAMP, UniqueConstraint
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -76,7 +76,9 @@ class Repo(Base):
 
     # KAN-41 16-category taxonomy (backfilled by backfill_primary_category.py)
     primary_category: Mapped[str | None] = mapped_column(Text, nullable=True)
-    secondary_categories: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # Prod column is text[] (verified 2026-04-05). Prior JSONB declaration caused
+    # `operator does not exist: text[] @> jsonb` in /repos/discover/cross-category.
+    secondary_categories: Mapped[list | None] = mapped_column(ARRAY(Text), nullable=True)
 
     # Relationships
     tags: Mapped[list["RepoTag"]] = relationship(
