@@ -10,6 +10,17 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import require_ingest_key, verify_api_key
 from app.database import get_db
 from app.models.repo import Repo, RepoAIDevSkill, RepoCategory
+from app.slo_observer import slo_observer
+
+# SLO targets documented in docs/SLOs.md. These are the thresholds the
+# /metrics/slo endpoint compares live values against. Keeping the dict here
+# (rather than in slo_observer) keeps the observer pure and testable.
+_SLO_TARGETS: dict[str, dict] = {
+    "/health": {"p95_ms": 500, "max_error_rate": 0.001},
+    "/library/full": {"p95_ms": 2000, "max_error_rate": 0.01},
+    "/intelligence/ask": {"p95_ms": 15000, "p99_ms": 25000, "max_error_rate": 0.01},
+    "/intelligence/nl-filter": {"p95_ms": 3000, "max_error_rate": 0.01},
+}
 
 router = APIRouter(tags=["Platform"])
 
@@ -78,6 +89,47 @@ async def audit_status(db: AsyncSession = Depends(get_db)) -> dict:
         "last_forksync_run": None,
         "ingestion_status": "not_running",
         "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@router.get("/metrics/slo", response_model=dict)
+async def metrics_slo() -> dict:
+    """
+    Live 24h SLO snapshot for the routes documented in docs/SLOs.md.
+
+    Values come from an in-memory rolling histogram populated by the request
+    logging middleware — single-process only, no Prometheus yet. This endpoint
+    is intended for smoke-level dashboarding and on-call debugging; it is NOT
+    a replacement for Cloud Monitoring.
+    """
+    snapshot = slo_observer.snapshot()
+    routes: dict[str, dict] = {}
+    for route, target in _SLO_TARGETS.items():
+        observed = snapshot.get(route, {})
+        p95 = observed.get("p95_ms")
+        p99 = observed.get("p99_ms")
+        err = observed.get("error_rate")
+
+        breaches: list[str] = []
+        if p95 is not None and "p95_ms" in target and p95 > target["p95_ms"]:
+            breaches.append(f"p95 {p95}ms > target {target['p95_ms']}ms")
+        if p99 is not None and "p99_ms" in target and p99 > target["p99_ms"]:
+            breaches.append(f"p99 {p99}ms > target {target['p99_ms']}ms")
+        if err is not None and err > target["max_error_rate"]:
+            breaches.append(f"error_rate {err} > target {target['max_error_rate']}")
+
+        routes[route] = {
+            "target": target,
+            "observed": observed,
+            "status": "breach" if breaches else ("ok" if observed.get("count") else "no_data"),
+            "breaches": breaches,
+        }
+
+    return {
+        "window_seconds": 24 * 60 * 60,
+        "source": "in_memory_histogram",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "routes": routes,
     }
 
 
