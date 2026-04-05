@@ -1123,3 +1123,22 @@ async def clear_repo_security_signals(
     invalidate_library_cache()
 
     return {"repo": repo_name, "security_signals": None}
+
+
+@router.post(
+    "/admin/retention/purge-query-logs",
+    summary="Manually purge old query_log rows (PII retention)",
+)
+async def admin_purge_query_logs(
+    days: int = Query(default=90, ge=30, le=3650),
+    _admin_key: None = Depends(require_admin_key),
+) -> dict:
+    """Delete query_log rows older than ``days`` days on demand.
+
+    The retention loop runs this automatically every 24 hours; this endpoint
+    is for ops/manual cleanup.
+    """
+    from app.retention import purge_old_query_logs
+
+    count = await purge_old_query_logs(days=days)
+    return {"purged": count, "cutoff_days": days}
