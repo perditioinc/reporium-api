@@ -1,3 +1,5 @@
+import hashlib
+import hmac
 import logging
 import os
 
@@ -15,10 +17,26 @@ security = HTTPBearer()
 _IS_PRODUCTION = os.getenv("ENVIRONMENT") == "production"
 
 
+def _secrets_equal(provided: str | None, expected: str | None) -> bool:
+    """
+    Constant-time comparison of two secret strings.
+
+    hmac.compare_digest requires both operands to be non-empty bytes of equal
+    length — otherwise it effectively returns False in constant time. We still
+    guard against None / empty explicitly so callers can differentiate
+    "missing credential" from "wrong credential" for HTTP status selection.
+    """
+    if not provided or not expected:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
 async def verify_api_key(
     credentials: HTTPAuthorizationCredentials = Security(security),
 ) -> str:
-    if credentials.credentials != settings.ingestion_api_key:
+    # Issue #237: timing-safe comparison of the bearer token against the
+    # configured ingestion API key.
+    if not _secrets_equal(credentials.credentials, settings.ingestion_api_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
@@ -42,7 +60,8 @@ async def require_admin_key(
             logger.error("ADMIN_API_KEY not set in production — rejecting request")
             raise HTTPException(status_code=500, detail="Server misconfiguration")
         return  # No key configured — allow in dev mode only
-    if x_admin_key != admin_key:
+    # Issue #237: timing-safe comparison.
+    if not _secrets_equal(x_admin_key, admin_key):
         raise HTTPException(status_code=403, detail="Invalid admin key")
 
 
@@ -65,7 +84,12 @@ async def require_ingest_key(
             logger.error("INGEST_API_KEY not set in production — rejecting request")
             raise HTTPException(status_code=500, detail="Server misconfiguration")
         return  # No key configured — allow in dev mode only
-    if x_ingest_key == ingest_key or x_admin_key == ingest_key:
+    # Issue #237: timing-safe comparison for both headers. Both branches run
+    # regardless of the first result so an attacker cannot distinguish which
+    # header was matched via response timing.
+    match_new = _secrets_equal(x_ingest_key, ingest_key)
+    match_legacy = _secrets_equal(x_admin_key, ingest_key)
+    if match_new or match_legacy:
         return
     raise HTTPException(status_code=403, detail="Invalid ingest key")
 
@@ -91,8 +115,35 @@ async def require_app_token(
             logger.error("APP_API_TOKEN not set in production — rejecting")
             raise HTTPException(status_code=500, detail="Server misconfiguration")
         return  # Dev mode
-    if x_app_token != expected:
+    # Issue #237: timing-safe comparison.
+    if not _secrets_equal(x_app_token, expected):
         raise HTTPException(status_code=403, detail="App token required")
+
+
+def hash_app_token(token: str | None) -> str | None:
+    """
+    Return a stable SHA-256 hex digest of the X-App-Token, or None.
+
+    Used by /intelligence/ask session-memory code (issue #235) to bind each
+    ask_sessions row to the token that created it so one app token cannot
+    read another's conversation history.
+    """
+    if not token:
+        return None
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+async def get_app_token_hash(
+    x_app_token: str | None = Security(_APP_TOKEN_HEADER),
+) -> str | None:
+    """
+    FastAPI dependency: return the SHA-256 hex of the presented X-App-Token.
+
+    Does NOT validate the token — `require_app_token` already does that via
+    its own Depends() on the same endpoint. Returns None in dev mode when no
+    token is required. Safe to use alongside `require_app_token`.
+    """
+    return hash_app_token(x_app_token)
 
 
 async def require_pubsub_push(
