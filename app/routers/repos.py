@@ -193,19 +193,21 @@ async def cross_category_repos(
     # contained in secondary_categories. Sum the matches and keep repos with >= 2.
 
     # We build per-slug match expressions and sum them.
-    from sqlalchemy import case, literal_column
-    from sqlalchemy.dialects.postgresql import JSONB as PG_JSONB
+    # Prod column secondary_categories is text[] (verified 2026-04-05). Prior
+    # implementation used JSONB @> jsonb, which raised UndefinedFunctionError
+    # in production. Use text[] @> ARRAY[slug]::text[] instead.
+    from sqlalchemy import ARRAY, case, literal
 
     match_exprs = []
     for slug in slugs:
-        # primary_category exact match OR slug is in the JSONB array
+        # primary_category exact match OR slug is contained in the text[] array
         match_exprs.append(
             case(
                 (
                     or_(
                         Repo.primary_category == slug,
                         Repo.secondary_categories.op("@>")(
-                            cast(json.dumps([slug]), PG_JSONB)
+                            cast(literal([slug]), ARRAY(Text))
                         ),
                     ),
                     1,
