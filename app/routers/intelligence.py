@@ -16,6 +16,7 @@ import re
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Literal
 from uuid import UUID
 
 import anthropic
@@ -1143,6 +1144,26 @@ class QueryResponse(BaseModel):
     tokens_used: dict
 
 
+class StreamEvent(BaseModel):
+    """
+    Schema for SSE events emitted by the /ask/stream endpoint.
+
+    Each event is serialized as ``data: <json>\\n\\n``. The ``type`` field
+    discriminates the payload:
+
+    - ``sources``: initial event carrying the retrieved ``sources`` list
+    - ``token``: incremental answer chunk in ``text``
+    - ``done``: terminal success event carrying ``tokens`` usage and ``model``
+    - ``error``: terminal failure event carrying ``message``
+    """
+    type: Literal["sources", "token", "done", "error"]
+    sources: list[dict] | None = None
+    text: str | None = None
+    message: str | None = None
+    tokens: dict | None = None
+    model: str | None = None
+
+
 class TaxonomyGapSignal(BaseModel):
     dimension: str
     value: str
@@ -1994,13 +2015,18 @@ async def intelligence_ask_stream(
 ) -> StreamingResponse:
     """
     Streaming endpoint — requires X-App-Token header.
-    Streams the answer as SSE events:
+    Streams the answer as SSE events. Each event payload conforms to the
+    :class:`StreamEvent` Pydantic schema defined above:
       data: {"type": "sources", "sources": [...]}   (sent immediately before generation)
       data: {"type": "token", "text": "..."}         (one per Claude streaming chunk)
-      data: {"type": "done", "tokens": {...}}         (final event with usage stats)
+      data: {"type": "done", "tokens": {...}, "model": "..."}  (final event with usage stats)
       data: {"type": "error", "message": "..."}       (on failure)
 
     Rate limited to 6/minute and 60/day per IP (same as /ask).
+
+    Backpressure: the generator detects client disconnects (via
+    ``request.is_disconnected()`` and ``GeneratorExit``) and aborts the
+    upstream Anthropic stream to avoid burning tokens on an abandoned client.
     """
     client_ip = get_remote_address(request)
 
@@ -2112,22 +2138,41 @@ async def intelligence_ask_stream(
 
             # Use a queue to bridge the sync streaming iterator to async
             import queue
+            import threading
             token_queue: queue.Queue = queue.Queue()
+            # Shared cancel flag — flipped when the client disconnects so the
+            # worker thread exits the Anthropic iterator on the next chunk and
+            # stops consuming tokens.
+            cancel_event = threading.Event()
 
             def _run_stream():
                 try:
                     with _stream_claude() as stream:
                         for text_chunk in stream.text_stream:
+                            if cancel_event.is_set():
+                                # Abort cleanly — the context manager will
+                                # close the underlying HTTP stream.
+                                return
                             token_queue.put(("token", text_chunk))
+                        if cancel_event.is_set():
+                            return
                         msg = stream.get_final_message()
                         token_queue.put(("done", msg))
                 except Exception as e:
-                    token_queue.put(("error", str(e)))
+                    if not cancel_event.is_set():
+                        token_queue.put(("error", str(e)))
 
             # Run the blocking streamer in a thread
             future = loop.run_in_executor(None, _run_stream)
 
             while True:
+                # Backpressure: bail out early if the client has gone away so
+                # we don't keep paying Anthropic for tokens nobody is reading.
+                if await request.is_disconnected():
+                    logger.info("Stream client disconnected")
+                    cancel_event.set()
+                    break
+
                 try:
                     item = await loop.run_in_executor(
                         None,
@@ -2135,6 +2180,7 @@ async def intelligence_ask_stream(
                     )
                 except queue.Empty:
                     yield f"data: {json.dumps({'type': 'error', 'message': 'Stream timed out'})}\n\n"
+                    cancel_event.set()
                     break
 
                 event_type, payload = item
@@ -2176,6 +2222,18 @@ async def intelligence_ask_stream(
 
             await future  # ensure thread cleanup
 
+        except GeneratorExit:
+            # Client disconnected (FastAPI/Starlette closes the generator).
+            # Signal the worker thread to abort the Anthropic stream so we
+            # stop accruing token cost, then re-raise per async-generator
+            # protocol.
+            logger.info("Stream client disconnected")
+            try:
+                cancel_event.set()
+            except NameError:
+                # Disconnect happened before the stream was set up.
+                pass
+            raise
         except Exception as e:
             logger.error("Streaming ask error: %s", str(e), exc_info=True)
             yield f"data: {json.dumps({'type': 'error', 'message': 'Internal server error. Please try again.'})}\n\n"
