@@ -1166,3 +1166,77 @@ async def admin_purge_query_logs(
 
     count = await purge_old_query_logs(days=days)
     return {"purged": count, "cutoff_days": days}
+
+
+# ---------------------------------------------------------------------------
+# Issue #238 — ask_sessions retention + right-to-be-forgotten (RTBF)
+# ---------------------------------------------------------------------------
+#
+# ``ask_sessions`` stores the user's question and the assistant's answer so
+# /intelligence/ask can surface the last few turns as conversational memory.
+# That makes it a PII store; two endpoints keep it compliant:
+#
+#   1. POST /admin/purge-ask-sessions?days=90 — nightly retention purge.
+#      Call externally via any cron (Cloud Scheduler, GitHub Actions, etc.);
+#      no new in-process scheduler is started (see $0 infra constraint).
+#   2. DELETE /admin/ask-sessions/{session_id} — GDPR RTBF: remove every row
+#      tied to a single session_id on demand.
+#
+# Both endpoints are guarded by ``require_admin_key``.
+
+
+@router.post(
+    "/admin/purge-ask-sessions",
+    summary="Purge expired ask_sessions rows (retention, closes #238)",
+)
+async def admin_purge_ask_sessions(
+    days: int = Query(default=90, ge=7, le=365),
+    _admin_key: None = Depends(require_admin_key),
+) -> dict:
+    """Delete ask_sessions rows older than ``days`` days.
+
+    Recommended schedule: invoke daily from Cloud Scheduler / GitHub Actions
+    cron. ``days`` is bounded to [7, 365] so a misconfigured caller cannot
+    accidentally wipe live sessions or retain data indefinitely.
+    """
+    from app.retention import purge_expired_ask_sessions
+
+    count = await purge_expired_ask_sessions(max_age_days=days)
+    return {"purged": count, "max_age_days": days}
+
+
+@router.delete(
+    "/admin/ask-sessions/{session_id}",
+    summary="Delete all ask_sessions rows for a session_id (RTBF)",
+)
+async def admin_delete_ask_session(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+    _admin_key: None = Depends(require_admin_key),
+) -> dict:
+    """GDPR right-to-be-forgotten: delete every row for one session_id.
+
+    ``session_id`` is a UUID; an invalid value yields 400. The endpoint is
+    intentionally idempotent — deleting a non-existent session returns
+    ``{"deleted": 0}`` rather than 404 so repeat RTBF invocations succeed.
+    """
+    import uuid
+
+    try:
+        uuid.UUID(session_id)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="session_id must be a UUID") from exc
+
+    result = await db.execute(
+        text(
+            "DELETE FROM ask_sessions WHERE session_id = CAST(:sid AS uuid) RETURNING id"
+        ),
+        {"sid": session_id},
+    )
+    deleted = result.fetchall()
+    await db.commit()
+    count = len(deleted)
+    logger.info(
+        "ask_sessions RTBF delete: session_id=%s deleted=%d", session_id, count
+    )
+    return {"deleted": count, "session_id": session_id}
