@@ -1222,11 +1222,27 @@ def _coerce_cached_sources(raw_sources: object) -> list[SourceRepo]:
     return coerced
 
 
+def _validate_query_embedding(query_embedding) -> np.ndarray:
+    """Validate an embedding used for pgvector similarity search.
+
+    Rejects wrong-shape, NaN, and Infinity values to prevent corrupt or
+    hostile inputs from reaching the DB layer.
+    """
+    if not isinstance(query_embedding, np.ndarray):
+        query_embedding = np.asarray(query_embedding, dtype=np.float32)
+    if query_embedding.shape != (384,):
+        raise ValueError(f"Invalid embedding shape: {query_embedding.shape}")
+    if np.any(np.isnan(query_embedding)) or np.any(np.isinf(query_embedding)):
+        raise ValueError("Embedding contains NaN or Infinity")
+    return query_embedding
+
+
 async def _find_semantic_cache_hit(
     db: AsyncSession,
     *,
     question_embedding: np.ndarray,
 ) -> tuple[str, list[SourceRepo], str | None] | None:
+    question_embedding = _validate_query_embedding(question_embedding)
     result = await db.execute(
         text("""
             SELECT answer_full, sources, model
@@ -1563,6 +1579,7 @@ async def _prepare_query(
 
     t_embed = time.perf_counter()
 
+    query_embedding = _validate_query_embedding(query_embedding)
     vec_str = vec_to_pg(query_embedding)
 
     # 3. pgvector HNSW index scan — O(log N) instead of O(N) Python loop

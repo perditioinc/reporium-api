@@ -198,11 +198,15 @@ async def log_requests(request: Request, call_next):
     start = time.perf_counter()
     response = await call_next(request)
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
+    # Redact query strings — they may contain user input, API keys, or PII
+    safe_path = request.url.path
+    if request.url.query:
+        safe_path = f"{safe_path}?<redacted>"
     logger.info(
         "request",
         extra={
             "method": request.method,
-            "path": request.url.path,
+            "path": safe_path,
             "status_code": response.status_code,
             "duration_ms": duration_ms,
         },
