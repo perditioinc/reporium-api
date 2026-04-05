@@ -1754,6 +1754,11 @@ class QueryContext:
     route_label: str | None
     embedding_candidates: int = 0
     redis_cache_key: str = ""
+    # Phase-level latency breakdown (milliseconds), set by _prepare_query
+    t_smart_ms: float = 0.0
+    t_embed_ms: float = 0.0
+    t_search_ms: float = 0.0
+    t_context_ms: float = 0.0
 
 
 async def _prepare_query(
@@ -2082,6 +2087,10 @@ async def _prepare_query(
         route_label=None,
         embedding_candidates=len(scored),
         redis_cache_key=redis_cache_key,
+        t_smart_ms=(t_smart - t0) * 1000,
+        t_embed_ms=(t_embed - t_smart) * 1000,
+        t_search_ms=(t_search - t_embed) * 1000,
+        t_context_ms=(t_context - t_search) * 1000,
     )
 
 
@@ -2141,6 +2150,12 @@ async def _run_query(
             question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
             cache_hit=cached.get("cache_hit", False),
         )).add_done_callback(_task_done_callback)
+        total_ms = int((time.monotonic() - _started_at) * 1000)
+        logger.info(
+            "ask latency breakdown: total=%dms smart=%dms embed=%dms search=%dms context=%dms claude=%dms model=%s cached=%s",
+            total_ms, int(qctx.t_smart_ms), int(qctx.t_embed_ms), int(qctx.t_search_ms),
+            int(qctx.t_context_ms), 0, qctx.model, True,
+        )
         return response
 
     # KAN-ask-output-caps: low-similarity early-exit guard. If retrieval
@@ -2238,6 +2253,7 @@ async def _run_query(
                 ],
             )
 
+    _t_claude_start = time.monotonic()
     try:
         message = await asyncio.wait_for(
             loop.run_in_executor(None, _call_claude),
@@ -2254,6 +2270,8 @@ async def _run_query(
                 "Please try again in a moment."
             ),
         )
+    _t_claude_end = time.monotonic()
+    claude_ms = int((_t_claude_end - _t_claude_start) * 1000)
 
     answer = message.content[0].text
     tokens_used = {
@@ -2351,6 +2369,13 @@ async def _run_query(
         asyncio.create_task(
             _save_session_turn(effective_session_id, req.question, answer, token_hash)
         ).add_done_callback(_task_done_callback)
+
+    total_ms = int((time.monotonic() - _started_at) * 1000)
+    logger.info(
+        "ask latency breakdown: total=%dms smart=%dms embed=%dms search=%dms context=%dms claude=%dms model=%s cached=%s",
+        total_ms, int(qctx.t_smart_ms), int(qctx.t_embed_ms), int(qctx.t_search_ms),
+        int(qctx.t_context_ms), claude_ms, qctx.model, False,
+    )
 
     return response
 
@@ -2491,6 +2516,12 @@ async def intelligence_ask_stream(
                     question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
                     cache_hit=cached.get("cache_hit", False),
                 )).add_done_callback(_task_done_callback)
+                total_ms = int((time.monotonic() - _started_at) * 1000)
+                logger.info(
+                    "ask latency breakdown: total=%dms smart=%dms embed=%dms search=%dms context=%dms claude=%dms model=%s cached=%s",
+                    total_ms, int(qctx.t_smart_ms), int(qctx.t_embed_ms), int(qctx.t_search_ms),
+                    int(qctx.t_context_ms), 0, qctx.model, True,
+                )
                 return
 
             # KAN-ask-output-caps: low-similarity early-exit guard for the
@@ -2625,6 +2656,7 @@ async def intelligence_ask_stream(
                         token_queue.put(("error", str(e)))
 
             # Run the blocking streamer in a thread
+            _t_claude_start = time.monotonic()
             future = loop.run_in_executor(None, _run_stream)
 
             while True:
@@ -2695,6 +2727,13 @@ async def intelligence_ask_stream(
                         asyncio.create_task(
                             _save_session_turn(req.session_id, req.question, full_answer, token_hash)
                         ).add_done_callback(_task_done_callback)
+                    _stream_claude_ms = int((time.monotonic() - _t_claude_start) * 1000)
+                    _stream_total_ms = int((time.monotonic() - _started_at) * 1000)
+                    logger.info(
+                        "ask latency breakdown: total=%dms smart=%dms embed=%dms search=%dms context=%dms claude=%dms model=%s cached=%s",
+                        _stream_total_ms, int(qctx.t_smart_ms), int(qctx.t_embed_ms), int(qctx.t_search_ms),
+                        int(qctx.t_context_ms), _stream_claude_ms, qctx.model, False,
+                    )
                     break
                 elif event_type == "error":
                     yield f"data: {json.dumps({'type': 'error', 'message': payload})}\n\n"
@@ -2809,7 +2848,7 @@ async def compare_repos(
         )
         row = result.mappings().first()
         if row is None:
-            raise HTTPException(status_code=404, detail=f"Repo '{repo_name}' not found")
+            raise HTTPException(status_code=404, detail="Repo not found")
         rows.append(dict(row))
 
     def _repo_dict(r: dict) -> dict:
@@ -2914,7 +2953,7 @@ async def repo_ecosystem(
     )
     center_row = center.mappings().first()
     if center_row is None:
-        raise HTTPException(status_code=404, detail=f"Repo '{name}' not found")
+        raise HTTPException(status_code=404, detail="Repo not found")
 
     center_id = center_row["id"]
 
@@ -3089,7 +3128,7 @@ async def category_leaders(
             "commits_30d": m["commits_last_30_days"],
         })
     if not rows:
-        raise HTTPException(status_code=404, detail=f"No repos found for category '{category}'")
+        raise HTTPException(status_code=404, detail="No repos found for the specified category")
     return {"category": category, "repos": rows}
 
 
