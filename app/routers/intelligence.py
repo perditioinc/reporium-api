@@ -36,6 +36,7 @@ from app.database import async_session_factory, get_db
 from app.embeddings import get_embedding_model
 from app.models.session import AskSession
 from app.rate_limit import rate_limit_storage
+from app.slo_observer import token_observer
 from app.utils import get_anthropic_key, log_nonfatal, vec_to_pg
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
 _limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
@@ -1824,7 +1825,11 @@ async def _prepare_query(
 
 
 async def _run_query(
-    req: QueryRequest, db: AsyncSession, client_ip: str | None = None, session_id: str | None = None
+    req: QueryRequest,
+    db: AsyncSession,
+    client_ip: str | None = None,
+    session_id: str | None = None,
+    route_label: str = "/intelligence/ask",
 ) -> QueryResponse:
     """
     Core intelligence query logic — shared by /query (authed) and /ask (public).
@@ -1842,6 +1847,12 @@ async def _run_query(
     # Handle cache hits (smart route, Redis, or semantic)
     if qctx.cache_result is not None:
         cached = qctx.cache_result
+        # KAN-ask-spend: record cache hits so /metrics/spend can compute hit-rate.
+        # Wrapped so a metrics bug can never break a real request.
+        try:
+            token_observer.record_cache_hit(route_label)
+        except Exception:
+            log_nonfatal("token_observer.record_cache_hit")
         sources = _coerce_cached_sources(cached["sources"])
         response = QueryResponse(
             answer=cached["answer"],
@@ -1930,6 +1941,19 @@ async def _run_query(
     _est_cost = _estimate_cost(message.usage.input_tokens, message.usage.output_tokens, qctx.model)
     await record_cost(_est_cost, model=qctx.model)
 
+    # KAN-ask-spend: per-route token + cost accumulator for /metrics/spend.
+    # Wrapped so a metrics bug can never break a real request.
+    try:
+        token_observer.record_tokens(
+            route=route_label,
+            input_tokens=message.usage.input_tokens,
+            output_tokens=message.usage.output_tokens,
+            usd_cost=_est_cost,
+            model=qctx.model,
+        )
+    except Exception:
+        log_nonfatal("token_observer.record_tokens")
+
     # Build response
     sources = []
     for repo in qctx.sources:
@@ -1998,7 +2022,13 @@ async def intelligence_query(
     Pass ``session_id`` (UUID) in the request body to enable conversational
     memory — the last 3 turns of that session will be prepended to context.
     """
-    return await _run_query(req, db, client_ip=get_remote_address(request), session_id=req.session_id)
+    return await _run_query(
+        req,
+        db,
+        client_ip=get_remote_address(request),
+        session_id=req.session_id,
+        route_label="/intelligence/query",
+    )
 
 
 @router.post("/ask", response_model=QueryResponse)
@@ -2016,7 +2046,13 @@ async def intelligence_ask(
     Pass ``session_id`` (UUID) in the request body to enable conversational
     memory — the last 3 turns of that session will be prepended to context.
     """
-    return await _run_query(req, db, client_ip=get_remote_address(request), session_id=req.session_id)
+    return await _run_query(
+        req,
+        db,
+        client_ip=get_remote_address(request),
+        session_id=req.session_id,
+        route_label="/intelligence/ask",
+    )
 
 
 @router.post("/ask/stream")

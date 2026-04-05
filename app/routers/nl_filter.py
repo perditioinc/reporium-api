@@ -34,7 +34,8 @@ from app.cache import cache
 from app.circuit_breaker import anthropic_breaker
 from app.cost_tracker import check_budget, record_cost
 from app.rate_limit import rate_limit_storage
-from app.utils import get_anthropic_key
+from app.slo_observer import token_observer
+from app.utils import get_anthropic_key, log_nonfatal
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +154,11 @@ async def nl_filter(
     cache_key = f"nl_filter:{hashlib.sha256(body.query.lower().strip().encode()).hexdigest()[:16]}"
     cached = await cache.get(cache_key)
     if cached:
+        # KAN-ask-spend: record cache hit for /metrics/spend hit-rate.
+        try:
+            token_observer.record_cache_hit("/intelligence/nl-filter")
+        except Exception:
+            log_nonfatal("token_observer.record_cache_hit")
         return NLFilterResponse(**cached)
 
     if not await check_budget():
@@ -178,6 +184,17 @@ async def nl_filter(
             response = await asyncio.to_thread(_call_haiku)
         actual_cost = _estimate_cost(response.usage.input_tokens, response.usage.output_tokens, "claude-haiku-4-5")
         await record_cost(actual_cost, model="claude-haiku-4-5")
+        # KAN-ask-spend: per-route token + cost accumulator for /metrics/spend.
+        try:
+            token_observer.record_tokens(
+                route="/intelligence/nl-filter",
+                input_tokens=response.usage.input_tokens,
+                output_tokens=response.usage.output_tokens,
+                usd_cost=actual_cost,
+                model="claude-haiku-4-5",
+            )
+        except Exception:
+            log_nonfatal("token_observer.record_tokens")
         raw = response.content[0].text.strip()
 
         # Strip markdown fences if present
