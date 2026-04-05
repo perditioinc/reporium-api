@@ -65,6 +65,33 @@ async def require_admin_key(
         raise HTTPException(status_code=403, detail="Invalid admin key")
 
 
+async def require_metrics_access(
+    x_admin_key: str | None = Security(_ADMIN_KEY_HEADER),
+) -> None:
+    """
+    Feature-flagged admin-key gate for observability endpoints.
+
+    When ``METRICS_REQUIRE_AUTH=1`` is set, this dependency enforces the same
+    X-Admin-Key semantics as :func:`require_admin_key`. When the env var is
+    unset or empty, this is a no-op so the /metrics/* and /audit/status
+    endpoints stay open — matching pre-#236 behavior for backward compat.
+
+    Closes #236.
+    """
+    if os.getenv("METRICS_REQUIRE_AUTH", "").strip() != "1":
+        return  # gate disabled — endpoints stay open (default)
+    admin_key = os.getenv("ADMIN_API_KEY", "")
+    if not admin_key:
+        if _IS_PRODUCTION:
+            logger.error("METRICS_REQUIRE_AUTH=1 but ADMIN_API_KEY not set")
+            raise HTTPException(status_code=500, detail="Server misconfiguration")
+        return  # Dev mode with flag on but no key — allow
+    if not _secrets_equal(x_admin_key, admin_key):
+        raise HTTPException(
+            status_code=403, detail="Admin key required for metrics endpoints"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Ingest key - protects ingest pipeline endpoints (POST /ingest/*)
 # Accept both X-Ingest-Key and the legacy X-Admin-Key for backward compatibility.
