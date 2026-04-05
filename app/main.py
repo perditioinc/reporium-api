@@ -58,6 +58,10 @@ async def lifespan(app: FastAPI):
     loop = _asyncio.get_event_loop()
     await loop.run_in_executor(None, _get_embedding_model)
     logger.info("Embedding model pre-warmed at startup")
+    # Start query_log retention purge loop (fire-and-forget background task).
+    from app.retention import retention_loop
+    _asyncio.create_task(retention_loop())
+    logger.info("Retention purge loop scheduled")
     yield
     await cache.disconnect()
     await engine.dispose()
