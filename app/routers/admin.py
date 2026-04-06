@@ -1,6 +1,7 @@
 import json
 import logging
 from dataclasses import dataclass, field as dc_field
+from datetime import date
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
@@ -1240,3 +1241,39 @@ async def admin_delete_ask_session(
         "ask_sessions RTBF delete: session_id=%s deleted=%d", session_id, count
     )
     return {"deleted": count, "session_id": session_id}
+
+
+# ---------------------------------------------------------------------------
+# Audit log endpoint (KAN-governance)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/admin/audit", dependencies=[Depends(require_admin_key)])
+async def get_audit_logs(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    api_key_hash: str | None = Query(None, description="Filter by SHA-256 of API key"),
+    endpoint: str | None = Query(None, description="Filter by endpoint substring"),
+    date_from: date | None = Query(None, description="Start date (inclusive)"),
+    date_to: date | None = Query(None, description="End date (inclusive)"),
+    sandbox_only: bool = Query(False, description="Only show sandbox entries"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List recent audit log entries (admin-key required).
+
+    Returns timestamp, endpoint, model, tokens, cost, latency, and sandbox flag.
+    """
+    from app.audit import list_audit_logs
+
+    entries = await list_audit_logs(
+        db,
+        api_key_hash=api_key_hash,
+        endpoint=endpoint,
+        date_from=date_from,
+        date_to=date_to,
+        sandbox_only=sandbox_only,
+        limit=limit,
+        offset=offset,
+    )
+    return {"entries": entries, "count": len(entries), "limit": limit, "offset": offset}
