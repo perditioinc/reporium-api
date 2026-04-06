@@ -3,8 +3,8 @@
 Stores AI-generated developer-focused evaluation: pros, cons, best_for,
 avoid_if, community_verdict, comparable_to.
 
-Revision ID: 027
-Revises: 026
+Revision ID: 028
+Revises: 027
 """
 
 import sqlalchemy as sa
@@ -12,8 +12,8 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB
 
 
-revision = "027"
-down_revision = "026"
+revision = "028"
+down_revision = "027"
 branch_labels = None
 depends_on = None
 
