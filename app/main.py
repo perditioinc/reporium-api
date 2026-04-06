@@ -17,7 +17,7 @@ from app.cache import cache
 from app.rate_limit import rate_limit_storage
 from app.slo_observer import slo_observer
 from app.database import async_session_factory, check_db_connection, engine
-from app.routers import admin, analytics, compare, graph, ingest, intelligence, library, library_full, mentions, nl_filter, platform, recommendations, repos, search, taxonomy, trends, webhooks, wiki
+from app.routers import admin, analytics, compare, dependencies, graph, ingest, intelligence, library, library_full, mentions, nl_filter, platform, recommendations, repos, search, taxonomy, trends, webhooks, wiki
 from app.telemetry import init_telemetry
 
 
@@ -281,6 +281,7 @@ app.include_router(mentions.router)
 app.include_router(compare.router)
 app.include_router(admin.router)
 app.include_router(webhooks.router)
+app.include_router(dependencies.router)
 
 
 if __name__ == "__main__":
