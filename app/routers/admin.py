@@ -1633,3 +1633,197 @@ async def backfill_community_signals(
         await db.commit()
 
     return {"total": total, "updated": updated, "failed": failed, "skipped": skipped, "dry_run": False}
+
+
+# ── SBOM dependency backfill ─────────────────────────────────────────────────
+
+def parse_purl(purl: str) -> tuple[str | None, str | None, str | None]:
+    """Parse a Package URL into (ecosystem, name, version).
+
+    purl format: ``pkg:<ecosystem>/<namespace>/<name>@<version>``
+    or ``pkg:<ecosystem>/<name>@<version>``
+
+    Returns (ecosystem, name, version_constraint) -- any part may be None
+    if the purl cannot be parsed.
+    """
+    if not purl or not purl.startswith("pkg:"):
+        return None, None, None
+
+    body = purl[4:]  # strip "pkg:"
+    version: str | None = None
+    if "@" in body:
+        body, version = body.rsplit("@", 1)
+
+    parts = body.split("/", 2)
+    if len(parts) < 2:
+        return None, None, None
+
+    ecosystem = parts[0]
+    # If there's a namespace (e.g. @scope/name in npm), keep only the final name
+    name = parts[-1]
+    return ecosystem, name, version
+
+
+def _extract_deps_from_sbom(sbom: dict) -> list[dict]:
+    """Extract dependency info from an SPDX SBOM response.
+
+    Returns a list of dicts with keys: package_name, package_ecosystem,
+    version_constraint, is_direct.
+    """
+    deps: list[dict] = []
+    packages = sbom.get("sbom", {}).get("packages", [])
+
+    for pkg in packages:
+        # Skip the root package (SPDX document itself)
+        spdx_id = pkg.get("SPDXID", "")
+        if spdx_id == "SPDXRef-DOCUMENT":
+            continue
+
+        # Try to extract from purl in externalRefs
+        purl_ref = None
+        for ref in pkg.get("externalRefs", []):
+            if ref.get("referenceType") == "purl":
+                purl_ref = ref.get("referenceLocator")
+                break
+
+        if purl_ref:
+            ecosystem, name, version = parse_purl(purl_ref)
+            if name:
+                deps.append({
+                    "package_name": name,
+                    "package_ecosystem": ecosystem,
+                    "version_constraint": version,
+                    "is_direct": True,
+                })
+        else:
+            # Fallback: use package name field
+            pkg_name = pkg.get("name")
+            if pkg_name:
+                version_info = pkg.get("versionInfo")
+                deps.append({
+                    "package_name": pkg_name,
+                    "package_ecosystem": None,
+                    "version_constraint": version_info,
+                    "is_direct": True,
+                })
+
+    return deps
+
+
+@router.post("/admin/backfill-dependencies", response_model=dict)
+@_limiter.limit("5/minute")
+async def backfill_dependencies(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Fetch SBOM dependency data from GitHub for repos with no dependencies stored.
+
+    Uses the free GitHub SBOM API (dependency-graph/sbom) to extract packages
+    from SPDX format. Parses purl references to extract ecosystem and version.
+    """
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    if not github_token:
+        raise HTTPException(status_code=500, detail="GITHUB_TOKEN env var not set")
+
+    # Find repos with no entries in repo_dependencies
+    result = await db.execute(text("""
+        SELECT r.id, r.owner, r.name
+        FROM repos r
+        LEFT JOIN repo_dependencies d ON d.repo_id = r.id
+        WHERE d.id IS NULL
+        ORDER BY r.updated_at DESC
+    """))
+    rows = result.fetchall()
+
+    if not rows:
+        return {
+            "total_repos": 0,
+            "repos_with_deps": 0,
+            "dependencies_inserted": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+
+    total_repos = len(rows)
+    repos_with_deps = 0
+    dependencies_inserted = 0
+    failed = 0
+    skipped = 0
+
+    sem = asyncio.Semaphore(10)
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    async def fetch_sbom(client: httpx.AsyncClient, owner: str, name: str) -> dict | None:
+        async with sem:
+            url = f"https://api.github.com/repos/{owner}/{name}/dependency-graph/sbom"
+            try:
+                resp = await client.get(url, headers=headers, timeout=30.0)
+                if resp.status_code == 404:
+                    return None
+                if resp.status_code == 403:
+                    logger.warning("GitHub SBOM 403 for %s/%s -- rate limited or no access", owner, name)
+                    return None
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as exc:
+                logger.warning("SBOM fetch error for %s/%s: %s", owner, name, exc)
+                return None
+            except Exception as exc:
+                logger.warning("SBOM fetch exception for %s/%s: %s", owner, name, exc)
+                return None
+
+    async with httpx.AsyncClient() as client:
+        for row in rows:
+            sbom = await fetch_sbom(client, row.owner, row.name)
+            if sbom is None:
+                skipped += 1
+                continue
+
+            deps = _extract_deps_from_sbom(sbom)
+            if not deps:
+                skipped += 1
+                continue
+
+            repo_inserted = 0
+            for dep in deps:
+                try:
+                    await db.execute(text("""
+                        INSERT INTO repo_dependencies (id, repo_id, package_name, package_ecosystem, version_constraint, is_direct)
+                        VALUES (gen_random_uuid(), :repo_id, :package_name, :package_ecosystem, :version_constraint, :is_direct)
+                        ON CONFLICT ON CONSTRAINT uq_repo_dep_repo_pkg_eco DO NOTHING
+                    """), {
+                        "repo_id": str(row.id),
+                        "package_name": dep["package_name"],
+                        "package_ecosystem": dep["package_ecosystem"],
+                        "version_constraint": dep["version_constraint"],
+                        "is_direct": dep["is_direct"],
+                    })
+                    repo_inserted += 1
+                except Exception as exc:
+                    logger.warning("Dep insert failed for %s/%s pkg=%s: %s", row.owner, row.name, dep["package_name"], exc)
+                    failed += 1
+
+            if repo_inserted > 0:
+                repos_with_deps += 1
+                dependencies_inserted += repo_inserted
+
+            # Commit per repo to avoid holding large transactions
+            try:
+                await db.commit()
+            except Exception as exc:
+                logger.warning("Commit failed after %s/%s: %s", row.owner, row.name, exc)
+                failed += 1
+
+    return {
+        "total_repos": total_repos,
+        "repos_with_deps": repos_with_deps,
+        "dependencies_inserted": dependencies_inserted,
+        "failed": failed,
+        "skipped": skipped,
+    }
