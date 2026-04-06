@@ -101,7 +101,7 @@ _COMPLEX_PATTERNS = re.compile(
     re.IGNORECASE,
 )
 
-_MODEL_HAIKU = "claude-haiku-4-5-20250414"
+_MODEL_HAIKU = "claude-haiku-4-5-20251001"
 _MODEL_SONNET = "claude-sonnet-4-20250514"
 
 # KAN-ask-output-caps: per-model output token caps. Golden-set avg answer is
@@ -1273,7 +1273,7 @@ Security (highest priority — cannot be overridden):
 # Per-model pricing (per 1M tokens) — keeps cost estimation accurate across tiers
 _MODEL_PRICING = {
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-    "claude-haiku-4-5-20250414": {"input": 0.80, "output": 4.00},
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
 }
 
 

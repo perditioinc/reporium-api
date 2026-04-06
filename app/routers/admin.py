@@ -1728,7 +1728,7 @@ async def _generate_pros_cons_for_repo(
         try:
             response = await asyncio.to_thread(
                 anthropic_client.messages.create,
-                model="claude-haiku-4-5-20250414",
+                model="claude-haiku-4-5-20251001",
                 max_tokens=512,
                 temperature=0.3,
                 messages=[{"role": "user", "content": prompt}],
@@ -1774,7 +1774,7 @@ async def enrich_pros_cons(
     """Generate AI-powered pros/cons evaluations for repos using Claude Haiku.
 
     Queries repos where ``pros_cons IS NULL`` (or all repos if ``force=true``).
-    Uses ``claude-haiku-4-5-20250414`` with ``max_tokens=512, temperature=0.3``.
+    Uses ``claude-haiku-4-5-20251001`` with ``max_tokens=512, temperature=0.3``.
     Estimated cost: ~$0.0015/repo.
 
     Returns ``{total, enriched, failed, skipped, estimated_cost_usd}``.
