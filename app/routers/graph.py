@@ -7,17 +7,21 @@ become graph edges, giving full coverage across the entire library.
 
 Previously read from a static `repo_edges` table populated by a naive
 category-matching script.  The new approach uses the existing 384-dim
-nomic-embed-text embeddings and the HNSW index for fast ANN queries.
+all-MiniLM-L6-v2 embeddings and the HNSW index for fast ANN queries.
 """
 
 from fastapi import APIRouter, Depends, Query, Request
+from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.cache import cache
 from app.database import get_db
 from app.rate_limit import rate_limit_storage
+
+CACHE_TTL_GRAPH_EDGES = 3600  # 1 hr
 
 router = APIRouter(tags=["Graph"])
 _limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
@@ -39,6 +43,14 @@ async def get_graph_edges(
     Each repo is connected to its top-K nearest neighbours above the
     similarity threshold.  Edges are SIMILAR_TO with weight = similarity.
     """
+    # --- Redis cache check ---
+    cache_key = f"graph_edges:{limit}:{min_similarity}:{neighbours}"
+    cached = await cache.get(cache_key)
+    if cached is not None:
+        response = JSONResponse(content=cached)
+        response.headers["Cache-Control"] = "public, max-age=3600"
+        return response
+
     # Use a CTE to find top-K neighbours per repo via HNSW index.
     # The <=> operator returns cosine distance; 1 - distance = similarity.
     # We lateral-join to get the K nearest neighbours per repo efficiently.
@@ -156,7 +168,7 @@ async def get_graph_edges(
     """))
     count_row = counts.fetchone()
 
-    return {
+    result_payload = {
         "total": len(edges),
         "total_repos": len(repo_ids),
         "total_public_repos": count_row.total_public if count_row else 0,
@@ -164,3 +176,10 @@ async def get_graph_edges(
         "edgeTypes": ["SIMILAR_TO"],
         "edges": edges,
     }
+
+    # Store in Redis cache
+    await cache.set(cache_key, result_payload, ttl=CACHE_TTL_GRAPH_EDGES)
+
+    response = JSONResponse(content=result_payload)
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response

@@ -932,30 +932,37 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
                 }
         # Fall through to LLM if repo not found
 
-    # --- Dependency/relationship queries ---
+    # --- Dependency/relationship queries (pgvector similarity) ---
     m = _ROUTE_DEPENDENCY.search(q)
     if m:
         target_name = m.group(1).strip().lower()
         result = await db.execute(text("""
-            SELECT r_src.name, r_src.owner,
-                   COALESCE(r_src.parent_stars, r_src.stargazers_count, 0) as stars,
-                   r_src.primary_category, r_src.description,
-                   e.edge_type
-            FROM repo_edges e
-            JOIN repos r_tgt ON r_tgt.id = e.target_repo_id
-            JOIN repos r_src ON r_src.id = e.source_repo_id
-            WHERE r_src.is_private = false
-              AND LOWER(r_tgt.name) = :target_name
-              AND e.edge_type IN ('DEPENDS_ON', 'EXTENDS', 'FORK_OF')
-            ORDER BY COALESCE(r_src.parent_stars, r_src.stargazers_count, 0) DESC
+            SELECT r2.name, r2.owner,
+                   COALESCE(r2.parent_stars, r2.stargazers_count, 0) as stars,
+                   r2.primary_category, r2.description,
+                   1 - (e1.embedding_vec <=> e2.embedding_vec) AS similarity
+            FROM repos r1
+            JOIN repo_embeddings e1 ON e1.repo_id = r1.id
+            CROSS JOIN LATERAL (
+                SELECT e2_inner.repo_id, e2_inner.embedding_vec
+                FROM repo_embeddings e2_inner
+                WHERE e2_inner.repo_id != r1.id
+                ORDER BY e1.embedding_vec <=> e2_inner.embedding_vec
+                LIMIT 10
+            ) e2
+            JOIN repos r2 ON r2.id = e2.repo_id AND r2.is_private = false
+            WHERE LOWER(r1.name) = :target_name
+              AND r1.is_private = false
+              AND 1 - (e1.embedding_vec <=> e2.embedding_vec) >= 0.4
+            ORDER BY COALESCE(r2.parent_stars, r2.stargazers_count, 0) DESC
             LIMIT 10
         """), {"target_name": target_name})
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** ({r.edge_type.lower().replace('_', ' ')}) — {r.stars:,} stars" for r in rows]
+            parts = [f"- **{r.owner}/{r.name}** (similar, score {r.similarity:.2f}) — {r.stars:,} stars" for r in rows]
             return {
-                "answer": f"Repos that depend on, extend, or fork **{target_name}** ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "answer": f"Repos related to **{target_name}** ({len(rows)} shown):\n\n" + "\n".join(parts),
+                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": round(float(r.similarity), 4), "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
                 "route": "dependency_search",
             }
 
@@ -1986,29 +1993,35 @@ async def _prepare_query(
             else:
                 uncached_ids.append(rid)
 
-        # Query DB only for uncached repo edges
+        # Query DB only for uncached repo edges (pgvector similarity)
         new_edges: dict[str, list[dict]] = {}
         if uncached_ids:
             edge_result = await db.execute(
                 text("""
-                    SELECT e.edge_type, e.weight, e.evidence,
-                           e.source_repo_id::text as source_id,
-                           e.target_repo_id::text as target_id,
-                           r1.name as source_name, r1.forked_from as source_upstream,
-                           r2.name as target_name, r2.forked_from as target_upstream
-                    FROM repo_edges e
-                    JOIN repos r1 ON r1.id = e.source_repo_id
-                    JOIN repos r2 ON r2.id = e.target_repo_id
-                    WHERE e.source_repo_id::text = ANY(:ids)
-                       OR e.target_repo_id::text = ANY(:ids)
-                    LIMIT 20;
+                    SELECT e1.repo_id::text AS source_id,
+                           e2.repo_id::text AS target_id,
+                           r1.name AS source_name, r1.forked_from AS source_upstream,
+                           r2.name AS target_name, r2.forked_from AS target_upstream,
+                           1 - (e1.embedding_vec <=> e2.embedding_vec) AS similarity
+                    FROM repo_embeddings e1
+                    CROSS JOIN LATERAL (
+                        SELECT e2_inner.repo_id, e2_inner.embedding_vec
+                        FROM repo_embeddings e2_inner
+                        WHERE e2_inner.repo_id != e1.repo_id
+                        ORDER BY e1.embedding_vec <=> e2_inner.embedding_vec
+                        LIMIT 4
+                    ) e2
+                    JOIN repos r1 ON r1.id = e1.repo_id
+                    JOIN repos r2 ON r2.id = e2.repo_id
+                    WHERE e1.repo_id::text = ANY(:ids)
+                      AND 1 - (e1.embedding_vec <=> e2.embedding_vec) >= 0.4
                 """),
                 {"ids": uncached_ids},
             )
             edge_rows = edge_result.fetchall()
             for er in edge_rows:
                 edge_data = {
-                    "edge_type": er.edge_type,
+                    "edge_type": "SIMILAR_TO",
                     "source_name": er.source_upstream or er.source_name,
                     "target_name": er.target_upstream or er.target_name,
                 }
@@ -2970,21 +2983,28 @@ async def repo_ecosystem(
 
     center_id = center_row["id"]
 
-    # Level 1: edges touching center repo
+    # Level 1: nearest neighbours of center repo (pgvector similarity)
     level1_result = await db.execute(
         text("""
-            SELECT e.edge_type,
+            SELECT 'SIMILAR_TO' AS edge_type,
                    r1.name as source_name, r1.id::text as source_id,
                    COALESCE(r1.parent_stars, r1.stargazers_count, 0) as source_stars,
                    r1.primary_category as source_category,
                    r2.name as target_name, r2.id::text as target_id,
                    COALESCE(r2.parent_stars, r2.stargazers_count, 0) as target_stars,
                    r2.primary_category as target_category
-            FROM repo_edges e
-            JOIN repos r1 ON r1.id = e.source_repo_id
-            JOIN repos r2 ON r2.id = e.target_repo_id
-            WHERE (e.source_repo_id::text = :cid OR e.target_repo_id::text = :cid)
-              AND r1.is_private = false AND r2.is_private = false
+            FROM repo_embeddings e1
+            CROSS JOIN LATERAL (
+                SELECT e2_inner.repo_id, e2_inner.embedding_vec
+                FROM repo_embeddings e2_inner
+                WHERE e2_inner.repo_id != e1.repo_id
+                ORDER BY e1.embedding_vec <=> e2_inner.embedding_vec
+                LIMIT 8
+            ) e2
+            JOIN repos r1 ON r1.id = e1.repo_id AND r1.is_private = false
+            JOIN repos r2 ON r2.id = e2.repo_id AND r2.is_private = false
+            WHERE e1.repo_id::text = :cid
+              AND 1 - (e1.embedding_vec <=> e2.embedding_vec) >= 0.4
         """),
         {"cid": center_id},
     )
@@ -3009,23 +3029,30 @@ async def repo_ecosystem(
                     "category": r[f"{prefix}_category"],
                 }
 
-    # Level 2: edges touching level-1 repos (excluding center)
+    # Level 2: nearest neighbours of level-1 repos (excluding center)
     if connected_ids:
         level2_result = await db.execute(
             text("""
-                SELECT e.edge_type,
+                SELECT 'SIMILAR_TO' AS edge_type,
                        r1.name as source_name, r1.id::text as source_id,
                        COALESCE(r1.parent_stars, r1.stargazers_count, 0) as source_stars,
                        r1.primary_category as source_category,
                        r2.name as target_name, r2.id::text as target_id,
                        COALESCE(r2.parent_stars, r2.stargazers_count, 0) as target_stars,
                        r2.primary_category as target_category
-                FROM repo_edges e
-                JOIN repos r1 ON r1.id = e.source_repo_id
-                JOIN repos r2 ON r2.id = e.target_repo_id
-                WHERE (e.source_repo_id::text = ANY(:ids) OR e.target_repo_id::text = ANY(:ids))
-                  AND e.source_repo_id::text != :cid AND e.target_repo_id::text != :cid
-                  AND r1.is_private = false AND r2.is_private = false
+                FROM repo_embeddings e1
+                CROSS JOIN LATERAL (
+                    SELECT e2_inner.repo_id, e2_inner.embedding_vec
+                    FROM repo_embeddings e2_inner
+                    WHERE e2_inner.repo_id != e1.repo_id
+                    ORDER BY e1.embedding_vec <=> e2_inner.embedding_vec
+                    LIMIT 8
+                ) e2
+                JOIN repos r1 ON r1.id = e1.repo_id AND r1.is_private = false
+                JOIN repos r2 ON r2.id = e2.repo_id AND r2.is_private = false
+                WHERE e1.repo_id::text = ANY(:ids)
+                  AND e1.repo_id::text != :cid AND e2.repo_id::text != :cid
+                  AND 1 - (e1.embedding_vec <=> e2.embedding_vec) >= 0.4
             """),
             {"ids": list(connected_ids), "cid": center_id},
         )
