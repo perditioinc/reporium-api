@@ -18,6 +18,7 @@ from app.rate_limit import rate_limit_storage
 from app.slo_observer import slo_observer
 from app.database import async_session_factory, check_db_connection, engine
 from app.routers import admin, analytics, graph, ingest, intelligence, library, library_full, nl_filter, platform, recommendations, repos, search, taxonomy, trends, webhooks, wiki
+from app.telemetry import init_telemetry
 
 
 class _JsonFormatter(logging.Formatter):
@@ -53,6 +54,13 @@ async def lifespan(app: FastAPI):
     _env = os.environ.get("ENV") or os.environ.get("ENVIRONMENT") or ""
     if _env.lower() == "production" and not os.environ.get("APP_API_TOKEN"):
         logger.critical("APP_API_TOKEN not set in production — /ask endpoint will reject all requests")
+
+    # Initialise OpenTelemetry tracing (no-op unless OTEL_ENABLED=1).
+    _otel_provider = init_telemetry()
+    if _otel_provider is not None:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        FastAPIInstrumentor.instrument_app(app)
+        logger.info("FastAPI instrumented with OpenTelemetry")
 
     await cache.connect()
     await check_db_connection()
@@ -109,6 +117,12 @@ app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=1000)  # compress responses > 1KB
+
+# KAN-governance: audit middleware (feature-flagged, default OFF)
+if os.environ.get("AUDIT_ENABLED", "0") == "1":
+    from app.middleware.audit import AuditMiddleware  # noqa: E402
+    app.add_middleware(AuditMiddleware)
+    logger.info("Audit middleware enabled (AUDIT_ENABLED=1)")
 
 
 @app.get("/docs", include_in_schema=False)
@@ -201,7 +215,7 @@ app.add_middleware(
     allow_origins=_ALLOWED_ORIGINS,
     allow_origin_regex=r"https://reporium(-[a-z0-9]+)*\.vercel\.app",
     allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Ingest-Key", "X-App-Token", "Accept"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Ingest-Key", "X-App-Token", "X-Sandbox", "Accept"],
 )
 
 
