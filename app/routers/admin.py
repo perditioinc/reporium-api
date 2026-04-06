@@ -1,7 +1,11 @@
+import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field as dc_field
+from datetime import date
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from slowapi import Limiter
@@ -880,20 +884,8 @@ async def data_integrity_health(
 # Run history
 # ---------------------------------------------------------------------------
 
-@router.get(
-    "/admin/runs",
-    summary="List recent ingestion runs",
-    dependencies=[Depends(require_admin_key), Depends(verify_api_key)],
-)
-async def list_runs(
-    limit: int = Query(50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db),
-):
-    """Return the most recent *limit* ingestion run records, newest first."""
-    result = await db.execute(
-        select(IngestRun).order_by(IngestRun.started_at.desc()).limit(limit)
-    )
-    runs = result.scalars().all()
+def _format_runs(runs) -> list[dict]:
+    """Shared formatter for ingestion run records."""
     return [
         {
             "id": r.id,
@@ -912,6 +904,43 @@ async def list_runs(
         }
         for r in runs
     ]
+
+
+@router.get(
+    "/runs",
+    summary="List recent ingestion runs (public)",
+)
+async def list_runs_public(
+    limit: int = Query(20, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    """Public read-only view of recent ingestion runs (max 50, no error details)."""
+    result = await db.execute(
+        select(IngestRun).order_by(IngestRun.started_at.desc()).limit(limit)
+    )
+    runs = result.scalars().all()
+    formatted = _format_runs(runs)
+    # Strip error details from public endpoint
+    for r in formatted:
+        r.pop("errors", None)
+    return formatted
+
+
+@router.get(
+    "/admin/runs",
+    summary="List recent ingestion runs (admin)",
+    dependencies=[Depends(require_admin_key), Depends(verify_api_key)],
+)
+async def list_runs(
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the most recent *limit* ingestion run records, newest first."""
+    result = await db.execute(
+        select(IngestRun).order_by(IngestRun.started_at.desc()).limit(limit)
+    )
+    runs = result.scalars().all()
+    return _format_runs(runs)
 
 
 @router.post("/admin/enrichment/trigger", response_model=dict)
@@ -1240,3 +1269,785 @@ async def admin_delete_ask_session(
         "ask_sessions RTBF delete: session_id=%s deleted=%d", session_id, count
     )
     return {"deleted": count, "session_id": session_id}
+
+
+# ---------------------------------------------------------------------------
+# Audit log endpoint (KAN-governance)
+# ---------------------------------------------------------------------------
+
+
+@router.get("/admin/audit", dependencies=[Depends(require_admin_key)])
+async def get_audit_logs(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    api_key_hash: str | None = Query(None, description="Filter by SHA-256 of API key"),
+    endpoint: str | None = Query(None, description="Filter by endpoint substring"),
+    date_from: date | None = Query(None, description="Start date (inclusive)"),
+    date_to: date | None = Query(None, description="End date (inclusive)"),
+    sandbox_only: bool = Query(False, description="Only show sandbox entries"),
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+):
+    """List recent audit log entries (admin-key required).
+
+    Returns timestamp, endpoint, model, tokens, cost, latency, and sandbox flag.
+    """
+    from app.audit import list_audit_logs
+
+    entries = await list_audit_logs(
+        db,
+        api_key_hash=api_key_hash,
+        endpoint=endpoint,
+        date_from=date_from,
+        date_to=date_to,
+        sandbox_only=sandbox_only,
+        limit=limit,
+        offset=offset,
+    )
+    return {"entries": entries, "count": len(entries), "limit": limit, "offset": offset}
+
+
+# ---------------------------------------------------------------------------
+# License SPDX backfill via GitHub REST API
+# ---------------------------------------------------------------------------
+
+async def _fetch_license(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    owner: str,
+    name: str,
+) -> str | None:
+    """Fetch license.spdx_id from GitHub REST API for a single repo.
+
+    Returns the SPDX identifier string, or None if unavailable / on error.
+    """
+    async with semaphore:
+        try:
+            resp = await client.get(
+                f"https://api.github.com/repos/{owner}/{name}",
+                timeout=15.0,
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            license_obj = data.get("license")
+            if license_obj and isinstance(license_obj, dict):
+                spdx = license_obj.get("spdx_id")
+                # GitHub returns "NOASSERTION" when it can't identify the license
+                if spdx and spdx != "NOASSERTION":
+                    return spdx
+            return None
+        except Exception:
+            return None
+
+
+@router.post("/admin/backfill-licenses", response_model=dict)
+@_limiter.limit("5/minute")
+async def backfill_licenses(
+    request: Request,
+    dry_run: bool = Query(default=False, description="Preview without writing"),
+    concurrency: int = Query(default=10, ge=1, le=50, description="Max concurrent GitHub API calls"),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Backfill license_spdx for repos where the field is NULL or empty.
+
+    Calls the free GitHub REST API ``GET /repos/{owner}/{name}`` which returns
+    ``license.spdx_id`` at no cost.  Uses ``GITHUB_TOKEN`` env var for
+    authenticated requests (5 000 req/hr) when available.
+
+    Returns ``{total, updated, failed, skipped, dry_run}``.
+    """
+    # Find repos missing license_spdx
+    result = await db.execute(text(
+        "SELECT id, owner, name FROM repos "
+        "WHERE license_spdx IS NULL OR license_spdx = '' "
+        "ORDER BY updated_at DESC"
+    ))
+    rows = result.fetchall()
+    total = len(rows)
+
+    if total == 0:
+        return {"total": 0, "updated": 0, "failed": 0, "skipped": 0, "dry_run": dry_run}
+
+    if dry_run:
+        return {"total": total, "updated": 0, "failed": 0, "skipped": 0, "dry_run": True}
+
+    # Build HTTP headers — use GITHUB_TOKEN if available for 5k/hr rate limit
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    gh_token = os.getenv("GITHUB_TOKEN")
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+
+    semaphore = asyncio.Semaphore(concurrency)
+    updated = 0
+    failed = 0
+    skipped = 0
+
+    async with httpx.AsyncClient(headers=headers) as client:
+        # Create tasks for all repos
+        tasks = [
+            _fetch_license(client, semaphore, row.owner, row.name)
+            for row in rows
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for row, spdx in zip(rows, results):
+        if isinstance(spdx, Exception):
+            failed += 1
+            logger.warning("License fetch exception for %s/%s: %s", row.owner, row.name, spdx)
+            continue
+        if spdx is None:
+            skipped += 1
+            continue
+        try:
+            await db.execute(
+                text("UPDATE repos SET license_spdx = :spdx WHERE id = :id"),
+                {"spdx": spdx, "id": str(row.id)},
+            )
+            updated += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning("License update failed for %s/%s: %s", row.owner, row.name, exc)
+
+    if updated > 0:
+        await db.commit()
+
+    return {"total": total, "updated": updated, "failed": failed, "skipped": skipped, "dry_run": False}
+
+
+# ---------------------------------------------------------------------------
+# Community health signals backfill
+# ---------------------------------------------------------------------------
+
+def _parse_last_page(link_header: str | None) -> int | None:
+    """Extract the last page number from a GitHub ``Link`` header.
+
+    Returns ``None`` when the header is absent or has no ``rel="last"`` entry
+    (which means the first page already contains all results).
+    """
+    if not link_header:
+        return None
+    import re
+    match = re.search(r'<[^>]*[?&]page=(\d+)[^>]*>;\s*rel="last"', link_header)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+async def _fetch_community_signals(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    owner: str,
+    name: str,
+) -> dict | None:
+    """Fetch community health signals for a single repo from the free GitHub API.
+
+    Returns a dict with the signal values, or ``None`` on unrecoverable error
+    (404, etc.).
+    """
+    base = f"https://api.github.com/repos/{owner}/{name}"
+    signals: dict = {}
+
+    async with semaphore:
+        try:
+            # 1. Main repo endpoint → has_discussions, open_issues_count
+            resp = await client.get(base, timeout=15.0)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            repo_data = resp.json()
+            signals["has_discussions"] = repo_data.get("has_discussions", False)
+
+            # 2. Contributors (per_page=1, parse Link header for total)
+            resp_c = await client.get(
+                f"{base}/contributors",
+                params={"per_page": "1", "anon": "true"},
+                timeout=15.0,
+            )
+            if resp_c.status_code == 200:
+                last_page = _parse_last_page(resp_c.headers.get("link"))
+                signals["contributors_count"] = last_page if last_page else len(resp_c.json())
+            elif resp_c.status_code == 204:
+                # Empty repo — no contributors
+                signals["contributors_count"] = 0
+
+            # 3. Releases (per_page=1, parse Link header for count + latest date)
+            resp_r = await client.get(
+                f"{base}/releases",
+                params={"per_page": "1"},
+                timeout=15.0,
+            )
+            if resp_r.status_code == 200:
+                releases = resp_r.json()
+                last_page = _parse_last_page(resp_r.headers.get("link"))
+                signals["release_count"] = last_page if last_page else len(releases)
+                if releases:
+                    signals["latest_release_date"] = releases[0].get("published_at")
+            else:
+                signals["release_count"] = 0
+
+            # 4. Community profile → health_percentage
+            resp_cp = await client.get(
+                f"{base}/community/profile",
+                timeout=15.0,
+            )
+            if resp_cp.status_code == 200:
+                signals["community_health_pct"] = resp_cp.json().get("health_percentage")
+
+            # 5. Issue close rate
+            #    closed issues = total from search, open from repo data
+            open_issues = repo_data.get("open_issues_count", 0)
+            resp_closed = await client.get(
+                "https://api.github.com/search/issues",
+                params={
+                    "q": f"repo:{owner}/{name} type:issue is:closed",
+                    "per_page": "1",
+                },
+                timeout=15.0,
+            )
+            if resp_closed.status_code == 200:
+                closed_count = resp_closed.json().get("total_count", 0)
+                total_issues = open_issues + closed_count
+                signals["issue_close_rate"] = round(
+                    closed_count / total_issues, 4
+                ) if total_issues > 0 else None
+
+            # 6. PR merge rate
+            resp_closed_pr = await client.get(
+                "https://api.github.com/search/issues",
+                params={
+                    "q": f"repo:{owner}/{name} type:pr is:merged",
+                    "per_page": "1",
+                },
+                timeout=15.0,
+            )
+            resp_total_pr = await client.get(
+                "https://api.github.com/search/issues",
+                params={
+                    "q": f"repo:{owner}/{name} type:pr",
+                    "per_page": "1",
+                },
+                timeout=15.0,
+            )
+            if resp_closed_pr.status_code == 200 and resp_total_pr.status_code == 200:
+                merged_count = resp_closed_pr.json().get("total_count", 0)
+                total_prs = resp_total_pr.json().get("total_count", 0)
+                signals["pr_merge_rate"] = round(
+                    merged_count / total_prs, 4
+                ) if total_prs > 0 else None
+
+            return signals
+
+        except Exception as exc:
+            logger.warning("Community signals fetch failed for %s/%s: %s", owner, name, exc)
+            return None
+
+
+@router.post("/admin/backfill-community-signals", response_model=dict)
+@_limiter.limit("5/minute")
+async def backfill_community_signals(
+    request: Request,
+    dry_run: bool = Query(default=False, description="Preview without writing"),
+    batch_size: int = Query(default=0, ge=0, le=500, description="Max repos to process (0 = all)"),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Backfill community health signals for repos missing ``community_health_pct``.
+
+    Calls the free GitHub REST API to populate:
+    ``contributors_count``, ``release_count``, ``latest_release_date``,
+    ``issue_close_rate``, ``pr_merge_rate``, ``has_discussions``, and
+    ``community_health_pct``.
+
+    Uses ``GITHUB_TOKEN`` env var for authenticated requests (5 000 req/hr).
+
+    Returns ``{total, updated, failed, skipped, dry_run}``.
+    """
+    query = (
+        "SELECT id, owner, name FROM repos "
+        "WHERE community_health_pct IS NULL "
+        "ORDER BY updated_at DESC"
+    )
+    if batch_size > 0:
+        query += f" LIMIT {batch_size}"
+
+    result = await db.execute(text(query))
+    rows = result.fetchall()
+    total = len(rows)
+
+    if total == 0:
+        return {"total": 0, "updated": 0, "failed": 0, "skipped": 0, "dry_run": dry_run}
+
+    if dry_run:
+        return {"total": total, "updated": 0, "failed": 0, "skipped": 0, "dry_run": True}
+
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    gh_token = os.getenv("GITHUB_TOKEN")
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+
+    semaphore = asyncio.Semaphore(10)
+    updated = 0
+    failed = 0
+    skipped = 0
+
+    async with httpx.AsyncClient(headers=headers) as client:
+        tasks = [
+            _fetch_community_signals(client, semaphore, row.owner, row.name)
+            for row in rows
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for row, signals in zip(rows, results):
+        if isinstance(signals, Exception):
+            failed += 1
+            logger.warning(
+                "Community signals exception for %s/%s: %s", row.owner, row.name, signals
+            )
+            continue
+        if signals is None:
+            skipped += 1
+            continue
+        if not signals:
+            skipped += 1
+            continue
+
+        try:
+            set_clauses = []
+            params: dict = {"id": str(row.id)}
+
+            for col in (
+                "contributors_count",
+                "release_count",
+                "latest_release_date",
+                "issue_close_rate",
+                "pr_merge_rate",
+                "has_discussions",
+                "community_health_pct",
+            ):
+                if col in signals and signals[col] is not None:
+                    set_clauses.append(f"{col} = :{col}")
+                    params[col] = signals[col]
+
+            if not set_clauses:
+                skipped += 1
+                continue
+
+            await db.execute(
+                text(f"UPDATE repos SET {', '.join(set_clauses)} WHERE id = :id"),
+                params,
+            )
+            updated += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning(
+                "Community signals update failed for %s/%s: %s", row.owner, row.name, exc
+            )
+
+    if updated > 0:
+        await db.commit()
+
+    return {"total": total, "updated": updated, "failed": failed, "skipped": skipped, "dry_run": False}
+
+
+# ---------------------------------------------------------------------------
+# KAN pros-cons enrichment — AI-generated developer-focused evaluation
+# ---------------------------------------------------------------------------
+
+_PROS_CONS_PROMPT = """You are evaluating an AI/ML open-source tool for developers.
+
+Repository: {owner}/{name} ({stars}\u2605)
+Description: {description}
+README Summary: {readme_summary}
+Problem Solved: {problem_solved}
+Quality: {quality}, Maturity: {maturity}
+Category: {primary_category}
+Language: {primary_language}
+Contributors: {contributors_count}
+Issue Close Rate: {issue_close_rate}%
+Has Tests: {has_tests}, Has CI: {has_ci}
+Community Health: {community_health_pct}%
+
+Generate a developer-focused evaluation:
+{{
+  "pros": ["3-5 specific strengths based on evidence"],
+  "cons": ["2-4 honest weaknesses or gaps"],
+  "best_for": "1-sentence ideal use case",
+  "avoid_if": "1-sentence when NOT to use this",
+  "community_verdict": "1-sentence what developers think",
+  "comparable_to": ["3-5 well-known alternatives"]
+}}
+
+Rules:
+- Be specific and evidence-based, not generic
+- Reference actual metrics (stars, contributors, test coverage) in pros/cons
+- For comparable_to, list real tools even if not in our database
+- If data is sparse, say so in cons rather than speculating"""
+
+
+async def _generate_pros_cons_for_repo(
+    repo: Repo,
+    anthropic_client,
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    """Call Claude Haiku to generate pros/cons for a single repo.
+
+    Returns dict with keys: pros_cons, input_tokens, output_tokens, error.
+    """
+    qs = repo.quality_signals or {}
+    # Build context values, falling back to sensible defaults for sparse data
+    prompt = _PROS_CONS_PROMPT.format(
+        owner=repo.owner or "unknown",
+        name=repo.name or "unknown",
+        stars=repo.stargazers_count or repo.parent_stars or 0,
+        description=repo.description or "No description",
+        readme_summary=repo.readme_summary or "Not available",
+        problem_solved=repo.problem_solved or "Not available",
+        quality=qs.get("quality", "unknown"),
+        maturity=qs.get("maturity", "unknown"),
+        primary_category=repo.primary_category or "Uncategorized",
+        primary_language=repo.primary_language or "Unknown",
+        contributors_count=repo.contributors_count or 0,
+        issue_close_rate=repo.issue_close_rate or 0,
+        has_tests=repo.has_tests if repo.has_tests is not None else "Unknown",
+        has_ci=repo.has_ci if repo.has_ci is not None else "Unknown",
+        community_health_pct=repo.community_health_pct or 0,
+    )
+
+    async with semaphore:
+        try:
+            response = await asyncio.to_thread(
+                anthropic_client.messages.create,
+                model="claude-haiku-4-5-20250414",
+                max_tokens=512,
+                temperature=0.3,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as exc:
+            return {"pros_cons": None, "input_tokens": 0, "output_tokens": 0, "error": str(exc)}
+
+    raw = response.content[0].text.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {
+            "pros_cons": None,
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "error": f"JSON parse error: {exc}",
+        }
+
+    return {
+        "pros_cons": data,
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+        "error": None,
+    }
+
+
+@router.post("/admin/enrich-pros-cons", response_model=dict)
+@_limiter.limit("5/minute")
+async def enrich_pros_cons(
+    request: Request,
+    batch_size: int = Query(default=50, ge=1, le=500),
+    dry_run: bool = Query(default=False),
+    force: bool = Query(default=False, description="Re-generate even if pros_cons already exists"),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Generate AI-powered pros/cons evaluations for repos using Claude Haiku.
+
+    Queries repos where ``pros_cons IS NULL`` (or all repos if ``force=true``).
+    Uses ``claude-haiku-4-5-20250414`` with ``max_tokens=512, temperature=0.3``.
+    Estimated cost: ~$0.0015/repo.
+
+    Returns ``{total, enriched, failed, skipped, estimated_cost_usd}``.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    # Build query
+    if force:
+        stmt = select(Repo).where(Repo.is_private == False).limit(batch_size)  # noqa: E712
+    else:
+        stmt = (
+            select(Repo)
+            .where(Repo.is_private == False)  # noqa: E712
+            .where(Repo.pros_cons.is_(None))
+            .limit(batch_size)
+        )
+
+    result = await db.execute(stmt)
+    repos = result.scalars().all()
+    total = len(repos)
+
+    if total == 0:
+        return {"total": 0, "enriched": 0, "failed": 0, "skipped": 0, "estimated_cost_usd": 0.0}
+
+    if dry_run:
+        return {"total": total, "enriched": 0, "failed": 0, "skipped": total, "estimated_cost_usd": 0.0, "dry_run": True}
+
+    # Set up Anthropic client
+    from app.routers.ingest import _get_anthropic_key
+    import anthropic as _anthropic_lib
+
+    api_key = _get_anthropic_key()
+    client = _anthropic_lib.Anthropic(api_key=api_key)
+
+    semaphore = asyncio.Semaphore(5)  # Anthropic rate-limit guard
+
+    enriched = 0
+    failed = 0
+    skipped = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for repo in repos:
+        result_data = await _generate_pros_cons_for_repo(repo, client, semaphore)
+
+        total_input_tokens += result_data["input_tokens"]
+        total_output_tokens += result_data["output_tokens"]
+
+        if result_data["error"]:
+            failed += 1
+            logger.warning(
+                "Pros/cons enrichment failed for %s/%s: %s",
+                repo.owner, repo.name, result_data["error"],
+            )
+            continue
+
+        if result_data["pros_cons"] is None:
+            skipped += 1
+            continue
+
+        repo.pros_cons = result_data["pros_cons"]
+        repo.pros_cons_generated_at = _dt.now(_tz.utc)
+        enriched += 1
+
+    if enriched > 0:
+        await db.commit()
+
+    # Haiku pricing: $0.80/M input, $4.00/M output
+    estimated_cost = (total_input_tokens * 0.80 / 1_000_000) + (total_output_tokens * 4.00 / 1_000_000)
+
+    logger.info(
+        "Pros/cons enrichment complete: total=%d enriched=%d failed=%d cost=$%.4f",
+        total, enriched, failed, estimated_cost,
+    )
+
+    return {
+        "total": total,
+        "enriched": enriched,
+        "failed": failed,
+        "skipped": skipped,
+        "estimated_cost_usd": round(estimated_cost, 6),
+    }
+
+
+# ── SBOM dependency backfill ─────────────────────────────────────────────────
+
+def parse_purl(purl: str) -> tuple[str | None, str | None, str | None]:
+    """Parse a Package URL into (ecosystem, name, version).
+
+    purl format: ``pkg:<ecosystem>/<namespace>/<name>@<version>``
+    or ``pkg:<ecosystem>/<name>@<version>``
+
+    Returns (ecosystem, name, version_constraint) -- any part may be None
+    if the purl cannot be parsed.
+    """
+    if not purl or not purl.startswith("pkg:"):
+        return None, None, None
+
+    body = purl[4:]  # strip "pkg:"
+    version: str | None = None
+    if "@" in body:
+        body, version = body.rsplit("@", 1)
+
+    parts = body.split("/", 2)
+    if len(parts) < 2:
+        return None, None, None
+
+    ecosystem = parts[0]
+    # If there's a namespace (e.g. @scope/name in npm), keep only the final name
+    name = parts[-1]
+    return ecosystem, name, version
+
+
+def _extract_deps_from_sbom(sbom: dict) -> list[dict]:
+    """Extract dependency info from an SPDX SBOM response.
+
+    Returns a list of dicts with keys: package_name, package_ecosystem,
+    version_constraint, is_direct.
+    """
+    deps: list[dict] = []
+    packages = sbom.get("sbom", {}).get("packages", [])
+
+    for pkg in packages:
+        # Skip the root package (SPDX document itself)
+        spdx_id = pkg.get("SPDXID", "")
+        if spdx_id == "SPDXRef-DOCUMENT":
+            continue
+
+        # Try to extract from purl in externalRefs
+        purl_ref = None
+        for ref in pkg.get("externalRefs", []):
+            if ref.get("referenceType") == "purl":
+                purl_ref = ref.get("referenceLocator")
+                break
+
+        if purl_ref:
+            ecosystem, name, version = parse_purl(purl_ref)
+            if name:
+                deps.append({
+                    "package_name": name,
+                    "package_ecosystem": ecosystem,
+                    "version_constraint": version,
+                    "is_direct": True,
+                })
+        else:
+            # Fallback: use package name field
+            pkg_name = pkg.get("name")
+            if pkg_name:
+                version_info = pkg.get("versionInfo")
+                deps.append({
+                    "package_name": pkg_name,
+                    "package_ecosystem": None,
+                    "version_constraint": version_info,
+                    "is_direct": True,
+                })
+
+    return deps
+
+
+@router.post("/admin/backfill-dependencies", response_model=dict)
+@_limiter.limit("5/minute")
+async def backfill_dependencies(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Fetch SBOM dependency data from GitHub for repos with no dependencies stored.
+
+    Uses the free GitHub SBOM API (dependency-graph/sbom) to extract packages
+    from SPDX format. Parses purl references to extract ecosystem and version.
+    """
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    if not github_token:
+        raise HTTPException(status_code=500, detail="GITHUB_TOKEN env var not set")
+
+    # Find repos with no entries in repo_dependencies
+    result = await db.execute(text("""
+        SELECT r.id, r.owner, r.name
+        FROM repos r
+        LEFT JOIN repo_dependencies d ON d.repo_id = r.id
+        WHERE d.id IS NULL
+        ORDER BY r.updated_at DESC
+    """))
+    rows = result.fetchall()
+
+    if not rows:
+        return {
+            "total_repos": 0,
+            "repos_with_deps": 0,
+            "dependencies_inserted": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
+
+    total_repos = len(rows)
+    repos_with_deps = 0
+    dependencies_inserted = 0
+    failed = 0
+    skipped = 0
+
+    sem = asyncio.Semaphore(10)
+    headers = {
+        "Authorization": f"Bearer {github_token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+    async def fetch_sbom(client: httpx.AsyncClient, owner: str, name: str) -> dict | None:
+        async with sem:
+            url = f"https://api.github.com/repos/{owner}/{name}/dependency-graph/sbom"
+            try:
+                resp = await client.get(url, headers=headers, timeout=30.0)
+                if resp.status_code == 404:
+                    return None
+                if resp.status_code == 403:
+                    logger.warning("GitHub SBOM 403 for %s/%s -- rate limited or no access", owner, name)
+                    return None
+                resp.raise_for_status()
+                return resp.json()
+            except httpx.HTTPStatusError as exc:
+                logger.warning("SBOM fetch error for %s/%s: %s", owner, name, exc)
+                return None
+            except Exception as exc:
+                logger.warning("SBOM fetch exception for %s/%s: %s", owner, name, exc)
+                return None
+
+    async with httpx.AsyncClient() as client:
+        for row in rows:
+            sbom = await fetch_sbom(client, row.owner, row.name)
+            if sbom is None:
+                skipped += 1
+                continue
+
+            deps = _extract_deps_from_sbom(sbom)
+            if not deps:
+                skipped += 1
+                continue
+
+            repo_inserted = 0
+            for dep in deps:
+                try:
+                    await db.execute(text("""
+                        INSERT INTO repo_dependencies (id, repo_id, package_name, package_ecosystem, version_constraint, is_direct)
+                        VALUES (gen_random_uuid(), :repo_id, :package_name, :package_ecosystem, :version_constraint, :is_direct)
+                        ON CONFLICT ON CONSTRAINT uq_repo_dep_repo_pkg_eco DO NOTHING
+                    """), {
+                        "repo_id": str(row.id),
+                        "package_name": dep["package_name"],
+                        "package_ecosystem": dep["package_ecosystem"],
+                        "version_constraint": dep["version_constraint"],
+                        "is_direct": dep["is_direct"],
+                    })
+                    repo_inserted += 1
+                except Exception as exc:
+                    logger.warning("Dep insert failed for %s/%s pkg=%s: %s", row.owner, row.name, dep["package_name"], exc)
+                    failed += 1
+
+            if repo_inserted > 0:
+                repos_with_deps += 1
+                dependencies_inserted += repo_inserted
+
+            # Commit per repo to avoid holding large transactions
+            try:
+                await db.commit()
+            except Exception as exc:
+                logger.warning("Commit failed after %s/%s: %s", row.owner, row.name, exc)
+                failed += 1
+
+    return {
+        "total_repos": total_repos,
+        "repos_with_deps": repos_with_deps,
+        "dependencies_inserted": dependencies_inserted,
+        "failed": failed,
+        "skipped": skipped,
+    }

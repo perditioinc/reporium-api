@@ -175,6 +175,30 @@ async def list_dimensions(db: AsyncSession = Depends(get_db)) -> dict:
     }
 
 
+@router.get("/values", response_model=list)
+async def list_all_taxonomy_values(
+    limit: int = 500,
+    db: AsyncSession = Depends(get_db),
+) -> list:
+    """Return all taxonomy_values across all dimensions, sorted by repo_count desc.
+
+    Used by the frontend taxonomy explorer to render dimension cards.
+    """
+    if limit > 2000:
+        limit = 2000
+    result = await db.execute(text(
+        "SELECT dimension, name AS value, repo_count "
+        "FROM taxonomy_values "
+        "ORDER BY repo_count DESC, dimension, name "
+        "LIMIT :limit"
+    ), {"limit": limit})
+    rows = result.fetchall()
+    return [
+        {"dimension": row.dimension, "value": row.value, "repo_count": row.repo_count}
+        for row in rows
+    ]
+
+
 @router.get("/{dimension}", response_model=dict)
 async def list_taxonomy_values(
     dimension: str,
