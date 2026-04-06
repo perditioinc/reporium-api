@@ -258,7 +258,7 @@ async def test_ask_with_session_id_prepends_history_to_claude(client: AsyncClien
     cached_blocks = [b for b in current_content if b.get("cache_control")]
     assert len(cached_blocks) == 1
     assert cached_blocks[0]["cache_control"] == {"type": "ephemeral"}
-    assert "<sources>" in cached_blocks[0]["text"]
+    assert "SOURCES" in cached_blocks[0]["text"]
 
 
 @pytest.mark.asyncio
