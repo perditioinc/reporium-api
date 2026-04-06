@@ -344,6 +344,46 @@ async def repo_health(
     }
 
 
+@router.get("/repos/{repo_id}/evaluation")
+@_limiter.limit("60/minute")
+async def repo_evaluation(
+    request: Request,
+    repo_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the AI-generated pros/cons evaluation for a specific repo.
+
+    ``repo_id`` can be a repo name or UUID. Returns 404 if the repo does not
+    exist or has no evaluation yet.
+    """
+    import uuid as _uuid_mod
+
+    # Try UUID lookup first, fall back to name lookup
+    try:
+        parsed_uuid = _uuid_mod.UUID(repo_id)
+        stmt = select(Repo).where(Repo.id == parsed_uuid, Repo.is_private == False)  # noqa: E712
+    except (ValueError, TypeError):
+        stmt = select(Repo).where(
+            func.lower(Repo.name) == func.lower(repo_id),
+            Repo.is_private == False,  # noqa: E712
+        )
+
+    result = await db.execute(stmt)
+    repo = result.scalar_one_or_none()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+
+    if repo.pros_cons is None:
+        raise HTTPException(status_code=404, detail="No evaluation available for this repository")
+
+    return {
+        "repo": repo.name,
+        "owner": repo.owner,
+        "evaluation": repo.pros_cons,
+        "generated_at": repo.pros_cons_generated_at.isoformat() if repo.pros_cons_generated_at else None,
+    }
+
+
 @router.get("/repos/{name}", response_model=RepoDetail)
 async def get_repo(name: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
     cache_key = f"repos:detail:{name}"
