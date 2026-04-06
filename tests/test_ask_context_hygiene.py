@@ -12,7 +12,7 @@ Excluded for cost/noise reasons:
   - embedding arrays
   - created_at / updated_at / last_push_at timestamps
 """
-from app.routers.intelligence import _build_sources_block, _SOURCES_DESCRIPTION_MAX
+from app.routers.intelligence import _build_sources_block, _format_stars, _SOURCES_DESCRIPTION_MAX
 
 
 def _mock_repo():
@@ -45,7 +45,7 @@ def test_sources_block_includes_required_fields():
     assert "langchain" in block
     assert "langchain-ai" in block
     assert "LLM Framework" in block
-    assert "95000" in block
+    assert "95.0k★" in block
     assert "Build LLM applications" in block
 
 
@@ -90,8 +90,8 @@ def test_empty_repo_list_produces_empty_block():
 def test_multiple_repos_numbered():
     repos = [_mock_repo(), {**_mock_repo(), "name": "llamaindex", "owner": "run-llama"}]
     block = _build_sources_block(repos)
-    assert 'index="1"' in block
-    assert 'index="2"' in block
+    assert block.startswith("1. ")
+    assert "\n2. " in block
     assert "langchain" in block
     assert "llamaindex" in block
 
