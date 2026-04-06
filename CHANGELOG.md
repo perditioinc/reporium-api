@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.0.0] - 2026-04-06
+
+### Security
+- **Off-topic domain boundary filter** — Pre-Claude regex filter rejects math, coding exercises,
+  trivia, recipes, creative writing, medical/legal/financial advice, and utility tasks at $0 cost.
+  Repo-signal override prevents false positives (AI/ML keywords bypass the filter).
+- **System prompt hardened** with explicit domain boundary rules and strict off-topic refusal.
+- **Prompt injection defense** consolidated to single compressed security instruction (~40 tokens saved).
+
+### Added
+- **Governance gateway** (`app/governance.py`): per-key rate limiting (Redis sliding window),
+  per-key daily budget enforcement, auditable sandbox via `X-Sandbox: true` header.
+- **Audit trail** (`app/models/audit_log.py`, migration 025): `audit_logs` table with
+  `GET /admin/audit` endpoint for paginated, filterable audit log access.
+- **OpenTelemetry + Cloud Trace** integration (`app/telemetry.py`): HTTP, Claude API, pgvector,
+  Redis, and embedding spans. Feature-flagged via `OTEL_ENABLED=0`.
+- **Golden-set expansion**: 18 → 53 test cases covering negation, temporal, multi-category,
+  ambiguous, out-of-domain, injection edge cases, session follow-ups, and empty results.
+- **Off-topic filter tests**: 56 unit tests covering rejected, allowed, and edge cases.
+- **Graph optimization**: Redis caching (1hr TTL), semantic subgraph search at
+  `GET /graph/edges/search`, embedding coverage metrics at `GET /metrics/embeddings`.
+- **Source block compaction**: XML `<repo>` tags → compact numbered format (~165 tokens/request saved).
+- **PII redaction** wired into `_log_query()` before DB insert.
+- **Early-exit helper** `_should_early_exit()` extracted from duplicated similarity checks.
+- **Enterprise roadmap** documentation at `docs/enterprise-roadmap.md`.
+
+### Changed
+- System prompt compressed from ~5 security restatements to 1 clear rule + domain boundary.
+- Session history capping deduplicated — single `_MAX_SESSION_HISTORY_CHARS` constant.
+- Dead `cosine_similarity()` function and unused `get_anthropic_key` import removed.
+- Stale TODO comments updated to reflect implemented retention system.
+
+### Fixed
+- 20 stale injection tests updated to match current log-only defense strategy.
+- `ask_sessions(created_at)` btree index added (migration 023) for retention purge performance.
+- `repo_embeddings(repo_id)` btree index added (migration 024) for graph query performance.
+
 ## [Unreleased] - 2026-03-24
 
 ### Added
