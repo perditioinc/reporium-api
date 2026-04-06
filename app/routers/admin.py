@@ -1394,3 +1394,242 @@ async def backfill_licenses(
         await db.commit()
 
     return {"total": total, "updated": updated, "failed": failed, "skipped": skipped, "dry_run": False}
+
+
+# ---------------------------------------------------------------------------
+# Community health signals backfill
+# ---------------------------------------------------------------------------
+
+def _parse_last_page(link_header: str | None) -> int | None:
+    """Extract the last page number from a GitHub ``Link`` header.
+
+    Returns ``None`` when the header is absent or has no ``rel="last"`` entry
+    (which means the first page already contains all results).
+    """
+    if not link_header:
+        return None
+    import re
+    match = re.search(r'<[^>]*[?&]page=(\d+)[^>]*>;\s*rel="last"', link_header)
+    if match:
+        return int(match.group(1))
+    return None
+
+
+async def _fetch_community_signals(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    owner: str,
+    name: str,
+) -> dict | None:
+    """Fetch community health signals for a single repo from the free GitHub API.
+
+    Returns a dict with the signal values, or ``None`` on unrecoverable error
+    (404, etc.).
+    """
+    base = f"https://api.github.com/repos/{owner}/{name}"
+    signals: dict = {}
+
+    async with semaphore:
+        try:
+            # 1. Main repo endpoint → has_discussions, open_issues_count
+            resp = await client.get(base, timeout=15.0)
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            repo_data = resp.json()
+            signals["has_discussions"] = repo_data.get("has_discussions", False)
+
+            # 2. Contributors (per_page=1, parse Link header for total)
+            resp_c = await client.get(
+                f"{base}/contributors",
+                params={"per_page": "1", "anon": "true"},
+                timeout=15.0,
+            )
+            if resp_c.status_code == 200:
+                last_page = _parse_last_page(resp_c.headers.get("link"))
+                signals["contributors_count"] = last_page if last_page else len(resp_c.json())
+            elif resp_c.status_code == 204:
+                # Empty repo — no contributors
+                signals["contributors_count"] = 0
+
+            # 3. Releases (per_page=1, parse Link header for count + latest date)
+            resp_r = await client.get(
+                f"{base}/releases",
+                params={"per_page": "1"},
+                timeout=15.0,
+            )
+            if resp_r.status_code == 200:
+                releases = resp_r.json()
+                last_page = _parse_last_page(resp_r.headers.get("link"))
+                signals["release_count"] = last_page if last_page else len(releases)
+                if releases:
+                    signals["latest_release_date"] = releases[0].get("published_at")
+            else:
+                signals["release_count"] = 0
+
+            # 4. Community profile → health_percentage
+            resp_cp = await client.get(
+                f"{base}/community/profile",
+                timeout=15.0,
+            )
+            if resp_cp.status_code == 200:
+                signals["community_health_pct"] = resp_cp.json().get("health_percentage")
+
+            # 5. Issue close rate
+            #    closed issues = total from search, open from repo data
+            open_issues = repo_data.get("open_issues_count", 0)
+            resp_closed = await client.get(
+                "https://api.github.com/search/issues",
+                params={
+                    "q": f"repo:{owner}/{name} type:issue is:closed",
+                    "per_page": "1",
+                },
+                timeout=15.0,
+            )
+            if resp_closed.status_code == 200:
+                closed_count = resp_closed.json().get("total_count", 0)
+                total_issues = open_issues + closed_count
+                signals["issue_close_rate"] = round(
+                    closed_count / total_issues, 4
+                ) if total_issues > 0 else None
+
+            # 6. PR merge rate
+            resp_closed_pr = await client.get(
+                "https://api.github.com/search/issues",
+                params={
+                    "q": f"repo:{owner}/{name} type:pr is:merged",
+                    "per_page": "1",
+                },
+                timeout=15.0,
+            )
+            resp_total_pr = await client.get(
+                "https://api.github.com/search/issues",
+                params={
+                    "q": f"repo:{owner}/{name} type:pr",
+                    "per_page": "1",
+                },
+                timeout=15.0,
+            )
+            if resp_closed_pr.status_code == 200 and resp_total_pr.status_code == 200:
+                merged_count = resp_closed_pr.json().get("total_count", 0)
+                total_prs = resp_total_pr.json().get("total_count", 0)
+                signals["pr_merge_rate"] = round(
+                    merged_count / total_prs, 4
+                ) if total_prs > 0 else None
+
+            return signals
+
+        except Exception as exc:
+            logger.warning("Community signals fetch failed for %s/%s: %s", owner, name, exc)
+            return None
+
+
+@router.post("/admin/backfill-community-signals", response_model=dict)
+@_limiter.limit("5/minute")
+async def backfill_community_signals(
+    request: Request,
+    dry_run: bool = Query(default=False, description="Preview without writing"),
+    batch_size: int = Query(default=0, ge=0, le=500, description="Max repos to process (0 = all)"),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Backfill community health signals for repos missing ``community_health_pct``.
+
+    Calls the free GitHub REST API to populate:
+    ``contributors_count``, ``release_count``, ``latest_release_date``,
+    ``issue_close_rate``, ``pr_merge_rate``, ``has_discussions``, and
+    ``community_health_pct``.
+
+    Uses ``GITHUB_TOKEN`` env var for authenticated requests (5 000 req/hr).
+
+    Returns ``{total, updated, failed, skipped, dry_run}``.
+    """
+    query = (
+        "SELECT id, owner, name FROM repos "
+        "WHERE community_health_pct IS NULL "
+        "ORDER BY updated_at DESC"
+    )
+    if batch_size > 0:
+        query += f" LIMIT {batch_size}"
+
+    result = await db.execute(text(query))
+    rows = result.fetchall()
+    total = len(rows)
+
+    if total == 0:
+        return {"total": 0, "updated": 0, "failed": 0, "skipped": 0, "dry_run": dry_run}
+
+    if dry_run:
+        return {"total": total, "updated": 0, "failed": 0, "skipped": 0, "dry_run": True}
+
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    gh_token = os.getenv("GITHUB_TOKEN")
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+
+    semaphore = asyncio.Semaphore(10)
+    updated = 0
+    failed = 0
+    skipped = 0
+
+    async with httpx.AsyncClient(headers=headers) as client:
+        tasks = [
+            _fetch_community_signals(client, semaphore, row.owner, row.name)
+            for row in rows
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for row, signals in zip(rows, results):
+        if isinstance(signals, Exception):
+            failed += 1
+            logger.warning(
+                "Community signals exception for %s/%s: %s", row.owner, row.name, signals
+            )
+            continue
+        if signals is None:
+            skipped += 1
+            continue
+        if not signals:
+            skipped += 1
+            continue
+
+        try:
+            set_clauses = []
+            params: dict = {"id": str(row.id)}
+
+            for col in (
+                "contributors_count",
+                "release_count",
+                "latest_release_date",
+                "issue_close_rate",
+                "pr_merge_rate",
+                "has_discussions",
+                "community_health_pct",
+            ):
+                if col in signals and signals[col] is not None:
+                    set_clauses.append(f"{col} = :{col}")
+                    params[col] = signals[col]
+
+            if not set_clauses:
+                skipped += 1
+                continue
+
+            await db.execute(
+                text(f"UPDATE repos SET {', '.join(set_clauses)} WHERE id = :id"),
+                params,
+            )
+            updated += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning(
+                "Community signals update failed for %s/%s: %s", row.owner, row.name, exc
+            )
+
+    if updated > 0:
+        await db.commit()
+
+    return {"total": total, "updated": updated, "failed": failed, "skipped": skipped, "dry_run": False}
