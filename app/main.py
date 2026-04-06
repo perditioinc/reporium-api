@@ -110,6 +110,12 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
 app.add_middleware(GZipMiddleware, minimum_size=1000)  # compress responses > 1KB
 
+# KAN-governance: audit middleware (feature-flagged, default OFF)
+if os.environ.get("AUDIT_ENABLED", "0") == "1":
+    from app.middleware.audit import AuditMiddleware  # noqa: E402
+    app.add_middleware(AuditMiddleware)
+    logger.info("Audit middleware enabled (AUDIT_ENABLED=1)")
+
 
 @app.get("/docs", include_in_schema=False)
 async def scalar_docs() -> HTMLResponse:
@@ -201,7 +207,7 @@ app.add_middleware(
     allow_origins=_ALLOWED_ORIGINS,
     allow_origin_regex=r"https://reporium(-[a-z0-9]+)*\.vercel\.app",
     allow_methods=["GET", "POST"],
-    allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Ingest-Key", "X-App-Token", "Accept"],
+    allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Ingest-Key", "X-App-Token", "X-Sandbox", "Accept"],
 )
 
 
