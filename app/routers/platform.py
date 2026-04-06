@@ -214,6 +214,92 @@ async def metrics_spend(
     }
 
 
+@router.get("/metrics/export", response_model=dict)
+@_limiter.limit("30/minute")
+async def metrics_export(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _gate: None = Depends(require_metrics_access),
+) -> dict:
+    """
+    Unified metrics export — returns SLO snapshot, token spend,
+    embedding coverage, and revision info in a single JSON payload.
+
+    Designed for external dashboards and CI smoke tests.
+    """
+    # --- SLO snapshot (reuses /metrics/slo logic inline) ---
+    slo_snap = slo_observer.snapshot()
+    routes: dict[str, dict] = {}
+    for route, target in _SLO_TARGETS.items():
+        observed = slo_snap.get(route, {})
+        p95 = observed.get("p95_ms")
+        p99 = observed.get("p99_ms")
+        err = observed.get("error_rate")
+
+        breaches: list[str] = []
+        if p95 is not None and "p95_ms" in target and p95 > target["p95_ms"]:
+            breaches.append(f"p95 {p95}ms > target {target['p95_ms']}ms")
+        if p99 is not None and "p99_ms" in target and p99 > target["p99_ms"]:
+            breaches.append(f"p99 {p99}ms > target {target['p99_ms']}ms")
+        if err is not None and err > target["max_error_rate"]:
+            breaches.append(f"error_rate {err} > target {target['max_error_rate']}")
+
+        routes[route] = {
+            "target": target,
+            "observed": observed,
+            "status": "breach" if breaches else ("ok" if observed.get("count") else "no_data"),
+            "breaches": breaches,
+        }
+
+    slo = {
+        "window_seconds": 24 * 60 * 60,
+        "routes": routes,
+    }
+
+    # --- Token spend ---
+    spend_snapshot = token_observer.get_spend_snapshot()
+    total_usd = spend_snapshot["total"]["usd"]
+    spend = {
+        "usd_24h": total_usd,
+        "cache_hit_rate": spend_snapshot["total"]["cache_hit_rate"],
+        "status": _spend_status(total_usd, settings.spend_daily_budget_usd),
+        "daily_budget_usd": settings.spend_daily_budget_usd,
+    }
+
+    # --- Embedding coverage ---
+    counts = await db.execute(text("""
+        SELECT
+            (SELECT COUNT(*) FROM repos WHERE is_private = false) AS total_public,
+            (SELECT COUNT(DISTINCT re.repo_id)
+             FROM repo_embeddings re
+             JOIN repos r ON r.id = re.repo_id
+             WHERE r.is_private = false
+               AND re.embedding_vec IS NOT NULL) AS with_embeddings
+    """))
+    row = counts.fetchone()
+    total_pub = row.total_public if row else 0
+    with_emb = row.with_embeddings if row else 0
+    embeddings = {
+        "total_public_repos": total_pub,
+        "repos_with_embeddings": with_emb,
+        "coverage_percent": round((with_emb / total_pub * 100) if total_pub > 0 else 0.0, 2),
+    }
+
+    # --- Revision info ---
+    revision = {
+        "api_version": os.getenv("APP_VERSION", os.getenv("GITHUB_SHA", "unknown")[:7]),
+        "build_number": os.getenv("BUILD_NUMBER", "0"),
+    }
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "slo": slo,
+        "spend": spend,
+        "embeddings": embeddings,
+        "revision": revision,
+    }
+
+
 @router.post("/events/ingest", response_model=dict)
 async def events_ingest(
     payload: dict,
