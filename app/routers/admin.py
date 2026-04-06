@@ -1633,3 +1633,202 @@ async def backfill_community_signals(
         await db.commit()
 
     return {"total": total, "updated": updated, "failed": failed, "skipped": skipped, "dry_run": False}
+
+
+# ---------------------------------------------------------------------------
+# KAN pros-cons enrichment — AI-generated developer-focused evaluation
+# ---------------------------------------------------------------------------
+
+_PROS_CONS_PROMPT = """You are evaluating an AI/ML open-source tool for developers.
+
+Repository: {owner}/{name} ({stars}\u2605)
+Description: {description}
+README Summary: {readme_summary}
+Problem Solved: {problem_solved}
+Quality: {quality}, Maturity: {maturity}
+Category: {primary_category}
+Language: {primary_language}
+Contributors: {contributors_count}
+Issue Close Rate: {issue_close_rate}%
+Has Tests: {has_tests}, Has CI: {has_ci}
+Community Health: {community_health_pct}%
+
+Generate a developer-focused evaluation:
+{{
+  "pros": ["3-5 specific strengths based on evidence"],
+  "cons": ["2-4 honest weaknesses or gaps"],
+  "best_for": "1-sentence ideal use case",
+  "avoid_if": "1-sentence when NOT to use this",
+  "community_verdict": "1-sentence what developers think",
+  "comparable_to": ["3-5 well-known alternatives"]
+}}
+
+Rules:
+- Be specific and evidence-based, not generic
+- Reference actual metrics (stars, contributors, test coverage) in pros/cons
+- For comparable_to, list real tools even if not in our database
+- If data is sparse, say so in cons rather than speculating"""
+
+
+async def _generate_pros_cons_for_repo(
+    repo: Repo,
+    anthropic_client,
+    semaphore: asyncio.Semaphore,
+) -> dict:
+    """Call Claude Haiku to generate pros/cons for a single repo.
+
+    Returns dict with keys: pros_cons, input_tokens, output_tokens, error.
+    """
+    qs = repo.quality_signals or {}
+    # Build context values, falling back to sensible defaults for sparse data
+    prompt = _PROS_CONS_PROMPT.format(
+        owner=repo.owner or "unknown",
+        name=repo.name or "unknown",
+        stars=repo.stargazers_count or repo.parent_stars or 0,
+        description=repo.description or "No description",
+        readme_summary=repo.readme_summary or "Not available",
+        problem_solved=repo.problem_solved or "Not available",
+        quality=qs.get("quality", "unknown"),
+        maturity=qs.get("maturity", "unknown"),
+        primary_category=repo.primary_category or "Uncategorized",
+        primary_language=repo.primary_language or "Unknown",
+        contributors_count=repo.contributors_count or 0,
+        issue_close_rate=repo.issue_close_rate or 0,
+        has_tests=repo.has_tests if repo.has_tests is not None else "Unknown",
+        has_ci=repo.has_ci if repo.has_ci is not None else "Unknown",
+        community_health_pct=repo.community_health_pct or 0,
+    )
+
+    async with semaphore:
+        try:
+            response = await asyncio.to_thread(
+                anthropic_client.messages.create,
+                model="claude-haiku-4-5-20250414",
+                max_tokens=512,
+                temperature=0.3,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except Exception as exc:
+            return {"pros_cons": None, "input_tokens": 0, "output_tokens": 0, "error": str(exc)}
+
+    raw = response.content[0].text.strip()
+    # Strip markdown code fences if present
+    if raw.startswith("```"):
+        lines = raw.split("\n")
+        raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {
+            "pros_cons": None,
+            "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "error": f"JSON parse error: {exc}",
+        }
+
+    return {
+        "pros_cons": data,
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+        "error": None,
+    }
+
+
+@router.post("/admin/enrich-pros-cons", response_model=dict)
+@_limiter.limit("5/minute")
+async def enrich_pros_cons(
+    request: Request,
+    batch_size: int = Query(default=50, ge=1, le=500),
+    dry_run: bool = Query(default=False),
+    force: bool = Query(default=False, description="Re-generate even if pros_cons already exists"),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Generate AI-powered pros/cons evaluations for repos using Claude Haiku.
+
+    Queries repos where ``pros_cons IS NULL`` (or all repos if ``force=true``).
+    Uses ``claude-haiku-4-5-20250414`` with ``max_tokens=512, temperature=0.3``.
+    Estimated cost: ~$0.0015/repo.
+
+    Returns ``{total, enriched, failed, skipped, estimated_cost_usd}``.
+    """
+    from datetime import datetime as _dt, timezone as _tz
+
+    # Build query
+    if force:
+        stmt = select(Repo).where(Repo.is_private == False).limit(batch_size)  # noqa: E712
+    else:
+        stmt = (
+            select(Repo)
+            .where(Repo.is_private == False)  # noqa: E712
+            .where(Repo.pros_cons.is_(None))
+            .limit(batch_size)
+        )
+
+    result = await db.execute(stmt)
+    repos = result.scalars().all()
+    total = len(repos)
+
+    if total == 0:
+        return {"total": 0, "enriched": 0, "failed": 0, "skipped": 0, "estimated_cost_usd": 0.0}
+
+    if dry_run:
+        return {"total": total, "enriched": 0, "failed": 0, "skipped": total, "estimated_cost_usd": 0.0, "dry_run": True}
+
+    # Set up Anthropic client
+    from app.routers.ingest import _get_anthropic_key
+    import anthropic as _anthropic_lib
+
+    api_key = _get_anthropic_key()
+    client = _anthropic_lib.Anthropic(api_key=api_key)
+
+    semaphore = asyncio.Semaphore(5)  # Anthropic rate-limit guard
+
+    enriched = 0
+    failed = 0
+    skipped = 0
+    total_input_tokens = 0
+    total_output_tokens = 0
+
+    for repo in repos:
+        result_data = await _generate_pros_cons_for_repo(repo, client, semaphore)
+
+        total_input_tokens += result_data["input_tokens"]
+        total_output_tokens += result_data["output_tokens"]
+
+        if result_data["error"]:
+            failed += 1
+            logger.warning(
+                "Pros/cons enrichment failed for %s/%s: %s",
+                repo.owner, repo.name, result_data["error"],
+            )
+            continue
+
+        if result_data["pros_cons"] is None:
+            skipped += 1
+            continue
+
+        repo.pros_cons = result_data["pros_cons"]
+        repo.pros_cons_generated_at = _dt.now(_tz.utc)
+        enriched += 1
+
+    if enriched > 0:
+        await db.commit()
+
+    # Haiku pricing: $0.80/M input, $4.00/M output
+    estimated_cost = (total_input_tokens * 0.80 / 1_000_000) + (total_output_tokens * 4.00 / 1_000_000)
+
+    logger.info(
+        "Pros/cons enrichment complete: total=%d enriched=%d failed=%d cost=$%.4f",
+        total, enriched, failed, estimated_cost,
+    )
+
+    return {
+        "total": total,
+        "enriched": enriched,
+        "failed": failed,
+        "skipped": skipped,
+        "estimated_cost_usd": round(estimated_cost, 6),
+    }
