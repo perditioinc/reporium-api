@@ -79,6 +79,10 @@ class Repo(Base):
     has_discussions: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     community_health_pct: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # AI-generated pros/cons evaluation (KAN pros-cons enrichment)
+    pros_cons: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    pros_cons_generated_at: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+
     # Security risk — curated manually or via admin API
     # Structure: {risk_level, incident_reported, incident_date, incident_url, incident_summary}
     security_signals: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
