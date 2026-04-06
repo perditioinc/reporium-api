@@ -1,7 +1,10 @@
+import asyncio
 import json
 import logging
+import uuid
 from dataclasses import dataclass, field as dc_field
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from slowapi import Limiter
@@ -12,6 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import require_admin_key, verify_api_key
 from app.cache import cache
 from app.database import get_db
+from app.models.mention import RepoMention
 from app.models.repo import IngestRun, Repo, RepoCategory, RepoEmbedding, RepoTag
 from app.rate_limit import rate_limit_storage
 from app.routers.library_full import invalidate_library_cache
@@ -1240,3 +1244,132 @@ async def admin_delete_ask_session(
         "ask_sessions RTBF delete: session_id=%s deleted=%d", session_id, count
     )
     return {"deleted": count, "session_id": session_id}
+
+
+# ---------------------------------------------------------------------------
+# HackerNews mentions backfill  (HN Algolia API — free, no auth)
+# ---------------------------------------------------------------------------
+
+HN_SEARCH_URL = "https://hn.algolia.com/api/v1/search"
+
+
+async def _search_hn(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    query: str,
+    hits_per_page: int = 10,
+) -> list[dict]:
+    """Search HN Algolia API for stories matching *query*."""
+    async with semaphore:
+        try:
+            resp = await client.get(
+                HN_SEARCH_URL,
+                params={"query": query, "tags": "story", "hitsPerPage": hits_per_page},
+                timeout=15.0,
+            )
+            resp.raise_for_status()
+            return resp.json().get("hits", [])
+        except Exception as exc:
+            logger.warning("HN search failed for %r: %s", query, exc)
+            return []
+
+
+def _hn_hit_to_mention(hit: dict, repo_id, *, source: str = "hackernews") -> dict:
+    """Convert an HN Algolia hit dict to RepoMention column values."""
+    from datetime import datetime, timezone
+
+    created_ts = hit.get("created_at_i")
+    published = (
+        datetime.fromtimestamp(created_ts, tz=timezone.utc) if created_ts else None
+    )
+    story_id = str(hit.get("objectID", ""))
+    return {
+        "repo_id": repo_id,
+        "source": source,
+        "external_id": story_id,
+        "title": hit.get("title") or "(no title)",
+        "url": f"https://news.ycombinator.com/item?id={story_id}" if story_id else None,
+        "score": hit.get("points"),
+        "comment_count": hit.get("num_comments"),
+        "author": hit.get("author"),
+        "published_at": published,
+    }
+
+
+@router.post("/admin/backfill-hn-mentions", response_model=dict)
+@_limiter.limit("5/minute")
+async def backfill_hn_mentions(
+    request: Request,
+    dry_run: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Search HN Algolia for every repo and upsert mentions.
+
+    Uses ``owner/name`` as primary query; falls back to just ``name`` when the
+    primary query yields fewer than 3 results.  Duplicate mentions (same
+    repo_id + source + external_id) are silently skipped.
+    """
+    from sqlalchemy.dialects.postgresql import insert as pg_insert
+
+    result = await db.execute(select(Repo.id, Repo.owner, Repo.name))
+    repos = result.fetchall()
+    total_repos = len(repos)
+
+    semaphore = asyncio.Semaphore(5)
+    mentions_found = 0
+    mentions_inserted = 0
+    repos_with_mentions = 0
+    failed = 0
+
+    async with httpx.AsyncClient() as client:
+        for row in repos:
+            try:
+                slug = f"{row.owner}/{row.name}"
+                hits = await _search_hn(client, semaphore, slug)
+
+                # Supplement with name-only search when slug yields few results
+                if len(hits) < 3:
+                    extra = await _search_hn(client, semaphore, row.name)
+                    seen_ids = {h["objectID"] for h in hits}
+                    for h in extra:
+                        if h["objectID"] not in seen_ids:
+                            hits.append(h)
+
+                if not hits:
+                    continue
+
+                mentions_found += len(hits)
+                repos_with_mentions += 1
+
+                if dry_run:
+                    continue
+
+                for hit in hits:
+                    vals = _hn_hit_to_mention(hit, row.id)
+                    stmt = (
+                        pg_insert(RepoMention)
+                        .values(**vals)
+                        .on_conflict_do_nothing(
+                            constraint="uq_repo_mentions_repo_source_ext"
+                        )
+                    )
+                    res = await db.execute(stmt)
+                    if res.rowcount:
+                        mentions_inserted += 1
+
+                await db.commit()
+            except Exception as exc:
+                failed += 1
+                logger.warning("HN backfill failed for %s/%s: %s", row.owner, row.name, exc)
+                await db.rollback()
+
+    return {
+        "total_repos": total_repos,
+        "mentions_found": mentions_found,
+        "mentions_inserted": mentions_inserted,
+        "repos_with_mentions": repos_with_mentions,
+        "failed": failed,
+        "dry_run": dry_run,
+    }
