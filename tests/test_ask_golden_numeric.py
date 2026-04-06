@@ -7,7 +7,7 @@ numeric quality threshold rather than only response-shape assertions.
 
 How it works
 ------------
-1. Loads ``tests/golden_set_ask.yaml`` — a handcrafted set of 15-18 Q&A pairs
+1. Loads ``tests/golden_set_ask.yaml`` — a handcrafted set of 50+ Q&A pairs
    grounded in the real Reporium corpus.
 2. For each entry we:
      - Build a mocked DB session that returns the entry's ``fixture_repos``
@@ -219,8 +219,8 @@ async def test_ask_golden_set_numeric_gate(client_no_db: AsyncClient):
     from app.database import get_db
 
     golden_set = _load_golden_set()
-    assert len(golden_set) >= 15, (
-        f"Golden set must contain >= 15 entries, got {len(golden_set)}"
+    assert len(golden_set) >= 50, (
+        f"Golden set must contain >= 50 entries, got {len(golden_set)}"
     )
 
     scored_results: list[dict[str, Any]] = []
