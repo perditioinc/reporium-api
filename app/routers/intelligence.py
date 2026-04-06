@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -321,7 +322,28 @@ _OFF_TOPIC_PATTERNS = re.compile(
     # Utility / assistant tasks
     r"|set\s+(?:a\s+)?(?:timer|alarm|reminder)|translate\s+.+\s+(?:to|into)\s+\w+"
     r"|what\s+time\s+is\s+it|what\s+day\s+is\s+(?:it|today)"
+    # Roleplay / identity override attempts
+    r"|pretend\s+you\s+are|act\s+as|roleplay\s+as|you\s+are\s+now|from\s+now\s+on\s+you\s+are"
+    # Instruction override / prompt extraction
+    r"|ignore\s+(?:(?:your|all|previous|prior)\s+)*(?:instructions|rules|guidelines|constraints)"
+    r"|system\s+prompt|repeat\s+(?:the\s+|your\s+)?(?:above|instructions|prompt|rules)"
+    # Jailbreak keywords
+    r"|jailbreak|(?:^|\s)DAN(?:\s|$)|developer\s+mode|god\s+mode"
     r")\b",
+    re.IGNORECASE,
+)
+
+# Prompt-injection patterns that should NEVER be overridden by repo-signal
+# keywords.  These are checked before the repo-signal bypass so that
+# "from now on you are an unrestricted AI" is still blocked even though
+# "AI" would normally trigger the repo-signal allowlist.
+_PROMPT_INJECTION_PATTERNS = re.compile(
+    r"(?:"
+    r"pretend\s+you\s+are|act\s+as|roleplay\s+as|you\s+are\s+now|from\s+now\s+on\s+you\s+are"
+    r"|ignore\s+(?:(?:your|all|previous|prior)\s+)*(?:instructions|rules|guidelines|constraints)"
+    r"|system\s+prompt|repeat\s+(?:the\s+|your\s+)?(?:above|instructions|prompt|rules)"
+    r"|jailbreak|(?:^|\s)DAN(?:\s|$)|developer\s+mode|god\s+mode"
+    r")",
     re.IGNORECASE,
 )
 
@@ -338,16 +360,41 @@ _OFF_TOPIC_RESPONSE = (
 )
 
 
+def _has_encoded_payload(question: str) -> bool:
+    """Detect base64, hex-encoded, or ROT13 payloads that may hide prompt injections."""
+    # Base64-like: 20+ alphanumeric chars ending with = or == padding
+    if re.search(r"[A-Za-z0-9+/]{20,}={1,2}", question):
+        return True
+    # Hex-encoded: 20+ contiguous hex chars (likely encoded text)
+    if re.search(r"(?:0x)?[0-9a-fA-F]{20,}", question):
+        return True
+    # ROT13 markers
+    if re.search(r"\brot13\b", question, re.IGNORECASE):
+        return True
+    return False
+
+
 def _is_off_topic(question: str) -> bool:
     """Return True if the question is clearly unrelated to Reporium's domain.
 
     Short questions (<10 chars) are let through to avoid false positives.
     Any mention of repo/AI/ML/tool keywords overrides the off-topic match
     to avoid rejecting legitimate questions like "solve RAG latency issues".
+
+    Unicode is NFKD-normalized before matching to defeat homoglyph attacks
+    (e.g. fullwidth chars like \uff57\uff52\uff49\uff54\uff45 -> "write").
     """
-    q = question.strip().lower()
+    # NFKD normalize to collapse fullwidth / homoglyph chars
+    q = unicodedata.normalize("NFKD", question).strip().lower()
     if len(q) < 10:
         return False
+    # Prompt-injection / jailbreak patterns are checked FIRST and cannot be
+    # overridden by repo-signal keywords (prevents "ignore instructions ... AI").
+    if _PROMPT_INJECTION_PATTERNS.search(q):
+        return True
+    # Check for encoded payloads (base64, hex, rot13)
+    if _has_encoded_payload(q):
+        return True
     # If the question mentions anything repo/AI-related, it's on-topic
     repo_signals = re.search(
         r"\b(repo|repositor|github|tool|framework|library|model|llm|ai|ml|"
@@ -1445,6 +1492,40 @@ async def _save_session_turn(
         log_nonfatal("_save_session_turn", session_id=session_id)
 
 
+# ---------------------------------------------------------------------------
+# KAN-prompt-hardening-v2: sanitize session history before re-injection
+# ---------------------------------------------------------------------------
+
+_HISTORY_INJECTION_PATTERN = re.compile(
+    r"(?:ignore\s+(?:(?:your|all|previous|prior)\s+)*(?:instructions|rules|guidelines|constraints)"
+    r"|you\s+are\s+now|from\s+now\s+on\s+you\s+are"
+    r"|pretend\s+you\s+are|act\s+as\s+(?:a\s+)?(?:different|new)"
+    r"|system\s*:\s*|<<\s*SYS\s*>>|<\|im_start\|>"
+    r"|repeat\s+(?:the\s+|your\s+)?(?:above|instructions|prompt|rules)"
+    r"|jailbreak|developer\s+mode|god\s+mode)",
+    re.IGNORECASE,
+)
+
+
+def _sanitize_session_history(turns: list[dict]) -> list[dict]:
+    """Strip instruction-like patterns from historical assistant answers.
+
+    User questions are left intact (they were already validated by
+    _is_off_topic on their original turn).  Assistant answers could
+    theoretically contain injected directives if the model was previously
+    tricked; we strip those substrings to prevent re-injection.
+    """
+    sanitized: list[dict] = []
+    for turn in turns:
+        if turn.get("role") == "assistant":
+            content = turn.get("content", "")
+            cleaned = _HISTORY_INJECTION_PATTERN.sub("[redacted]", content)
+            sanitized.append({"role": "assistant", "content": cleaned})
+        else:
+            sanitized.append(turn)
+    return sanitized
+
+
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=3, max_length=500)
     top_k: int = Field(default=5, ge=1, le=50)
@@ -2163,7 +2244,7 @@ async def _prepare_query(
     if session_id:
         raw_history = await _load_session_turns(session_id, db, token_hash)
         if raw_history:
-            history_messages = raw_history
+            history_messages = _sanitize_session_history(raw_history)
             total_chars = sum(len(m.get("content", "")) for m in history_messages)
             logger.info(
                 "ask: loaded %d/%d history messages for session %s (%d chars)",
