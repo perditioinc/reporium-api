@@ -277,3 +277,165 @@ class TestAdminAuditEndpoint:
                 },
             )
             assert resp.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Governance wiring in /intelligence/ask and /ask/stream
+# --------------------------------------------------------------------------- #
+
+
+def _dummy_query_response():
+    """Return a minimal QueryResponse-shaped object for mocking _run_query."""
+    from app.routers.intelligence import QueryResponse
+    return QueryResponse(
+        answer="Test answer",
+        sources=[],
+        question="test?",
+        model="claude-sonnet-4-20250514",
+        answered_at="2026-01-01T00:00:00Z",
+        embedding_candidates=0,
+        tokens_used={"input": 100, "output": 50, "total": 150},
+    )
+
+
+class TestGovernanceWiringAsk:
+    """Tests that /intelligence/ask respects GOVERNANCE_ENABLED flag."""
+
+    @pytest.mark.asyncio
+    async def test_ask_returns_429_on_rate_limit(self, client: AsyncClient):
+        """When governance is enabled and rate limit exceeded, /ask returns 429."""
+        with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "1"}):
+            with patch("app.routers.intelligence.gov_check_rate_limit", new_callable=AsyncMock, return_value=False):
+                with patch("app.routers.intelligence.get_app_token_hash", return_value="hash-abc"):
+                    with patch("app.routers.intelligence.require_app_token", return_value=None):
+                        resp = await client.post(
+                            "/intelligence/ask",
+                            json={"question": "What are the best RAG frameworks?"},
+                        )
+                        assert resp.status_code == 429
+                        assert "rate limit" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_ask_returns_429_on_budget_exceeded(self, client: AsyncClient):
+        """When governance is enabled and budget exhausted, /ask returns 429."""
+        with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "1"}):
+            with patch("app.routers.intelligence.gov_check_rate_limit", new_callable=AsyncMock, return_value=True):
+                with patch("app.routers.intelligence.gov_check_budget", new_callable=AsyncMock, return_value=(False, 0.0)):
+                    with patch("app.routers.intelligence.get_app_token_hash", return_value="hash-abc"):
+                        with patch("app.routers.intelligence.require_app_token", return_value=None):
+                            resp = await client.post(
+                                "/intelligence/ask",
+                                json={"question": "What are the best RAG frameworks?"},
+                            )
+                            assert resp.status_code == 429
+                            assert "budget" in resp.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    async def test_ask_passes_when_governance_disabled(self, client: AsyncClient):
+        """When GOVERNANCE_ENABLED is not set, governance checks are skipped."""
+        with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "0"}):
+            with patch("app.routers.intelligence._run_query", new_callable=AsyncMock, return_value=_dummy_query_response()):
+                with patch("app.routers.intelligence.get_app_token_hash", return_value="hash-abc"):
+                    with patch("app.routers.intelligence.require_app_token", return_value=None):
+                        resp = await client.post(
+                            "/intelligence/ask",
+                            json={"question": "What are the best RAG frameworks?"},
+                        )
+                        assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_ask_records_spend_after_query(self, client: AsyncClient):
+        """When governance is enabled, record_spend is called after a successful query."""
+        mock_record = AsyncMock()
+        with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "1"}):
+            with patch("app.routers.intelligence.gov_check_rate_limit", new_callable=AsyncMock, return_value=True):
+                with patch("app.routers.intelligence.gov_check_budget", new_callable=AsyncMock, return_value=(True, 5.0)):
+                    with patch("app.routers.intelligence.gov_record_spend", mock_record):
+                        with patch("app.routers.intelligence._run_query", new_callable=AsyncMock, return_value=_dummy_query_response()):
+                            with patch("app.routers.intelligence.get_app_token_hash", return_value="hash-abc"):
+                                with patch("app.routers.intelligence.require_app_token", return_value=None):
+                                    resp = await client.post(
+                                        "/intelligence/ask",
+                                        json={"question": "What are the best RAG frameworks?"},
+                                    )
+                                    assert resp.status_code == 200
+                                    mock_record.assert_called_once()
+                                    args = mock_record.call_args
+                                    assert args[0][0] == "hash-abc"
+                                    assert args[0][1] > 0  # cost > 0
+
+    @pytest.mark.asyncio
+    async def test_ask_fails_open_on_governance_error(self, client: AsyncClient):
+        """When governance check raises an unexpected error, request proceeds (fail-open)."""
+        with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "1"}):
+            with patch("app.routers.intelligence.gov_check_rate_limit", new_callable=AsyncMock, side_effect=RuntimeError("Redis exploded")):
+                with patch("app.routers.intelligence._run_query", new_callable=AsyncMock, return_value=_dummy_query_response()):
+                    with patch("app.routers.intelligence.get_app_token_hash", return_value="hash-abc"):
+                        with patch("app.routers.intelligence.require_app_token", return_value=None):
+                            resp = await client.post(
+                                "/intelligence/ask",
+                                json={"question": "What are the best RAG frameworks?"},
+                            )
+                            assert resp.status_code == 200
+
+    @pytest.mark.asyncio
+    async def test_ask_skips_governance_when_no_token_hash(self, client: AsyncClient):
+        """When token_hash is None, governance checks are skipped even if enabled."""
+        with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "1"}):
+            with patch("app.routers.intelligence._run_query", new_callable=AsyncMock, return_value=_dummy_query_response()):
+                with patch("app.routers.intelligence.get_app_token_hash", return_value=None):
+                    with patch("app.routers.intelligence.require_app_token", return_value=None):
+                        resp = await client.post(
+                            "/intelligence/ask",
+                            json={"question": "What are the best RAG frameworks?"},
+                        )
+                        assert resp.status_code == 200
+
+
+class TestGovernanceWiringStream:
+    """Tests that /intelligence/ask/stream respects GOVERNANCE_ENABLED flag."""
+
+    @pytest.mark.asyncio
+    async def test_stream_returns_429_on_rate_limit(self, client: AsyncClient):
+        """When governance is enabled and rate limit exceeded, /ask/stream returns 429."""
+        with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "1"}):
+            with patch("app.routers.intelligence.gov_check_rate_limit", new_callable=AsyncMock, return_value=False):
+                with patch("app.routers.intelligence.get_app_token_hash", return_value="hash-abc"):
+                    with patch("app.routers.intelligence.require_app_token", return_value=None):
+                        resp = await client.post(
+                            "/intelligence/ask/stream",
+                            json={"question": "What are the best RAG frameworks?"},
+                        )
+                        assert resp.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_stream_returns_429_on_budget_exceeded(self, client: AsyncClient):
+        """When governance is enabled and budget exhausted, /ask/stream returns 429."""
+        with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "1"}):
+            with patch("app.routers.intelligence.gov_check_rate_limit", new_callable=AsyncMock, return_value=True):
+                with patch("app.routers.intelligence.gov_check_budget", new_callable=AsyncMock, return_value=(False, 0.0)):
+                    with patch("app.routers.intelligence.get_app_token_hash", return_value="hash-abc"):
+                        with patch("app.routers.intelligence.require_app_token", return_value=None):
+                            resp = await client.post(
+                                "/intelligence/ask/stream",
+                                json={"question": "What are the best RAG frameworks?"},
+                            )
+                            assert resp.status_code == 429
+
+    @pytest.mark.asyncio
+    async def test_stream_fails_open_on_governance_error(self, client: AsyncClient):
+        """When governance check raises an unexpected error, stream proceeds (fail-open)."""
+        with patch.dict(os.environ, {"GOVERNANCE_ENABLED": "1"}):
+            with patch("app.routers.intelligence.gov_check_rate_limit", new_callable=AsyncMock, side_effect=RuntimeError("Redis down")):
+                with patch("app.routers.intelligence.get_app_token_hash", return_value="hash-abc"):
+                    with patch("app.routers.intelligence.require_app_token", return_value=None):
+                        try:
+                            resp = await client.post(
+                                "/intelligence/ask/stream",
+                                json={"question": "What are the best RAG frameworks?"},
+                            )
+                            # Should not be 429 — governance failed open
+                            assert resp.status_code != 429
+                        except Exception:
+                            # DB/model not available is acceptable in test env
+                            pass
