@@ -3098,71 +3098,7 @@ async def portfolio_insights(
 # ---------------------------------------------------------------------------
 
 
-@router.get("/compare")
-@_limiter.limit("30/minute")
-async def compare_repos(
-    request: Request,
-    a: str = Query(..., max_length=100, description="First repo name"),
-    b: str = Query(..., max_length=100, description="Second repo name"),
-    db: AsyncSession = Depends(get_db),
-):
-    """Structured side-by-side comparison of two repos."""
-    rows = []
-    for repo_name in (a, b):
-        result = await db.execute(
-            text("""
-                SELECT name, description, readme_summary, problem_solved,
-                       primary_category, primary_language,
-                       COALESCE(parent_stars, stargazers_count, 0) as stars,
-                       license_spdx, activity_score, has_tests, has_ci,
-                       commits_last_30_days, quality_signals, forked_from
-                FROM repos
-                WHERE name = :name AND is_private = false
-            """),
-            {"name": repo_name},
-        )
-        row = result.mappings().first()
-        if row is None:
-            raise HTTPException(status_code=404, detail="Repo not found")
-        rows.append(dict(row))
-
-    def _repo_dict(r: dict) -> dict:
-        return {
-            "name": r["name"],
-            "description": r["description"],
-            "readme_summary": r["readme_summary"],
-            "problem_solved": r["problem_solved"],
-            "stars": r["stars"],
-            "category": r["primary_category"],
-            "language": r["primary_language"],
-            "license": r["license_spdx"],
-            "activity_score": r["activity_score"],
-            "has_tests": r["has_tests"],
-            "has_ci": r["has_ci"],
-            "commits_30d": r["commits_last_30_days"],
-            "quality_signals": r["quality_signals"],
-            "forked_from": r["forked_from"],
-        }
-
-    r_a, r_b = rows[0], rows[1]
-    comparison = {
-        "more_stars": r_a["name"] if r_a["stars"] >= r_b["stars"] else r_b["name"],
-        "more_active": (
-            r_a["name"]
-            if r_a["commits_last_30_days"] >= r_b["commits_last_30_days"]
-            else r_b["name"]
-        ),
-        "better_quality": (
-            r_a["name"]
-            if (r_a["activity_score"] or 0) >= (r_b["activity_score"] or 0)
-            else r_b["name"]
-        ),
-    }
-
-    return {
-        "repos": [_repo_dict(r_a), _repo_dict(r_b)],
-        "comparison": comparison,
-    }
+# NOTE: /compare endpoint moved to app/routers/compare.py (enhanced multi-repo comparison)
 
 
 @router.get("/trending")
