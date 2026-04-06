@@ -52,7 +52,7 @@ def _get_client() -> anthropic.Anthropic:
 # Per-model pricing (per 1M tokens)
 _MODEL_PRICING = {
     "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
-    "claude-haiku-4-5-20250414": {"input": 0.80, "output": 4.00},
+    "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
     "claude-haiku-4-5": {"input": 0.80, "output": 4.00},
 }
 
