@@ -166,7 +166,7 @@ class TestSystemPromptDefenses:
     def test_system_prompt_mentions_repo_tag_defense(self):
         from app.routers.intelligence import _SYSTEM_PROMPT
 
-        assert "<repo>" in _SYSTEM_PROMPT
+        assert "repo entries" in _SYSTEM_PROMPT or "numbered repo" in _SYSTEM_PROMPT
         assert "untrusted" in _SYSTEM_PROMPT.lower()
 
 
