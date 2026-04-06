@@ -207,7 +207,7 @@ class RepoEmbedding(Base):
     )
     # Stored as JSON array; pgvector column handled at DB level via migration
     embedding: Mapped[str | None] = mapped_column(Text)
-    model: Mapped[str] = mapped_column(Text, nullable=False, default="nomic-embed-text")
+    model: Mapped[str] = mapped_column(Text, nullable=False, default="all-MiniLM-L6-v2")
     generated_at: Mapped[datetime] = mapped_column(
         TIMESTAMP(timezone=True), nullable=False, server_default=func.now()
     )
