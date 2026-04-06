@@ -884,20 +884,8 @@ async def data_integrity_health(
 # Run history
 # ---------------------------------------------------------------------------
 
-@router.get(
-    "/admin/runs",
-    summary="List recent ingestion runs",
-    dependencies=[Depends(require_admin_key), Depends(verify_api_key)],
-)
-async def list_runs(
-    limit: int = Query(50, ge=1, le=200),
-    db: AsyncSession = Depends(get_db),
-):
-    """Return the most recent *limit* ingestion run records, newest first."""
-    result = await db.execute(
-        select(IngestRun).order_by(IngestRun.started_at.desc()).limit(limit)
-    )
-    runs = result.scalars().all()
+def _format_runs(runs) -> list[dict]:
+    """Shared formatter for ingestion run records."""
     return [
         {
             "id": r.id,
@@ -916,6 +904,43 @@ async def list_runs(
         }
         for r in runs
     ]
+
+
+@router.get(
+    "/runs",
+    summary="List recent ingestion runs (public)",
+)
+async def list_runs_public(
+    limit: int = Query(20, ge=1, le=50),
+    db: AsyncSession = Depends(get_db),
+):
+    """Public read-only view of recent ingestion runs (max 50, no error details)."""
+    result = await db.execute(
+        select(IngestRun).order_by(IngestRun.started_at.desc()).limit(limit)
+    )
+    runs = result.scalars().all()
+    formatted = _format_runs(runs)
+    # Strip error details from public endpoint
+    for r in formatted:
+        r.pop("errors", None)
+    return formatted
+
+
+@router.get(
+    "/admin/runs",
+    summary="List recent ingestion runs (admin)",
+    dependencies=[Depends(require_admin_key), Depends(verify_api_key)],
+)
+async def list_runs(
+    limit: int = Query(50, ge=1, le=200),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return the most recent *limit* ingestion run records, newest first."""
+    result = await db.execute(
+        select(IngestRun).order_by(IngestRun.started_at.desc()).limit(limit)
+    )
+    runs = result.scalars().all()
+    return _format_runs(runs)
 
 
 @router.post("/admin/enrichment/trigger", response_model=dict)
