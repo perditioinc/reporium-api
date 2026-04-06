@@ -33,6 +33,11 @@ from app.auth import get_app_token_hash, require_app_token, verify_api_key
 from app.cache import CACHE_TTL_STATS, cache
 from app.circuit_breaker import anthropic_breaker
 from app.cost_tracker import check_budget, record_cost
+from app.governance import (
+    check_rate_limit as gov_check_rate_limit,
+    check_budget as gov_check_budget,
+    record_spend as gov_record_spend,
+)
 from app.database import async_session_factory, get_db
 from app.embeddings import get_embedding_model
 from app.models.session import AskSession
@@ -45,6 +50,11 @@ _limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
 # OpenTelemetry tracer for key intelligence phases.
 _tracer = trace.get_tracer("reporium.ask")
+
+
+def _governance_enabled() -> bool:
+    """Return True when per-key governance (rate limit + budget) is active."""
+    return os.environ.get("GOVERNANCE_ENABLED", "0") == "1"
 
 # Patterns that indicate prompt injection attempts in user queries.
 # These try to override instructions, inject roles, or exfiltrate data.
@@ -2552,7 +2562,20 @@ async def intelligence_ask(
     Issue #235: session history is scoped to the hash of the presented
     X-App-Token so one app token cannot read another's conversation.
     """
-    return await _run_query(
+    # --- KAN-governance: per-key rate limit + budget checks (fail-open) ---
+    if _governance_enabled() and token_hash:
+        try:
+            if not await gov_check_rate_limit(token_hash, "/intelligence/ask"):
+                raise HTTPException(status_code=429, detail="Per-key rate limit exceeded. Try again shortly.")
+            budget_ok, remaining = await gov_check_budget(token_hash)
+            if not budget_ok:
+                raise HTTPException(status_code=429, detail="Daily per-key budget exhausted. Try again tomorrow.")
+        except HTTPException:
+            raise
+        except Exception:
+            log_nonfatal("governance.pre_check")  # fail-open
+
+    result = await _run_query(
         req,
         db,
         client_ip=get_remote_address(request),
@@ -2560,6 +2583,20 @@ async def intelligence_ask(
         route_label="/intelligence/ask",
         token_hash=token_hash,
     )
+
+    # --- KAN-governance: record spend after successful query ---
+    if _governance_enabled() and token_hash and result.tokens_used:
+        try:
+            cost = _estimate_cost(
+                result.tokens_used.get("input", 0),
+                result.tokens_used.get("output", 0),
+                result.model or "claude-sonnet-4-20250514",
+            )
+            await gov_record_spend(token_hash, cost)
+        except Exception:
+            log_nonfatal("governance.record_spend")  # fail-open
+
+    return result
 
 
 @router.post("/ask/stream")
@@ -2586,6 +2623,19 @@ async def intelligence_ask_stream(
     ``request.is_disconnected()`` and ``GeneratorExit``) and aborts the
     upstream Anthropic stream to avoid burning tokens on an abandoned client.
     """
+    # --- KAN-governance: per-key rate limit + budget checks (fail-open) ---
+    if _governance_enabled() and token_hash:
+        try:
+            if not await gov_check_rate_limit(token_hash, "/intelligence/ask/stream"):
+                raise HTTPException(status_code=429, detail="Per-key rate limit exceeded. Try again shortly.")
+            budget_ok, _remaining = await gov_check_budget(token_hash)
+            if not budget_ok:
+                raise HTTPException(status_code=429, detail="Daily per-key budget exhausted. Try again tomorrow.")
+        except HTTPException:
+            raise
+        except Exception:
+            log_nonfatal("governance.pre_check_stream")  # fail-open
+
     client_ip = get_remote_address(request)
 
     async def event_generator():
@@ -2827,6 +2877,12 @@ async def intelligence_ask_stream(
                     # Record actual token-based cost
                     _stream_est_cost = _estimate_cost(input_tokens, output_tokens, qctx.model)
                     await record_cost(_stream_est_cost, model=qctx.model)
+                    # KAN-governance: record per-key spend (fail-open)
+                    if _governance_enabled() and token_hash:
+                        try:
+                            await gov_record_spend(token_hash, _stream_est_cost)
+                        except Exception:
+                            log_nonfatal("governance.record_spend_stream")
                     # KAN-ask-output-caps: negative caching on low-quality
                     # streamed answers — short TTL + "negative" flag, and
                     # the log row is written with NULL embedding so semantic
