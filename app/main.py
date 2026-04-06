@@ -18,6 +18,7 @@ from app.rate_limit import rate_limit_storage
 from app.slo_observer import slo_observer
 from app.database import async_session_factory, check_db_connection, engine
 from app.routers import admin, analytics, graph, ingest, intelligence, library, library_full, nl_filter, platform, recommendations, repos, search, taxonomy, trends, webhooks, wiki
+from app.telemetry import init_telemetry
 
 
 class _JsonFormatter(logging.Formatter):
@@ -53,6 +54,13 @@ async def lifespan(app: FastAPI):
     _env = os.environ.get("ENV") or os.environ.get("ENVIRONMENT") or ""
     if _env.lower() == "production" and not os.environ.get("APP_API_TOKEN"):
         logger.critical("APP_API_TOKEN not set in production — /ask endpoint will reject all requests")
+
+    # Initialise OpenTelemetry tracing (no-op unless OTEL_ENABLED=1).
+    _otel_provider = init_telemetry()
+    if _otel_provider is not None:
+        from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+        FastAPIInstrumentor.instrument_app(app)
+        logger.info("FastAPI instrumented with OpenTelemetry")
 
     await cache.connect()
     await check_db_connection()
