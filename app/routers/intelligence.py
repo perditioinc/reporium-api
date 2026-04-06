@@ -21,6 +21,7 @@ from uuid import UUID
 
 import anthropic
 import numpy as np
+from opentelemetry import trace
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
@@ -41,6 +42,9 @@ from app.privacy import redact_pii
 from app.utils import log_nonfatal, vec_to_pg
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
 _limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
+
+# OpenTelemetry tracer for key intelligence phases.
+_tracer = trace.get_tracer("reporium.ask")
 
 # Patterns that indicate prompt injection attempts in user queries.
 # These try to override instructions, inject roles, or exfiltrate data.
@@ -1802,7 +1806,9 @@ async def _prepare_query(
     t0 = time.perf_counter()
 
     # 0. Smart routing — answer simple questions with SQL, no LLM call needed
-    smart_result = await _try_smart_route(question, db)
+    with _tracer.start_as_current_span("smart_route_check") as span:
+        smart_result = await _try_smart_route(question, db)
+        span.set_attribute("cache_hit", smart_result is not None)
     if smart_result is not None:
         logger.info("ask: smart-routed via %s (no LLM)", smart_result["route"])
         return QueryContext(
@@ -1858,19 +1864,22 @@ async def _prepare_query(
     # Claude prompt and logged verbatim.
     # KAN-ask-timeout: guard against embedding model hangs (e.g. model not loaded,
     # huge input, or CPU contention on Cloud Run cold starts).
-    try:
-        query_embedding = await asyncio.wait_for(
-            asyncio.get_event_loop().run_in_executor(
-                None, lambda: embed_model.encode(normalized_question)
-            ),
-            timeout=5.0,
-        )
-    except asyncio.TimeoutError:
-        logger.warning(
-            "Embedding generation timed out after 5s for question (len=%d)",
-            len(normalized_question),
-        )
-        query_embedding = None  # fall through — return early-exit "not enough data"
+    with _tracer.start_as_current_span("embedding_generation") as emb_span:
+        try:
+            query_embedding = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: embed_model.encode(normalized_question)
+                ),
+                timeout=5.0,
+            )
+            emb_span.set_attribute("embedding.success", True)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Embedding generation timed out after 5s for question (len=%d)",
+                len(normalized_question),
+            )
+            query_embedding = None  # fall through — return early-exit "not enough data"
+            emb_span.set_attribute("embedding.success", False)
 
     # If embedding failed, return a graceful early-exit response so the caller
     # doesn't proceed to pgvector search (which requires a valid embedding).
@@ -1923,23 +1932,26 @@ async def _prepare_query(
 
     # 3. pgvector HNSW index scan — O(log N) instead of O(N) Python loop
     fetch_k = top_k + 10
-    result = await db.execute(
-        text("""
-            SELECT r.id, r.name, r.owner, r.forked_from, r.description,
-                   r.parent_stars, r.readme_summary, r.problem_solved,
-                   r.primary_category, r.language, r.license_spdx,
-                   r.activity_score, r.has_tests, r.has_ci,
-                   1 - (e.embedding_vec <=> CAST(:vec AS vector)) AS similarity
-            FROM repo_embeddings e
-            JOIN repos r ON r.id = e.repo_id
-            WHERE r.is_private = false
-              AND e.embedding_vec IS NOT NULL
-            ORDER BY e.embedding_vec <=> CAST(:vec AS vector)
-            LIMIT :fetch_k
-        """),
-        {"vec": vec_str, "fetch_k": fetch_k},
-    )
-    rows = result.fetchall()
+    with _tracer.start_as_current_span("pgvector_search") as search_span:
+        result = await db.execute(
+            text("""
+                SELECT r.id, r.name, r.owner, r.forked_from, r.description,
+                       r.parent_stars, r.readme_summary, r.problem_solved,
+                       r.primary_category, r.language, r.license_spdx,
+                       r.activity_score, r.has_tests, r.has_ci,
+                       1 - (e.embedding_vec <=> CAST(:vec AS vector)) AS similarity
+                FROM repo_embeddings e
+                JOIN repos r ON r.id = e.repo_id
+                WHERE r.is_private = false
+                  AND e.embedding_vec IS NOT NULL
+                ORDER BY e.embedding_vec <=> CAST(:vec AS vector)
+                LIMIT :fetch_k
+            """),
+            {"vec": vec_str, "fetch_k": fetch_k},
+        )
+        rows = result.fetchall()
+        search_span.set_attribute("pgvector.fetch_k", fetch_k)
+        search_span.set_attribute("pgvector.rows_returned", len(rows))
 
     # Adaptive top_k: stop including repos when similarity drops below threshold
     # 0.45 ≈ moderately related; below this, repos add noise more than value
@@ -2279,22 +2291,26 @@ async def _run_query(
             )
 
     _t_claude_start = time.monotonic()
-    try:
-        message = await asyncio.wait_for(
-            loop.run_in_executor(None, _call_claude),
-            timeout=_CLAUDE_TIMEOUT_S,
-        )
-    except asyncio.TimeoutError:
-        logger.error(
-            "Claude API call timed out after %ds — returning 504", _CLAUDE_TIMEOUT_S
-        )
-        raise HTTPException(
-            status_code=504,
-            detail=(
-                f"The AI model did not respond within {_CLAUDE_TIMEOUT_S}s. "
-                "Please try again in a moment."
-            ),
-        )
+    with _tracer.start_as_current_span("claude_api_call") as claude_span:
+        claude_span.set_attribute("model", qctx.model)
+        try:
+            message = await asyncio.wait_for(
+                loop.run_in_executor(None, _call_claude),
+                timeout=_CLAUDE_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "Claude API call timed out after %ds — returning 504", _CLAUDE_TIMEOUT_S
+            )
+            raise HTTPException(
+                status_code=504,
+                detail=(
+                    f"The AI model did not respond within {_CLAUDE_TIMEOUT_S}s. "
+                    "Please try again in a moment."
+                ),
+            )
+        claude_span.set_attribute("tokens.input", message.usage.input_tokens)
+        claude_span.set_attribute("tokens.output", message.usage.output_tokens)
     _t_claude_end = time.monotonic()
     claude_ms = int((_t_claude_end - _t_claude_start) * 1000)
 
@@ -2308,6 +2324,10 @@ async def _run_query(
     # Record actual token-based cost
     _est_cost = _estimate_cost(message.usage.input_tokens, message.usage.output_tokens, qctx.model)
     await record_cost(_est_cost, model=qctx.model)
+
+    # Add cost to the OTel span (after _est_cost is computed).
+    claude_span.set_attribute("cost_usd", _est_cost)
+    claude_span.set_attribute("cache_hit", False)
 
     # KAN-ask-spend: per-route token + cost accumulator for /metrics/spend.
     # Wrapped so a metrics bug can never break a real request.
