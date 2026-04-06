@@ -70,6 +70,15 @@ class Repo(Base):
     has_tests: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     has_ci: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
 
+    # Community health signals (backfilled from free GitHub API)
+    contributors_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    release_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latest_release_date: Mapped[datetime | None] = mapped_column(TIMESTAMP(timezone=True), nullable=True)
+    issue_close_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    pr_merge_rate: Mapped[float | None] = mapped_column(Float, nullable=True)
+    has_discussions: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    community_health_pct: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # Security risk — curated manually or via admin API
     # Structure: {risk_level, incident_reported, incident_date, incident_url, incident_summary}
     security_signals: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
