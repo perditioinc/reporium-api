@@ -1,8 +1,11 @@
+import asyncio
 import json
 import logging
+import os
 from dataclasses import dataclass, field as dc_field
 from datetime import date
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from slowapi import Limiter
@@ -1277,3 +1280,117 @@ async def get_audit_logs(
         offset=offset,
     )
     return {"entries": entries, "count": len(entries), "limit": limit, "offset": offset}
+
+
+# ---------------------------------------------------------------------------
+# License SPDX backfill via GitHub REST API
+# ---------------------------------------------------------------------------
+
+async def _fetch_license(
+    client: httpx.AsyncClient,
+    semaphore: asyncio.Semaphore,
+    owner: str,
+    name: str,
+) -> str | None:
+    """Fetch license.spdx_id from GitHub REST API for a single repo.
+
+    Returns the SPDX identifier string, or None if unavailable / on error.
+    """
+    async with semaphore:
+        try:
+            resp = await client.get(
+                f"https://api.github.com/repos/{owner}/{name}",
+                timeout=15.0,
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            data = resp.json()
+            license_obj = data.get("license")
+            if license_obj and isinstance(license_obj, dict):
+                spdx = license_obj.get("spdx_id")
+                # GitHub returns "NOASSERTION" when it can't identify the license
+                if spdx and spdx != "NOASSERTION":
+                    return spdx
+            return None
+        except Exception:
+            return None
+
+
+@router.post("/admin/backfill-licenses", response_model=dict)
+@_limiter.limit("5/minute")
+async def backfill_licenses(
+    request: Request,
+    dry_run: bool = Query(default=False, description="Preview without writing"),
+    concurrency: int = Query(default=10, ge=1, le=50, description="Max concurrent GitHub API calls"),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Backfill license_spdx for repos where the field is NULL or empty.
+
+    Calls the free GitHub REST API ``GET /repos/{owner}/{name}`` which returns
+    ``license.spdx_id`` at no cost.  Uses ``GITHUB_TOKEN`` env var for
+    authenticated requests (5 000 req/hr) when available.
+
+    Returns ``{total, updated, failed, skipped, dry_run}``.
+    """
+    # Find repos missing license_spdx
+    result = await db.execute(text(
+        "SELECT id, owner, name FROM repos "
+        "WHERE license_spdx IS NULL OR license_spdx = '' "
+        "ORDER BY updated_at DESC"
+    ))
+    rows = result.fetchall()
+    total = len(rows)
+
+    if total == 0:
+        return {"total": 0, "updated": 0, "failed": 0, "skipped": 0, "dry_run": dry_run}
+
+    if dry_run:
+        return {"total": total, "updated": 0, "failed": 0, "skipped": 0, "dry_run": True}
+
+    # Build HTTP headers — use GITHUB_TOKEN if available for 5k/hr rate limit
+    headers: dict[str, str] = {
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    gh_token = os.getenv("GITHUB_TOKEN")
+    if gh_token:
+        headers["Authorization"] = f"Bearer {gh_token}"
+
+    semaphore = asyncio.Semaphore(concurrency)
+    updated = 0
+    failed = 0
+    skipped = 0
+
+    async with httpx.AsyncClient(headers=headers) as client:
+        # Create tasks for all repos
+        tasks = [
+            _fetch_license(client, semaphore, row.owner, row.name)
+            for row in rows
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for row, spdx in zip(rows, results):
+        if isinstance(spdx, Exception):
+            failed += 1
+            logger.warning("License fetch exception for %s/%s: %s", row.owner, row.name, spdx)
+            continue
+        if spdx is None:
+            skipped += 1
+            continue
+        try:
+            await db.execute(
+                text("UPDATE repos SET license_spdx = :spdx WHERE id = :id"),
+                {"spdx": spdx, "id": str(row.id)},
+            )
+            updated += 1
+        except Exception as exc:
+            failed += 1
+            logger.warning("License update failed for %s/%s: %s", row.owner, row.name, exc)
+
+    if updated > 0:
+        await db.commit()
+
+    return {"total": total, "updated": updated, "failed": failed, "skipped": skipped, "dry_run": False}
