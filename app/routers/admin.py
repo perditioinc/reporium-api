@@ -1678,7 +1678,7 @@ Issue Close Rate: {issue_close_rate}%
 Has Tests: {has_tests}, Has CI: {has_ci}
 Community Health: {community_health_pct}%
 
-Generate a developer-focused evaluation:
+Return ONLY a valid JSON object — no markdown, no explanation, no text before or after:
 {{
   "pros": ["3-5 specific strengths based on evidence"],
   "cons": ["2-4 honest weaknesses or gaps"],
@@ -1692,7 +1692,8 @@ Rules:
 - Be specific and evidence-based, not generic
 - Reference actual metrics (stars, contributors, test coverage) in pros/cons
 - For comparable_to, list real tools even if not in our database
-- If data is sparse, say so in cons rather than speculating"""
+- If data is sparse, say so in cons rather than speculating
+- Output ONLY the JSON object, nothing else"""
 
 
 async def _generate_pros_cons_for_repo(
@@ -1742,8 +1743,10 @@ async def _generate_pros_cons_for_repo(
         lines = raw.split("\n")
         raw = "\n".join(lines[1:-1] if lines[-1].strip() == "```" else lines[1:])
 
+    # Extract the first JSON object even if the model added trailing text
     try:
-        data = json.loads(raw)
+        decoder = json.JSONDecoder()
+        data, _ = decoder.raw_decode(raw)
     except json.JSONDecodeError as exc:
         return {
             "pros_cons": None,
