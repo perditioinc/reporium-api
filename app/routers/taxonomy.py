@@ -221,7 +221,7 @@ async def list_taxonomy_values(
     }
 
 
-@router.post("/admin/taxonomy/rebuild", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
+@router.post("/rebuild", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def rebuild_taxonomy(
     body: RebuildBody = RebuildBody(),
     db: AsyncSession = Depends(get_db),
@@ -261,7 +261,7 @@ async def rebuild_taxonomy(
     return {"status": "ok", "upserted": upserted, "dimensions": dimensions}
 
 
-@router.post("/admin/taxonomy/backfill", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
+@router.post("/backfill", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def backfill_taxonomy_from_repos(db: AsyncSession = Depends(get_db)) -> dict:
     """
     Backfill repo_taxonomy from JSONB columns on repos (skill_areas, industries,
@@ -332,7 +332,7 @@ async def backfill_taxonomy_from_repos(db: AsyncSession = Depends(get_db)) -> di
     }
 
 
-@router.post("/admin/taxonomy/embed", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
+@router.post("/embed", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def embed_taxonomy(db: AsyncSession = Depends(get_db)) -> dict:
     """
     Generate embeddings for taxonomy_values that are missing embedding_vec.
@@ -380,7 +380,7 @@ async def embed_taxonomy(db: AsyncSession = Depends(get_db)) -> dict:
     return response
 
 
-@router.post("/admin/taxonomy/assign", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
+@router.post("/assign", response_model=dict, dependencies=[Depends(verify_api_key), Depends(require_admin_key)])
 async def assign_taxonomy(
     body: AssignBody = AssignBody(),
     db: AsyncSession = Depends(get_db),

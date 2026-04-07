@@ -79,7 +79,7 @@ jobs:
           # Wait for Cloud Run to be healthy
           sleep 15
           # Rebuild taxonomy_values from repo_taxonomy (fast batch INSERT — no timeout risk)
-          curl -sf -X POST "${API_URL}/admin/taxonomy/rebuild" \
+          curl -sf -X POST "${API_URL}/taxonomy/rebuild" \
             -H "Authorization: Bearer ${INGEST_API_KEY}" \
             -H "X-Admin-Key: ${ADMIN_API_KEY}" \
             -H "Content-Type: application/json" \
