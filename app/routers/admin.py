@@ -2076,11 +2076,11 @@ async def backfill_hn_mentions(
     """
     # Find repos that have no HN mentions yet
     result = await db.execute(text("""
-        SELECT r.id, r.owner, r.name, r.stars
+        SELECT r.id, r.owner, r.name, r.stargazers_count
         FROM repos r
         LEFT JOIN repo_mentions m ON m.repo_id = r.id AND m.source = 'hackernews'
         WHERE m.id IS NULL
-        ORDER BY r.stars DESC NULLS LAST
+        ORDER BY r.stargazers_count DESC NULLS LAST
         LIMIT :limit
     """), {"limit": limit})
     rows = result.fetchall()
