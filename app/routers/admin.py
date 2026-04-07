@@ -2051,3 +2051,111 @@ async def backfill_dependencies(
         "failed": failed,
         "skipped": skipped,
     }
+
+
+# ---------------------------------------------------------------------------
+# HN Mentions Backfill — free HN Algolia API
+# ---------------------------------------------------------------------------
+
+@router.post("/admin/backfill-hn-mentions", response_model=dict)
+async def backfill_hn_mentions(
+    request: Request,
+    limit: int = Query(200, ge=1, le=2000, description="Max repos to scan"),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Backfill HackerNews mentions for repos using the free HN Algolia API.
+
+    Searches ``hn.algolia.com`` for stories linking to each repo's GitHub URL.
+    Inserts results into ``repo_mentions`` with source='hackernews'.
+    Rate-limited to ~1 req/s to respect Algolia fair-use.
+    """
+    # Find repos that have no HN mentions yet
+    result = await db.execute(text("""
+        SELECT r.id, r.owner, r.name, r.stars
+        FROM repos r
+        LEFT JOIN repo_mentions m ON m.repo_id = r.id AND m.source = 'hackernews'
+        WHERE m.id IS NULL
+        ORDER BY r.stars DESC NULLS LAST
+        LIMIT :limit
+    """), {"limit": limit})
+    rows = result.fetchall()
+
+    if not rows:
+        return {"total": 0, "with_mentions": 0, "mentions_inserted": 0, "failed": 0, "skipped": len(rows)}
+
+    total = len(rows)
+    with_mentions = 0
+    mentions_inserted = 0
+    failed = 0
+    skipped = 0
+
+    async with httpx.AsyncClient() as client:
+        for i, row in enumerate(rows):
+            try:
+                search_query = f"github.com/{row.owner}/{row.name}"
+                resp = await client.get(
+                    "https://hn.algolia.com/api/v1/search",
+                    params={"query": search_query, "tags": "story", "hitsPerPage": 20},
+                    timeout=15.0,
+                )
+                if resp.status_code == 429:
+                    logger.warning("HN Algolia rate limited at repo %d/%d, stopping", i + 1, total)
+                    skipped += total - i
+                    break
+                resp.raise_for_status()
+                data = resp.json()
+                hits = data.get("hits", [])
+
+                if not hits:
+                    skipped += 1
+                else:
+                    repo_count = 0
+                    for hit in hits:
+                        story_url = hit.get("url", "")
+                        # Only keep hits that actually reference this repo
+                        if f"{row.owner}/{row.name}" not in (story_url or "") and \
+                           f"{row.owner}/{row.name}" not in (hit.get("title", "") or ""):
+                            continue
+                        try:
+                            await db.execute(text("""
+                                INSERT INTO repo_mentions (id, repo_id, source, external_id, title, url, score, comment_count, author, published_at)
+                                VALUES (gen_random_uuid(), :repo_id, 'hackernews', :external_id, :title, :url, :score, :comment_count, :author, to_timestamp(:created_at))
+                                ON CONFLICT ON CONSTRAINT uq_repo_mentions_repo_source_ext DO NOTHING
+                            """), {
+                                "repo_id": str(row.id),
+                                "external_id": str(hit.get("objectID", "")),
+                                "title": (hit.get("title") or "")[:500],
+                                "url": f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}",
+                                "score": hit.get("points"),
+                                "comment_count": hit.get("num_comments"),
+                                "author": hit.get("author"),
+                                "created_at": hit.get("created_at_i", 0),
+                            })
+                            repo_count += 1
+                        except Exception as exc:
+                            logger.warning("HN mention insert failed for %s/%s story=%s: %s", row.owner, row.name, hit.get("objectID"), exc)
+                            failed += 1
+
+                    if repo_count > 0:
+                        with_mentions += 1
+                        mentions_inserted += repo_count
+
+                    await db.commit()
+
+                # Respect rate limit: ~1 req/s
+                if i < total - 1:
+                    await asyncio.sleep(1.0)
+
+            except Exception as exc:
+                logger.warning("HN backfill error for %s/%s: %s", row.owner, row.name, exc)
+                failed += 1
+
+    return {
+        "total": total,
+        "with_mentions": with_mentions,
+        "mentions_inserted": mentions_inserted,
+        "failed": failed,
+        "skipped": skipped,
+    }
