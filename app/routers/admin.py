@@ -2097,7 +2097,8 @@ async def backfill_hn_mentions(
     async with httpx.AsyncClient() as client:
         for i, row in enumerate(rows):
             try:
-                search_query = f"github.com/{row.owner}/{row.name}"
+                # Search by repo name on GitHub (not owner, since we're forks)
+                search_query = f"github.com {row.name}"
                 resp = await client.get(
                     "https://hn.algolia.com/api/v1/search",
                     params={"query": search_query, "tags": "story", "hitsPerPage": 20},
@@ -2117,9 +2118,15 @@ async def backfill_hn_mentions(
                     repo_count = 0
                     for hit in hits:
                         story_url = hit.get("url", "")
-                        # Only keep hits that actually reference this repo
-                        if f"{row.owner}/{row.name}" not in (story_url or "") and \
-                           f"{row.owner}/{row.name}" not in (hit.get("title", "") or ""):
+                        title = hit.get("title", "") or ""
+                        # Only keep hits that reference this repo name on github.com
+                        repo_name_lower = row.name.lower()
+                        url_lower = (story_url or "").lower()
+                        title_lower = title.lower()
+                        if not (
+                            (f"github.com/" in url_lower and f"/{repo_name_lower}" in url_lower) or
+                            repo_name_lower in title_lower
+                        ):
                             continue
                         try:
                             await db.execute(text("""
