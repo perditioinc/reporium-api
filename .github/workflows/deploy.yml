@@ -78,25 +78,26 @@ jobs:
         run: |
           # Wait for Cloud Run to be healthy
           sleep 15
-          # Rebuild taxonomy_values from repo_taxonomy (fast batch INSERT — no timeout risk)
+          # Rebuild taxonomy_values from repo_taxonomy (fast batch INSERT)
           curl -sf -X POST "${API_URL}/taxonomy/rebuild" \
             -H "Authorization: Bearer ${INGEST_API_KEY}" \
             -H "X-Admin-Key: ${ADMIN_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d '{}' \
-            && echo "Taxonomy rebuild triggered" || echo "Taxonomy rebuild skipped (secrets not configured)"
-          # Re-derive categories from current tags (idempotent, safe to repeat)
+            -d '{}' --max-time 60 \
+            && echo "Taxonomy rebuild triggered" || echo "Taxonomy rebuild skipped"
+          # Re-derive categories from current tags (idempotent)
           curl -sf -X POST "${API_URL}/admin/backfill/categories" \
             -H "Authorization: Bearer ${INGEST_API_KEY}" \
             -H "X-Admin-Key: ${ADMIN_API_KEY}" \
             -H "Content-Type: application/json" \
-            && echo "Category backfill triggered" || echo "Category backfill skipped (secrets not configured)"
-          # Backfill embeddings for any repos missing them (needed for knowledge graph)
+            --max-time 60 \
+            && echo "Category backfill triggered" || echo "Category backfill skipped"
+          # Backfill embeddings (background — don't block deploy)
           curl -sf -X POST "${API_URL}/admin/embeddings/backfill" \
             -H "Authorization: Bearer ${INGEST_API_KEY}" \
             -H "X-Admin-Key: ${ADMIN_API_KEY}" \
             -H "Content-Type: application/json" \
-            --max-time 120 \
+            --max-time 60 \
             && echo "Embeddings backfill triggered" || echo "Embeddings backfill skipped"
 
       - name: Publish api.deployed event
