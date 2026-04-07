@@ -86,7 +86,7 @@ async def test_list_taxonomy_values_for_industry(client):
     """After rebuild, industry values should be listed."""
     # First rebuild to populate taxonomy_values
     rebuild_resp = await client.post(
-        "/taxonomy/admin/taxonomy/rebuild",
+        "/taxonomy/rebuild",
         json={"dimension": "industry"},
         headers=AUTH_HEADERS,
     )
@@ -117,7 +117,7 @@ async def test_list_taxonomy_values_unknown_dimension_returns_empty(client):
 @pytest.mark.asyncio
 async def test_rebuild_aggregates_correctly(client):
     resp = await client.post(
-        "/taxonomy/admin/taxonomy/rebuild",
+        "/taxonomy/rebuild",
         json={},
         headers=AUTH_HEADERS,
     )
@@ -132,7 +132,7 @@ async def test_rebuild_aggregates_correctly(client):
 @pytest.mark.asyncio
 async def test_rebuild_single_dimension(client):
     resp = await client.post(
-        "/taxonomy/admin/taxonomy/rebuild",
+        "/taxonomy/rebuild",
         json={"dimension": "use_case"},
         headers=AUTH_HEADERS,
     )
@@ -145,7 +145,7 @@ async def test_rebuild_single_dimension(client):
 @pytest.mark.asyncio
 async def test_rebuild_requires_auth(client):
     resp = await client.post(
-        "/taxonomy/admin/taxonomy/rebuild",
+        "/taxonomy/rebuild",
         json={},
     )
     assert resp.status_code in (401, 403)
@@ -159,7 +159,7 @@ async def test_rebuild_requires_auth(client):
 async def test_embed_taxonomy_uses_model(client):
     """Rebuild first so taxonomy_values exist, then call embed with mocked model."""
     await client.post(
-        "/taxonomy/admin/taxonomy/rebuild",
+        "/taxonomy/rebuild",
         json={},
         headers=AUTH_HEADERS,
     )
@@ -171,7 +171,7 @@ async def test_embed_taxonomy_uses_model(client):
 
     with patch("app.embeddings.get_embedding_model", return_value=mock_model):
         resp = await client.post(
-                "/taxonomy/admin/taxonomy/embed",
+                "/taxonomy/embed",
                 headers=AUTH_HEADERS,
             )
 
@@ -184,7 +184,7 @@ async def test_embed_taxonomy_uses_model(client):
 
 @pytest.mark.asyncio
 async def test_embed_requires_auth(client):
-    resp = await client.post("/taxonomy/admin/taxonomy/embed")
+    resp = await client.post("/taxonomy/embed")
     assert resp.status_code in (401, 403)
 
 
@@ -196,7 +196,7 @@ async def test_embed_requires_auth(client):
 async def test_assign_returns_ok(client):
     """Assign with no embeddings present should succeed with 0 assigned."""
     resp = await client.post(
-        "/taxonomy/admin/taxonomy/assign",
+        "/taxonomy/assign",
         json={"threshold": 0.65},
         headers=AUTH_HEADERS,
     )
@@ -210,7 +210,7 @@ async def test_assign_returns_ok(client):
 @pytest.mark.asyncio
 async def test_assign_requires_auth(client):
     resp = await client.post(
-        "/taxonomy/admin/taxonomy/assign",
+        "/taxonomy/assign",
         json={},
     )
     assert resp.status_code in (401, 403)
@@ -219,7 +219,7 @@ async def test_assign_requires_auth(client):
 @pytest.mark.asyncio
 async def test_assign_single_dimension(client):
     resp = await client.post(
-        "/taxonomy/admin/taxonomy/assign",
+        "/taxonomy/assign",
         json={"dimension": "industry", "threshold": 0.7},
         headers=AUTH_HEADERS,
     )
