@@ -52,6 +52,15 @@ def _resolve_secrets():
                 os.environ["ANTHROPIC_API_KEY"] = _get_secret("anthropic-api-key", project).strip()
             except Exception:
                 logger.warning("ANTHROPIC_API_KEY not found in Secret Manager")
+        if not os.getenv("GITHUB_TOKEN") and not os.getenv("GH_TOKEN"):
+            try:
+                logger.info("Loading GITHUB_TOKEN from Secret Manager")
+                os.environ["GITHUB_TOKEN"] = _get_secret("github-token", project).strip()
+            except Exception:
+                logger.warning("GITHUB_TOKEN not found in Secret Manager")
+    # Normalise: if GH_TOKEN is set but GITHUB_TOKEN is not, copy it over
+    if os.getenv("GH_TOKEN") and not os.getenv("GITHUB_TOKEN"):
+        os.environ["GITHUB_TOKEN"] = os.getenv("GH_TOKEN")
     os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium")
 
 
