@@ -211,8 +211,9 @@ _ALLOWED_ORIGINS = [
     "https://reporium.com",
     "https://www.reporium.com",
     "https://perditioinc.github.io",
-    "http://localhost:3000",
 ]
+if os.getenv("ENVIRONMENT") != "production":
+    _ALLOWED_ORIGINS.append("http://localhost:3000")
 
 app.add_middleware(
     CORSMiddleware,
