@@ -67,13 +67,17 @@ async def lifespan(app: FastAPI):
     # Pre-warm the sentence-transformers model so the first /search/semantic
     # and /intelligence/ask requests don't pay a 3-5s cold-start penalty on
     # Cloud Run. The model is ~90 MB and loads once per process.
-    import asyncio as _asyncio
-    from app.embeddings import get_embedding_model as _get_embedding_model
-    loop = _asyncio.get_event_loop()
-    _emb_start = time.perf_counter()
-    await loop.run_in_executor(None, _get_embedding_model)
-    _emb_ms = round((time.perf_counter() - _emb_start) * 1000, 1)
-    logger.info("Embedding model pre-warmed at startup in %.1f ms", _emb_ms)
+    # Skip in test environments to avoid slow model downloads in CI.
+    if os.environ.get("ENVIRONMENT", "").lower() != "test":
+        import asyncio as _asyncio
+        from app.embeddings import get_embedding_model as _get_embedding_model
+        loop = _asyncio.get_event_loop()
+        _emb_start = time.perf_counter()
+        await loop.run_in_executor(None, _get_embedding_model)
+        _emb_ms = round((time.perf_counter() - _emb_start) * 1000, 1)
+        logger.info("Embedding model pre-warmed at startup in %.1f ms", _emb_ms)
+    else:
+        logger.info("Skipping embedding model pre-warm (test environment)")
     # Start query_log retention purge loop (fire-and-forget background task).
     from app.retention import retention_loop
     _asyncio.create_task(retention_loop())
