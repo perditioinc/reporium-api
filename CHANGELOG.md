@@ -5,6 +5,7 @@
 ### Added
 - **Similar repos fallback**: If `/intelligence/similar/{owner}/{name}` returns zero candidates (repo has no categories or tags), falls back to surfacing repos sharing the same `primary_category`, ordered by star count.
 - **Edge type colors in 3D graph**: Knowledge graph edges now rendered in distinct colors per relationship type (amber=ALTERNATIVE_TO, green=COMPATIBLE_WITH, blue=DEPENDS_ON, violet=SIMILAR_TO, pink=EXTENDS).
+- **`/graph/edges` now returns typed relationship edges**: After fetching pgvector similarity edges, also queries the `repo_edges` table for ALTERNATIVE_TO, COMPATIBLE_WITH, DEPENDS_ON, EXTENDS edges. Typed edges override SIMILAR_TO when the same (source, target) pair exists. Degrades gracefully if `repo_edges` table is missing. `edgeTypes` field in response now lists all distinct types present in the data.
 
 ### Changed
 - **pgvector retrieval threshold**: Lowered from 0.45 → 0.40 in the adaptive top_k filter to surface more relevant repos per ask query.
