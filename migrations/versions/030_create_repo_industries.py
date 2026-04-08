@@ -16,12 +16,14 @@ depends_on = None
 
 
 def upgrade():
-    op.create_table(
-        "repo_industries",
-        sa.Column("repo_id", UUID(as_uuid=True), sa.ForeignKey("repos.id", ondelete="CASCADE"), primary_key=True),
-        sa.Column("industry", sa.Text(), primary_key=True),
-    )
-    op.create_index("ix_repo_industries_repo_id", "repo_industries", ["repo_id"])
+    op.execute("""
+        CREATE TABLE IF NOT EXISTS repo_industries (
+            repo_id UUID REFERENCES repos(id) ON DELETE CASCADE,
+            industry TEXT NOT NULL,
+            PRIMARY KEY (repo_id, industry)
+        )
+    """)
+    op.execute("CREATE INDEX IF NOT EXISTS ix_repo_industries_repo_id ON repo_industries(repo_id)")
 
 
 def downgrade():
