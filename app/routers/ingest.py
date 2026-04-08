@@ -378,7 +378,7 @@ async def ingest_repos(
             upserted += 1
         except Exception as e:
             logger.error(f"Failed to upsert repo '{item.name}': {e}")
-            errors.append(f"{item.name}: {str(e)}")
+            errors.append(f"{item.name}: upsert failed")
 
     await db.commit()
 
@@ -533,7 +533,7 @@ async def repo_ingested_event(
         embed_result = await embed_taxonomy(db)
     except Exception as exc:
         log.exception("embed_taxonomy failed during repo-ingested refresh")
-        embed_result = {"status": "skipped", "error": str(exc), "embedded": 0}
+        embed_result = {"status": "skipped", "error": "embed_taxonomy failed", "embedded": 0}
     assign_result = await assign_taxonomy(AssignBody(), db)
     gap_result = await _rebuild_gap_analysis(db)
 
@@ -618,7 +618,7 @@ async def repo_added_event(
         return {"status": "error", "repo": repo_name, "reason": exc.detail}
     except Exception as exc:
         logger.error("repo-added event: unexpected error for '%s': %s", repo_name, exc)
-        return {"status": "error", "repo": repo_name, "reason": str(exc)}
+        return {"status": "error", "repo": repo_name, "reason": "unexpected error"}
 
     # Invalidate caches so the enriched data appears immediately
     await cache.invalidate(f"repos:detail:{repo_name}")
