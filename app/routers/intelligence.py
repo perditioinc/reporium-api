@@ -9,6 +9,7 @@ Cost: ~$0.01 per query (Claude API for answer generation).
 
 import asyncio
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -1278,10 +1279,10 @@ _MODEL_PRICING = {
 
 
 def _hash_ip(ip: str | None) -> str | None:
-    """Return SHA-256 hex of the IP — no raw PII stored."""
+    """Return HMAC-SHA-256 hex of the IP — no raw PII stored."""
     if not ip:
         return None
-    return hashlib.sha256(ip.encode()).hexdigest()
+    return hmac.new(os.environ.get("IP_HASH_SECRET", "reporium-default-salt").encode(), ip.encode(), hashlib.sha256).hexdigest()
 
 
 def _estimate_cost(input_tokens: int, output_tokens: int, model: str = "claude-sonnet-4-20250514") -> float:
@@ -3147,8 +3148,6 @@ async def repo_ecosystem(
     db: AsyncSession = Depends(get_db),
 ):
     """Walk the dependency graph 2 levels deep from a repo."""
-    if len(name) > 100:
-        raise HTTPException(status_code=400, detail="Name too long")
     if len(name) > 100:
         raise HTTPException(status_code=400, detail="Name too long")
     cache_key = f"ecosystem:{name}"
