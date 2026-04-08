@@ -12,6 +12,7 @@ os.environ["INGESTION_API_KEY"] = "test-api-key"
 os.environ["GH_USERNAME"] = "testuser"
 os.environ["REDIS_URL"] = ""  # disable Redis in tests
 os.environ["RATELIMIT_ENABLED"] = "0"  # disable rate limiting in tests
+os.environ["ENVIRONMENT"] = "test"  # skip embedding model pre-warm in tests
 
 import app.database as db_module
 from app.database import Base, get_db
