@@ -118,7 +118,8 @@ def _get_anthropic_key() -> str:
         response = client.access_secret_version(request={"name": name})
         return response.payload.data.decode("UTF-8").strip()
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"ANTHROPIC_API_KEY not configured: {exc}")
+        logger.exception("Failed to retrieve ANTHROPIC_API_KEY: %s", exc)
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not configured")
 
 
 async def _enrich_repo_with_haiku(repo: Repo, db: AsyncSession) -> dict:
