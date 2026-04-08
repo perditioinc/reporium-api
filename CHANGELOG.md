@@ -1,5 +1,14 @@
 # Changelog
 
+## [Unreleased] - 2026-04-08
+
+### Added
+- **Similar repos fallback**: If `/intelligence/similar/{owner}/{name}` returns zero candidates (repo has no categories or tags), falls back to surfacing repos sharing the same `primary_category`, ordered by star count.
+- **Edge type colors in 3D graph**: Knowledge graph edges now rendered in distinct colors per relationship type (amber=ALTERNATIVE_TO, green=COMPATIBLE_WITH, blue=DEPENDS_ON, violet=SIMILAR_TO, pink=EXTENDS).
+
+### Changed
+- **pgvector retrieval threshold**: Lowered from 0.45 → 0.40 in the adaptive top_k filter to surface more relevant repos per ask query.
+
 ## [2.0.0] - 2026-04-06
 
 ### Security
