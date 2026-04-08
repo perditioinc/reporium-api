@@ -121,6 +121,9 @@ class Repo(Base):
     taxonomy: Mapped[list["RepoTaxonomy"]] = relationship(
         "RepoTaxonomy", lazy="select", cascade="all, delete-orphan"
     )
+    industries: Mapped[list["RepoIndustry"]] = relationship(
+        back_populates="repo", cascade="all, delete-orphan"
+    )
 
 
 class RepoTag(Base):
@@ -226,6 +229,17 @@ class RepoEmbedding(Base):
     )
 
     repo: Mapped["Repo"] = relationship(back_populates="embedding")
+
+
+class RepoIndustry(Base):
+    __tablename__ = "repo_industries"
+
+    repo_id: Mapped[UUID] = mapped_column(
+        PGUUID(as_uuid=True), ForeignKey("repos.id", ondelete="CASCADE"), primary_key=True
+    )
+    industry: Mapped[str] = mapped_column(Text, primary_key=True)
+
+    repo: Mapped["Repo"] = relationship(back_populates="industries")
 
 
 class SkillArea(Base):

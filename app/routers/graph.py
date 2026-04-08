@@ -82,11 +82,19 @@ def _extract_quality(quality_signals: dict | None) -> float | None:
 
 
 def _rows_to_edges(rows) -> list[dict]:
-    """Convert DB rows (with source_*/target_* columns) to edge dicts."""
+    """Convert DB rows (with source_*/target_* columns) to edge dicts.
+
+    Handles both similarity rows (have a ``similarity`` column, no ``edge_type``)
+    and typed rows from ``repo_edges`` (have ``edge_type`` and ``weight`` columns).
+    """
     return [
         {
-            "edgeType": "SIMILAR_TO",
-            "weight": round(float(row.similarity), 4),
+            "edgeType": (getattr(row, "edge_type", None) or "SIMILAR_TO"),
+            "weight": round(float(
+                getattr(row, "similarity", None)
+                or getattr(row, "weight", None)
+                or 0.5
+            ), 4),
             "evidence": None,
             "source": {
                 "name": row.source_name,
@@ -261,15 +269,29 @@ async def get_graph_edges(
     result = await db.execute(sql, params)
     rows = result.fetchall()
 
-    edges = _rows_to_edges(rows)
-
-    # Build unique nodes map with visualization metadata
+    # Build similarity edges, keyed by (source, target) for dedup
+    edges_by_pair: dict[tuple[str, str], dict] = {}
     node_map: dict[str, dict] = {}
+
     for row in rows:
+        key = (row.source_name, row.target_name)
+        if key not in edges_by_pair:
+            edges_by_pair[key] = {
+                "edgeType": "SIMILAR_TO",
+                "weight": round(float(row.similarity), 4),
+                "evidence": None,
+                "source": {
+                    "name": row.source_name, "owner": row.source_owner,
+                    "description": row.source_description, "category": row.source_category,
+                },
+                "target": {
+                    "name": row.target_name, "owner": row.target_owner,
+                    "description": row.target_description, "category": row.target_category,
+                },
+            }
         if row.source_name not in node_map:
             node_map[row.source_name] = {
-                "name": row.source_name,
-                "owner": row.source_owner,
+                "name": row.source_name, "owner": row.source_owner,
                 "description": row.source_description,
                 "primary_category": row.source_category,
                 "stars": row.source_stars or 0,
@@ -278,8 +300,7 @@ async def get_graph_edges(
             }
         if row.target_name not in node_map:
             node_map[row.target_name] = {
-                "name": row.target_name,
-                "owner": row.target_owner,
+                "name": row.target_name, "owner": row.target_owner,
                 "description": row.target_description,
                 "primary_category": row.target_category,
                 "stars": row.target_stars or 0,
@@ -287,6 +308,73 @@ async def get_graph_edges(
                 "quality": _extract_quality(row.target_quality_signals),
             }
 
+    # Merge typed relationship edges from repo_edges — override SIMILAR_TO when same pair
+    try:
+        typed_sql = text("""
+            SELECT
+                re.edge_type,
+                re.weight,
+                r1.name        AS source_name,
+                r1.owner       AS source_owner,
+                r1.description AS source_description,
+                r1.primary_category AS source_category,
+                r1.stargazers_count AS source_stars,
+                r1.quality_signals  AS source_quality_signals,
+                r2.name        AS target_name,
+                r2.owner       AS target_owner,
+                r2.description AS target_description,
+                r2.primary_category AS target_category,
+                r2.stargazers_count AS target_stars,
+                r2.quality_signals  AS target_quality_signals
+            FROM repo_edges re
+            JOIN repos r1 ON r1.id = re.source_repo_id AND r1.is_private = false
+            JOIN repos r2 ON r2.id = re.target_repo_id AND r2.is_private = false
+            WHERE re.edge_type IN ('ALTERNATIVE_TO', 'COMPATIBLE_WITH', 'DEPENDS_ON', 'EXTENDS')
+            ORDER BY re.weight DESC NULLS LAST
+            LIMIT 5000
+        """)
+        typed_result = await db.execute(typed_sql)
+        typed_rows = typed_result.fetchall()
+
+        for trow in typed_rows:
+            key = (trow.source_name, trow.target_name)
+            # Typed edge overrides similarity edge for same pair
+            edges_by_pair[key] = {
+                "edgeType": trow.edge_type,
+                "weight": round(float(trow.weight or 0.5), 4),
+                "evidence": None,
+                "source": {
+                    "name": trow.source_name, "owner": trow.source_owner,
+                    "description": trow.source_description, "category": trow.source_category,
+                },
+                "target": {
+                    "name": trow.target_name, "owner": trow.target_owner,
+                    "description": trow.target_description, "category": trow.target_category,
+                },
+            }
+            if trow.source_name not in node_map:
+                node_map[trow.source_name] = {
+                    "name": trow.source_name, "owner": trow.source_owner,
+                    "description": trow.source_description,
+                    "primary_category": trow.source_category,
+                    "stars": trow.source_stars or 0,
+                    "stars_log": _log_scale_stars(trow.source_stars),
+                    "quality": _extract_quality(trow.source_quality_signals),
+                }
+            if trow.target_name not in node_map:
+                node_map[trow.target_name] = {
+                    "name": trow.target_name, "owner": trow.target_owner,
+                    "description": trow.target_description,
+                    "primary_category": trow.target_category,
+                    "stars": trow.target_stars or 0,
+                    "stars_log": _log_scale_stars(trow.target_stars),
+                    "quality": _extract_quality(trow.target_quality_signals),
+                }
+    except Exception as exc:
+        # repo_edges table may not exist yet — degrade gracefully
+        logger.warning("Could not fetch typed graph edges: %s", exc)
+
+    edges = list(edges_by_pair.values())
     nodes = list(node_map.values())
 
     # Count repos with and without embeddings for diagnostics
@@ -306,7 +394,7 @@ async def get_graph_edges(
         "total_repos": len(nodes),
         "total_public_repos": count_row.total_public if count_row else 0,
         "repos_with_embeddings": count_row.with_embeddings if count_row else 0,
-        "edgeTypes": ["SIMILAR_TO"],
+        "edgeTypes": sorted({e["edgeType"] for e in edges}),
         "nodes": nodes,
         "edges": edges,
     }

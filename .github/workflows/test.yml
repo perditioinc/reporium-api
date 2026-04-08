@@ -32,6 +32,7 @@ jobs:
       REDIS_URL: ""
       INGESTION_API_KEY: test-api-key
       GH_USERNAME: testuser
+      ENVIRONMENT: test
 
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
@@ -45,6 +46,7 @@ jobs:
       - run: pip install pytest pytest-asyncio==0.24.0 httpx
 
       - run: pytest tests/ -v
+        timeout-minutes: 10
 
   notify-on-failure:
     needs: test

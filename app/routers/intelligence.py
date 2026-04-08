@@ -2118,9 +2118,9 @@ async def _prepare_query(
         search_span.set_attribute("pgvector.rows_returned", len(rows))
 
     # Adaptive top_k: stop including repos when similarity drops below threshold
-    # 0.45 ≈ moderately related; below this, repos add noise more than value
+    # 0.40 ≈ moderately related; lowered from 0.45 to surface more results
     if rows and len(rows) > 3:
-        filtered = [r for r in rows if r.similarity >= 0.45]
+        filtered = [r for r in rows if r.similarity >= 0.40]
         if len(filtered) >= 3:  # keep at least 3
             rows = filtered
 
@@ -3546,15 +3546,35 @@ async def similar_repos(
     ).fetchall()
 
     if not candidate_rows:
-        response = SimilarReposResponse(
-            target=SimilarTarget(owner=target_row.owner, name=target_row.name),
-            similar=[],
-        )
-        try:
-            await cache.set(cache_key, response.model_dump(), ttl=900)
-        except Exception:
-            pass
-        return response
+        # Fallback: surface any repos in the same primary_category (no tag/category overlap required)
+        fallback_rows = (
+            await db.execute(
+                text("""
+                    SELECT DISTINCT r.id, r.owner, r.name, r.github_url, r.primary_language
+                    FROM repos r
+                    WHERE r.is_private = false
+                      AND r.id <> :tid
+                      AND r.primary_category IN (
+                          SELECT primary_category FROM repos WHERE id = :tid AND primary_category IS NOT NULL
+                      )
+                    ORDER BY COALESCE(r.parent_stars, r.stargazers_count, 0) DESC
+                    LIMIT 10
+                """),
+                {"tid": target_id},
+            )
+        ).fetchall()
+        if fallback_rows:
+            candidate_rows = fallback_rows
+        else:
+            response = SimilarReposResponse(
+                target=SimilarTarget(owner=target_row.owner, name=target_row.name),
+                similar=[],
+            )
+            try:
+                await cache.set(cache_key, response.model_dump(), ttl=900)
+            except Exception:
+                pass
+            return response
 
     candidate_ids = [row.id for row in candidate_rows]
 
