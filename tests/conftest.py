@@ -46,10 +46,37 @@ async def _setup_db():
         await conn.execute(
             text("ALTER TABLE repo_embeddings ADD COLUMN IF NOT EXISTS embedding_vec vector(384)")
         )
+        # Create repo_edges table (managed outside ORM by build_knowledge_graph.py)
+        await conn.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS repo_edges (
+                    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                    source_repo_id UUID NOT NULL REFERENCES repos(id),
+                    target_repo_id UUID NOT NULL REFERENCES repos(id),
+                    edge_type TEXT NOT NULL,
+                    weight FLOAT DEFAULT 1.0,
+                    evidence JSONB DEFAULT '{}',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(source_repo_id, target_repo_id, edge_type)
+                )
+            """)
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS idx_repo_edges_source ON repo_edges(source_repo_id)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS idx_repo_edges_target ON repo_edges(target_repo_id)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS idx_repo_edges_type ON repo_edges(edge_type)")
+        )
     yield
     await db_module.engine.dispose()
     db_module.engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=NullPool)
     async with db_module.engine.begin() as conn:
+        # Drop repo_edges first — it has FK constraints to repos and is not
+        # tracked by the ORM, so drop_all() would fail with DependentObjects.
+        await conn.execute(text("DROP TABLE IF EXISTS repo_edges CASCADE"))
         await conn.run_sync(Base.metadata.drop_all)
     await db_module.engine.dispose()
 
