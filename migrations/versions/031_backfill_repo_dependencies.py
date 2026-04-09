@@ -41,8 +41,7 @@ def upgrade() -> None:
             'unknown' AS package_ecosystem,
             true AS is_direct,
             NOW() AS fetched_at
-        FROM repo_taxonomy
-        WHERE dimension = 'dependency'
+        FROM (SELECT DISTINCT repo_id, value FROM repo_taxonomy WHERE dimension = 'dependency') dedup
         ON CONFLICT (repo_id, package_name, package_ecosystem) DO NOTHING
     """)
 

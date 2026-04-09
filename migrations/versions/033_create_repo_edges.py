@@ -38,12 +38,17 @@ depends_on = None
 def upgrade() -> None:
     # Handle pre-existing repo_edges table from old build_knowledge_graph.py
     # (it used `evidence` instead of `metadata` and had no ingest_run_id).
+    # Guard: only rename if repo_edges exists AND repo_edges_legacy does not —
+    # prevents a retry from renaming the freshly-created table over a prior backup.
     op.execute("""
         DO $$
         BEGIN
             IF EXISTS (
                 SELECT 1 FROM information_schema.tables
                 WHERE table_name = 'repo_edges'
+            ) AND NOT EXISTS (
+                SELECT 1 FROM information_schema.tables
+                WHERE table_name = 'repo_edges_legacy'
             ) THEN
                 ALTER TABLE repo_edges RENAME TO repo_edges_legacy;
                 RAISE NOTICE 'Renamed pre-existing repo_edges to repo_edges_legacy';
@@ -106,58 +111,29 @@ def upgrade() -> None:
     )
 
     # ── repo_edges_history ────────────────────────────────────────────────────
+    # Lightweight count-log: one row per edge_type per rebuild run.
+    # Records aggregate edge counts for velocity tracking and monitoring.
+    # (A full per-edge temporal archive is out of scope for Wave 2 and will be
+    # added in a future migration once the atomic-swap rebuild is in place.)
     op.create_table(
         "repo_edges_history",
-        sa.Column(
-            "id",
-            UUID(as_uuid=True),
-            primary_key=True,
-            server_default=sa.text("gen_random_uuid()"),
-        ),
-        sa.Column(
-            "source_repo_id",
-            UUID(as_uuid=True),
-            sa.ForeignKey("repos.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
-        sa.Column(
-            "target_repo_id",
-            UUID(as_uuid=True),
-            sa.ForeignKey("repos.id", ondelete="CASCADE"),
-            nullable=False,
-        ),
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
+        sa.Column("run_id", sa.Integer(), nullable=True),
         sa.Column("edge_type", sa.String(32), nullable=False),
-        sa.Column("weight", sa.Float(), nullable=False, server_default="1.0"),
-        sa.Column("confidence", sa.Float(), nullable=False, server_default="0.5"),
-        sa.Column("metadata", JSONB(), nullable=True, server_default="{}"),
+        sa.Column("edge_count", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("sample_edges", JSONB(), nullable=True),
         sa.Column(
-            "ingest_run_id",
-            sa.Integer(),
-            sa.ForeignKey("ingest_runs.id", ondelete="SET NULL"),
-            nullable=True,
-        ),
-        sa.Column(
-            "valid_from",
+            "created_at",
             sa.TIMESTAMP(timezone=True),
             nullable=False,
             server_default=sa.text("NOW()"),
         ),
-        sa.Column(
-            "valid_until",
-            sa.TIMESTAMP(timezone=True),
-            nullable=True,
-        ),
     )
 
     op.create_index(
-        "idx_repo_edges_history_valid_from",
+        "idx_repo_edges_history_created_at",
         "repo_edges_history",
-        ["valid_from"],
-    )
-    op.create_index(
-        "idx_repo_edges_history_src_type",
-        "repo_edges_history",
-        ["source_repo_id", "edge_type"],
+        ["created_at"],
     )
 
 
@@ -167,8 +143,7 @@ def downgrade() -> None:
     op.drop_index("idx_repo_edges_type", table_name="repo_edges")
     op.drop_index("idx_repo_edges_target", table_name="repo_edges")
     op.drop_index("idx_repo_edges_source", table_name="repo_edges")
-    op.drop_index("idx_repo_edges_history_src_type", table_name="repo_edges_history")
-    op.drop_index("idx_repo_edges_history_valid_from", table_name="repo_edges_history")
+    op.drop_index("idx_repo_edges_history_created_at", table_name="repo_edges_history")
     op.drop_table("repo_edges_history")
     op.drop_table("repo_edges")
 
