@@ -299,7 +299,7 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
     repo_fields = item.model_dump(
         exclude={"tags", "categories", "builders", "ai_dev_skills", "pm_skills", "languages", "commits",
                  "skill_areas", "industries", "use_cases", "modalities", "ai_trends", "deployment_context",
-                 "dependencies"}
+                 "dependencies", "dep_ecosystem"}
     )
 
     if repo is None:

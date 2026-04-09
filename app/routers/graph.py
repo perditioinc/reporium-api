@@ -385,7 +385,8 @@ async def get_graph_edges(
              FROM repo_embeddings re
              JOIN repos r ON r.id = re.repo_id
              WHERE r.is_private = false
-               AND re.embedding_vec IS NOT NULL) AS with_embeddings
+               AND re.embedding_vec IS NOT NULL) AS with_embeddings,
+            (SELECT COUNT(*) FROM repo_edges) AS total_graph_edges
     """))
     count_row = counts.fetchone()
 
@@ -394,6 +395,7 @@ async def get_graph_edges(
         "total_repos": len(nodes),
         "total_public_repos": count_row.total_public if count_row else 0,
         "repos_with_embeddings": count_row.with_embeddings if count_row else 0,
+        "total_knowledge_graph_edges": count_row.total_graph_edges if count_row else 0,
         "edgeTypes": sorted({e["edgeType"] for e in edges}),
         "nodes": nodes,
         "edges": edges,
