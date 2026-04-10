@@ -100,13 +100,15 @@ def upgrade() -> None:
         ),
     )
 
-    op.create_index("idx_repo_edges_source", "repo_edges", ["source_repo_id"])
-    op.create_index("idx_repo_edges_target", "repo_edges", ["target_repo_id"])
-    op.create_index("idx_repo_edges_type", "repo_edges", ["edge_type"])
-    op.create_index("idx_repo_edges_ingest_run", "repo_edges", ["ingest_run_id"])
+    # Use IF NOT EXISTS: the pre-existing repo_edges (renamed to repo_edges_legacy)
+    # carried these index names along with it, so a plain CREATE INDEX would fail.
+    op.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_source ON repo_edges(source_repo_id)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_target ON repo_edges(target_repo_id)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_type ON repo_edges(edge_type)")
+    op.execute("CREATE INDEX IF NOT EXISTS idx_repo_edges_ingest_run ON repo_edges(ingest_run_id)")
     # Partial index for high-confidence edges used by the frontend/API
     op.execute(
-        "CREATE INDEX idx_repo_edges_high_confidence "
+        "CREATE INDEX IF NOT EXISTS idx_repo_edges_high_confidence "
         "ON repo_edges(edge_type, confidence) WHERE confidence >= 0.7"
     )
 
