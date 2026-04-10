@@ -196,9 +196,12 @@ async def test_ask_top_k_bounds(client: AsyncClient):
 # ---------------------------------------------------------------------------
 
 def test_hash_ip_returns_sha256_hex():
+    import hmac as _hmac
     ip = "203.0.113.42"
     result = _hash_ip(ip)
-    assert result == hashlib.sha256(ip.encode()).hexdigest()
+    # _hash_ip uses HMAC-SHA256 with the default salt
+    expected = _hmac.new(b"reporium-default-salt", ip.encode(), hashlib.sha256).hexdigest()
+    assert result == expected
     assert len(result) == 64
 
 
@@ -426,6 +429,7 @@ async def test_run_query_raises_504_on_claude_timeout():
     """_run_query must surface a 504 HTTPException when Claude times out."""
     from fastapi import HTTPException as _HTTPException
     import asyncio as _asyncio
+    from app.routers.intelligence import _CLAUDE_TIMEOUT_S
 
     db = AsyncMock()
     fake_model = MagicMock()
@@ -435,15 +439,23 @@ async def test_run_query_raises_504_on_claude_timeout():
     async def _no_cache(*args, **kwargs):
         return None
 
-    # Simulate Claude taking forever
-    async def _slow_executor(executor, fn):
+    # Selective wait_for: let the embedding call (timeout=5.0) succeed normally,
+    # but raise TimeoutError for the Claude call (timeout=_CLAUDE_TIMEOUT_S).
+    _real_wait_for = _asyncio.wait_for
+
+    async def _selective_wait_for(coro_or_fut, timeout=None):
+        if timeout != _CLAUDE_TIMEOUT_S:
+            return await _real_wait_for(coro_or_fut, timeout=timeout)
+        # Claude call — simulate timeout; cancel the future to avoid resource leaks
+        if hasattr(coro_or_fut, "cancel"):
+            coro_or_fut.cancel()
         raise _asyncio.TimeoutError()
 
     mock_client = MagicMock()
     with patch("app.routers.intelligence.get_embedding_model", return_value=fake_model), \
          patch("app.routers.intelligence._find_semantic_cache_hit", new=AsyncMock(side_effect=_no_cache)), \
          patch("app.routers.intelligence._get_client", return_value=mock_client), \
-         patch("app.routers.intelligence.asyncio.wait_for", side_effect=_asyncio.TimeoutError):
+         patch("app.routers.intelligence.asyncio.wait_for", side_effect=_selective_wait_for):
         # Provide a minimal DB result so the vector search completes
         db.execute = AsyncMock(return_value=MagicMock(fetchall=lambda: []))
         with pytest.raises(_HTTPException) as exc_info:

@@ -2060,9 +2060,33 @@ async def backfill_dependencies(
 # HN Mentions Backfill — free HN Algolia API
 # ---------------------------------------------------------------------------
 
+
+def _hn_hit_to_mention(hit: dict, repo_id) -> dict:
+    """Convert a raw HN Algolia hit dict to a repo_mentions insert dict."""
+    from datetime import datetime, timezone
+
+    created_at_i = hit.get("created_at_i")
+    published_at = (
+        datetime.fromtimestamp(created_at_i, tz=timezone.utc) if created_at_i else None
+    )
+    title = hit.get("title") or "(no title)"
+    return {
+        "repo_id": repo_id,
+        "source": "hackernews",
+        "external_id": str(hit.get("objectID", "")),
+        "title": title[:500],
+        "url": f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}",
+        "score": hit.get("points"),
+        "comment_count": hit.get("num_comments"),
+        "author": hit.get("author"),
+        "published_at": published_at,
+    }
+
+
 @router.post("/admin/backfill-hn-mentions", response_model=dict)
 async def backfill_hn_mentions(
     request: Request,
+    dry_run: bool = Query(default=False, description="Preview without writing"),
     limit: int = Query(200, ge=1, le=2000, description="Max repos to scan"),
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
@@ -2086,10 +2110,17 @@ async def backfill_hn_mentions(
     rows = result.fetchall()
 
     if not rows:
-        return {"total": 0, "with_mentions": 0, "mentions_inserted": 0, "failed": 0, "skipped": len(rows)}
+        return {
+            "dry_run": dry_run,
+            "total_repos": 0,
+            "mentions_found": 0,
+            "mentions_inserted": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
 
-    total = len(rows)
-    with_mentions = 0
+    total_repos = len(rows)
+    mentions_found = 0
     mentions_inserted = 0
     failed = 0
     skipped = 0
@@ -2105,8 +2136,8 @@ async def backfill_hn_mentions(
                     timeout=15.0,
                 )
                 if resp.status_code == 429:
-                    logger.warning("HN Algolia rate limited at repo %d/%d, stopping", i + 1, total)
-                    skipped += total - i
+                    logger.warning("HN Algolia rate limited at repo %d/%d, stopping", i + 1, total_repos)
+                    skipped += total_repos - i
                     break
                 resp.raise_for_status()
                 data = resp.json()
@@ -2124,24 +2155,29 @@ async def backfill_hn_mentions(
                         url_lower = (story_url or "").lower()
                         title_lower = title.lower()
                         if not (
-                            (f"github.com/" in url_lower and f"/{repo_name_lower}" in url_lower) or
+                            ("github.com/" in url_lower and f"/{repo_name_lower}" in url_lower) or
                             repo_name_lower in title_lower
                         ):
                             continue
+                        mentions_found += 1
+                        if dry_run:
+                            continue
                         try:
+                            mention = _hn_hit_to_mention(hit, row.id)
                             await db.execute(text("""
                                 INSERT INTO repo_mentions (id, repo_id, source, external_id, title, url, score, comment_count, author, published_at)
-                                VALUES (gen_random_uuid(), :repo_id, 'hackernews', :external_id, :title, :url, :score, :comment_count, :author, to_timestamp(:created_at))
+                                VALUES (gen_random_uuid(), :repo_id, :source, :external_id, :title, :url, :score, :comment_count, :author, :published_at)
                                 ON CONFLICT ON CONSTRAINT uq_repo_mentions_repo_source_ext DO NOTHING
                             """), {
-                                "repo_id": str(row.id),
-                                "external_id": str(hit.get("objectID", "")),
-                                "title": (hit.get("title") or "")[:500],
-                                "url": f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}",
-                                "score": hit.get("points"),
-                                "comment_count": hit.get("num_comments"),
-                                "author": hit.get("author"),
-                                "created_at": hit.get("created_at_i", 0),
+                                "repo_id": str(mention["repo_id"]),
+                                "source": mention["source"],
+                                "external_id": mention["external_id"],
+                                "title": mention["title"],
+                                "url": mention["url"],
+                                "score": mention["score"],
+                                "comment_count": mention["comment_count"],
+                                "author": mention["author"],
+                                "published_at": mention["published_at"],
                             })
                             repo_count += 1
                         except Exception as exc:
@@ -2149,13 +2185,13 @@ async def backfill_hn_mentions(
                             failed += 1
 
                     if repo_count > 0:
-                        with_mentions += 1
                         mentions_inserted += repo_count
 
-                    await db.commit()
+                    if not dry_run:
+                        await db.commit()
 
                 # Respect rate limit: ~1 req/s
-                if i < total - 1:
+                if i < total_repos - 1:
                     await asyncio.sleep(1.0)
 
             except Exception as exc:
@@ -2163,8 +2199,9 @@ async def backfill_hn_mentions(
                 failed += 1
 
     return {
-        "total": total,
-        "with_mentions": with_mentions,
+        "dry_run": dry_run,
+        "total_repos": total_repos,
+        "mentions_found": mentions_found,
         "mentions_inserted": mentions_inserted,
         "failed": failed,
         "skipped": skipped,
