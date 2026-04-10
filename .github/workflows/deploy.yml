@@ -99,6 +99,12 @@ jobs:
             -H "Content-Type: application/json" \
             --max-time 60 \
             && echo "Embeddings backfill triggered" || echo "Embeddings backfill skipped"
+          # Bust graph edge cache so new typed-edge query is reflected immediately
+          curl -sf -X POST "${API_URL}/admin/cache/graph/invalidate" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" \
+            --max-time 30 \
+            && echo "Graph cache invalidated" || echo "Graph cache invalidation skipped"
 
       - name: Publish api.deployed event
         if: success()
