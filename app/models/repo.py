@@ -43,6 +43,7 @@ class Repo(Base):
 
     # Own star count (for non-fork / built repos)
     stargazers_count: Mapped[int | None] = mapped_column(Integer)
+    forks_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     open_issues_count: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
 
     # Activity
@@ -53,7 +54,12 @@ class Repo(Base):
     # Enrichment
     readme_summary: Mapped[str | None] = mapped_column(Text)
     activity_score: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    activity_score_breakdown: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     quality_signals: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    # Integration tags: raw = AI output, canonical = fuzzy-matched to vocabulary
+    raw_integration_tags: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    integration_tags: Mapped[list | None] = mapped_column(JSONB, nullable=True)
 
     # Metadata
     ingested_at: Mapped[datetime] = mapped_column(
