@@ -185,7 +185,6 @@ class RepoIngestItem(BaseModel):
     languages: list[LanguageIngest] = []
     commits: list[CommitIngest] = []
 
-    license_spdx: str | None = None
     has_tests: bool | None = None
     has_ci: bool | None = None
 
@@ -199,7 +198,11 @@ class RepoIngestItem(BaseModel):
     modalities: list[str] = []
     ai_trends: list[str] = []
     deployment_context: list[str] = []
+
+    # Dependency data — written to repo_dependencies table (not repo_taxonomy).
+    # dep_ecosystem: pypi | npm | go | cargo | unknown | None
     dependencies: list[str] = []
+    dep_ecosystem: str | None = None
 
 
 class RepoEnrichItem(BaseModel):
