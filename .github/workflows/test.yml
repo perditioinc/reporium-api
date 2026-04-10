@@ -43,9 +43,9 @@ jobs:
 
       - run: pip install -r requirements.txt
 
-      - run: pip install pytest pytest-asyncio==0.24.0 httpx
+      - run: pip install pytest pytest-asyncio==0.24.0 httpx pytest-timeout==2.3.1
 
-      - run: pytest tests/ -v
+      - run: pytest tests/ -v --timeout=60
         timeout-minutes: 10
 
   notify-on-failure:

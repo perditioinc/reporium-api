@@ -22,8 +22,9 @@ async def test_backfill_licenses_requires_api_key(client: AsyncClient):
 
 
 @pytest.mark.asyncio
-async def test_backfill_licenses_requires_admin_key(client: AsyncClient):
+async def test_backfill_licenses_requires_admin_key(client: AsyncClient, monkeypatch):
     """Endpoint rejects requests that have an API key but no admin key."""
+    monkeypatch.setenv("ADMIN_API_KEY", "test-admin-key")
     resp = await client.post(
         "/admin/backfill-licenses",
         headers={"Authorization": f"Bearer {TEST_API_KEY}"},

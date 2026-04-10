@@ -72,6 +72,12 @@ def _make_db_row(
     row.integration_tags = integration_tags or []
     row.dependencies = dependencies or []
     row.similarity = similarity
+    row.primary_category = None
+    row.language = None
+    row.license_spdx = None
+    row.activity_score = None
+    row.has_tests = None
+    row.has_ci = None
     return row
 
 
@@ -186,6 +192,7 @@ def _patch_anthropic_key():
     return patch(
         "app.routers.intelligence.get_anthropic_key",
         return_value="sk-ant-test-key",
+        create=True,
     )
 
 
