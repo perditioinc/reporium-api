@@ -23,4 +23,4 @@ opentelemetry-sdk>=1.20.0
 opentelemetry-exporter-gcp-trace>=1.6.0
 opentelemetry-instrumentation-fastapi>=0.41b0
 opentelemetry-instrumentation-httpx>=0.41b0
-sentry-sdk[fastapi]==2.20.0
+sentry-sdk[fastapi]==2.25.1
