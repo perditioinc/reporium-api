@@ -30,18 +30,18 @@ depends_on = None
 
 def upgrade() -> None:
     # Backfill from repo_taxonomy rows where dimension='dependency'.
-    # repo_taxonomy.value holds the package name; ecosystem is unknown (historical).
+    # repo_taxonomy.raw_value holds the package name; ecosystem is unknown (historical).
     op.execute("""
         INSERT INTO repo_dependencies
             (id, repo_id, package_name, package_ecosystem, is_direct, fetched_at)
         SELECT
             gen_random_uuid(),
             repo_id,
-            value AS package_name,
+            raw_value AS package_name,
             'unknown' AS package_ecosystem,
             true AS is_direct,
             NOW() AS fetched_at
-        FROM (SELECT DISTINCT repo_id, value FROM repo_taxonomy WHERE dimension = 'dependency') dedup
+        FROM (SELECT DISTINCT repo_id, raw_value FROM repo_taxonomy WHERE dimension = 'dependency') dedup
         ON CONFLICT (repo_id, package_name, package_ecosystem) DO NOTHING
     """)
 
