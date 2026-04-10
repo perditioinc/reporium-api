@@ -165,6 +165,7 @@ class RepoIngestItem(BaseModel):
     parent_forks: int | None = None
     parent_is_archived: bool = False
     stargazers_count: int | None = None
+    forks_count: int = 0
     open_issues_count: int = 0
     license_spdx: str | None = None
 
@@ -174,6 +175,7 @@ class RepoIngestItem(BaseModel):
 
     readme_summary: str | None = None
     activity_score: int = 0
+    activity_score_breakdown: dict | None = None
 
     github_updated_at: datetime | None = None
 
