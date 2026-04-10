@@ -186,6 +186,7 @@ def _patch_anthropic_key():
     return patch(
         "app.routers.intelligence.get_anthropic_key",
         return_value="sk-ant-test-key",
+        create=True,
     )
 
 

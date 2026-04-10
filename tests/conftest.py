@@ -14,9 +14,18 @@ os.environ["REDIS_URL"] = ""  # disable Redis in tests
 os.environ["RATELIMIT_ENABLED"] = "0"  # disable rate limiting in tests
 os.environ["ENVIRONMENT"] = "test"  # skip embedding model pre-warm in tests
 
+import importlib
+
 import app.database as db_module
 from app.database import Base, get_db
 from app.main import app
+
+# Ensure all ORM models are imported so Base.metadata.create_all() creates
+# every table, including ones not transitively imported by main.py at startup.
+importlib.import_module("app.models.query_log")
+importlib.import_module("app.models.audit_log")
+importlib.import_module("app.models.mention")
+importlib.import_module("app.models.session")
 
 TEST_API_KEY = "test-api-key"
 AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
@@ -30,7 +39,12 @@ async def _setup_db():
     # NullPool: no connection pooling → each session gets a fresh connection.
     # This prevents "Future attached to a different loop" errors when pytest-asyncio
     # creates a new event loop per test while the engine is session-scoped.
-    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=NullPool)
+    db_module.engine = create_async_engine(
+        TEST_DB_URL,
+        echo=False,
+        poolclass=NullPool,
+        connect_args={"command_timeout": 30},
+    )
     db_module.async_session_factory.configure(bind=db_module.engine)
 
     async with db_module.engine.begin() as conn:
@@ -72,7 +86,12 @@ async def _setup_db():
         )
     yield
     await db_module.engine.dispose()
-    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=NullPool)
+    db_module.engine = create_async_engine(
+        TEST_DB_URL,
+        echo=False,
+        poolclass=NullPool,
+        connect_args={"command_timeout": 30},
+    )
     async with db_module.engine.begin() as conn:
         # Drop repo_edges first — it has FK constraints to repos and is not
         # tracked by the ORM, so drop_all() would fail with DependentObjects.

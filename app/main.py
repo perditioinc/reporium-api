@@ -48,6 +48,36 @@ def _configure_logging() -> None:
 _configure_logging()
 logger = logging.getLogger(__name__)
 
+
+def _init_sentry() -> None:
+    """Initialise Sentry SDK if SENTRY_DSN is configured.
+
+    No-ops silently when the DSN is absent so local/test environments are
+    unaffected.  Import is deferred to avoid loading the SDK on every startup
+    when it won't be used.
+    """
+    dsn = os.environ.get("SENTRY_DSN", "")
+    if not dsn:
+        return
+    import sentry_sdk
+    from sentry_sdk.integrations.fastapi import FastApiIntegration
+    from sentry_sdk.integrations.starlette import StarletteIntegration
+
+    sentry_sdk.init(
+        dsn=dsn,
+        environment=os.environ.get("ENVIRONMENT", "production"),
+        traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.1")),
+        integrations=[
+            StarletteIntegration(transaction_style="endpoint"),
+            FastApiIntegration(transaction_style="endpoint"),
+        ],
+        send_default_pii=False,
+    )
+    logger.info("Sentry SDK initialised (environment=%s)", os.environ.get("ENVIRONMENT", "production"))
+
+
+_init_sentry()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup env validation: warn loudly if APP_API_TOKEN is missing in production.

@@ -23,6 +23,9 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import cache
+
+# Tests patch app.routers.graph.redis_cache — expose the same object under that name.
+redis_cache = cache
 from app.database import get_db
 from app.embeddings import get_embedding_model
 from app.rate_limit import rate_limit_storage
