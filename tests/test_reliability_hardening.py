@@ -42,22 +42,20 @@ class TestPoolSizing:
 class TestTaskDoneCallback:
     """Verify _task_done_callback logs warnings for failed tasks and stays silent for successful ones."""
 
-    def test_logs_warning_for_failed_task(self, caplog):
+    @pytest.mark.asyncio
+    async def test_logs_warning_for_failed_task(self, caplog):
         from app.routers.intelligence import _task_done_callback
 
         async def _failing():
             raise RuntimeError("boom")
 
-        async def _run():
-            task = asyncio.create_task(_failing())
-            try:
-                await task
-            except RuntimeError:
-                pass
-            with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
-                _task_done_callback(task)
-
-        asyncio.get_event_loop().run_until_complete(_run())
+        task = asyncio.create_task(_failing())
+        try:
+            await task
+        except RuntimeError:
+            pass
+        with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
+            _task_done_callback(task)
 
         assert any("boom" in record.message for record in caplog.records), (
             "Expected a warning log containing 'boom'"
@@ -66,42 +64,38 @@ class TestTaskDoneCallback:
             "Expected log message to mention 'Background task'"
         )
 
-    def test_no_log_for_successful_task(self, caplog):
+    @pytest.mark.asyncio
+    async def test_no_log_for_successful_task(self, caplog):
         from app.routers.intelligence import _task_done_callback
 
         async def _ok():
             return 42
 
-        async def _run():
-            task = asyncio.create_task(_ok())
-            await task
-            with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
-                _task_done_callback(task)
-
-        asyncio.get_event_loop().run_until_complete(_run())
+        task = asyncio.create_task(_ok())
+        await task
+        with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
+            _task_done_callback(task)
 
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) == 0, (
             f"Expected no warning logs for a successful task, got: {warning_records}"
         )
 
-    def test_no_log_for_cancelled_task(self, caplog):
+    @pytest.mark.asyncio
+    async def test_no_log_for_cancelled_task(self, caplog):
         from app.routers.intelligence import _task_done_callback
 
         async def _slow():
             await asyncio.sleep(100)
 
-        async def _run():
-            task = asyncio.create_task(_slow())
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
-                _task_done_callback(task)
-
-        asyncio.get_event_loop().run_until_complete(_run())
+        task = asyncio.create_task(_slow())
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
+            _task_done_callback(task)
 
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) == 0, (
