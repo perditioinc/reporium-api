@@ -2161,7 +2161,6 @@ async def backfill_hn_mentions(
                             continue
                         mentions_found += 1
                         if dry_run:
-                            repo_count += 1
                             continue
                         try:
                             mention = _hn_hit_to_mention(hit, row.id)

@@ -22,10 +22,7 @@ from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.cache import cache
-
-# Tests patch app.routers.graph.redis_cache — expose the same object under that name.
-redis_cache = cache
+from app.cache import cache as redis_cache
 from app.database import get_db
 from app.embeddings import get_embedding_model
 from app.rate_limit import rate_limit_storage
@@ -169,7 +166,7 @@ async def get_graph_edges(
 
     # --- Redis cache check ---
     cache_key = f"graph_edges:{limit}:{min_similarity}:{neighbours}:{since or 'all'}"
-    cached = await cache.get(cache_key)
+    cached = await redis_cache.get(cache_key)
     if cached is not None:
         response = JSONResponse(content=cached)
         response.headers["Cache-Control"] = "public, max-age=3600"
@@ -405,7 +402,7 @@ async def get_graph_edges(
     }
 
     # Store in Redis cache
-    await cache.set(cache_key, result_payload, ttl=CACHE_TTL_GRAPH_EDGES)
+    await redis_cache.set(cache_key, result_payload, ttl=CACHE_TTL_GRAPH_EDGES)
 
     response = JSONResponse(content=result_payload)
     response.headers["Cache-Control"] = "public, max-age=3600"
@@ -437,7 +434,7 @@ async def search_graph_edges(
     # --- Redis cache ---
     query_hash = hashlib.sha256(query.lower().strip().encode()).hexdigest()[:16]
     cache_key = f"graph_search:{query_hash}:{top_k}:{neighbours}:{min_similarity}"
-    cached = await cache.get(cache_key)
+    cached = await redis_cache.get(cache_key)
     if cached is not None:
         return cached
 
@@ -524,7 +521,7 @@ async def search_graph_edges(
         "edges": edges,
     }
 
-    await cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_SEARCH)
+    await redis_cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_SEARCH)
     return payload
 
 
@@ -553,7 +550,7 @@ async def get_repo_subgraph(
     Redis cached with 30-min TTL.
     """
     cache_key = f"graph_subgraph:{repo_name}:{neighbours}:{min_similarity}"
-    cached = await cache.get(cache_key)
+    cached = await redis_cache.get(cache_key)
     if cached is not None:
         return cached
 
@@ -681,7 +678,7 @@ async def get_repo_subgraph(
         "edges": edges,
     }
 
-    await cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_SUBGRAPH)
+    await redis_cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_SUBGRAPH)
     return payload
 
 
@@ -703,7 +700,7 @@ async def get_graph_clusters(
     Redis cached with 1-hr TTL.
     """
     cache_key = "graph_clusters"
-    cached = await cache.get(cache_key)
+    cached = await redis_cache.get(cache_key)
     if cached is not None:
         return cached
 
@@ -807,7 +804,7 @@ async def get_graph_clusters(
         "clusters": cluster_list,
     }
 
-    await cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_CLUSTERS)
+    await redis_cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_CLUSTERS)
     return payload
 
 

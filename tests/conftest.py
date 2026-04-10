@@ -84,6 +84,11 @@ async def _setup_db():
         await conn.execute(
             text("CREATE INDEX IF NOT EXISTS idx_repo_edges_type ON repo_edges(edge_type)")
         )
+        # query_log.question_embedding_vec is added by migration in production;
+        # the ORM model doesn't include it, so we add it manually here.
+        await conn.execute(
+            text("ALTER TABLE query_log ADD COLUMN IF NOT EXISTS question_embedding_vec vector(384)")
+        )
     yield
     await db_module.engine.dispose()
     db_module.engine = create_async_engine(
