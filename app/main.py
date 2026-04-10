@@ -4,6 +4,8 @@ import os
 import time
 from contextlib import asynccontextmanager
 
+import sentry_sdk
+
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -47,6 +49,13 @@ def _configure_logging() -> None:
 
 _configure_logging()
 logger = logging.getLogger(__name__)
+
+sentry_sdk.init(
+    dsn=os.getenv("SENTRY_DSN"),
+    traces_sample_rate=1.0,
+    send_default_pii=True,
+    environment=os.getenv("ENVIRONMENT", "production"),
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
