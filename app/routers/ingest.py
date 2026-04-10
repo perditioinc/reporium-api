@@ -19,6 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.auth import require_ingest_key, require_pubsub_push, verify_api_key
 from app.cache import cache
 from app.database import get_db
+from app.models.dependency import RepoDependency
 from app.models.repo import (
     Repo,
     RepoAIDevSkill,
@@ -56,6 +57,8 @@ limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 MAX_BATCH = 100
 
 # Mapping from ingest payload field → taxonomy dimension string
+# NOTE: "dependencies" is intentionally absent — deps are written to the
+# repo_dependencies table (via RepoDependency ORM), not repo_taxonomy.
 _TAXONOMY_DIMENSION_MAP = {
     "skill_areas": "skill_area",
     "industries": "industry",
@@ -63,7 +66,6 @@ _TAXONOMY_DIMENSION_MAP = {
     "modalities": "modality",
     "ai_trends": "ai_trend",
     "deployment_context": "deployment_context",
-    "dependencies": "dependency",
 }
 
 
@@ -299,7 +301,7 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
     repo_fields = item.model_dump(
         exclude={"tags", "categories", "builders", "ai_dev_skills", "pm_skills", "languages", "commits",
                  "skill_areas", "industries", "use_cases", "modalities", "ai_trends", "deployment_context",
-                 "dependencies"}
+                 "dependencies", "dep_ecosystem"}
     )
 
     if repo is None:
@@ -354,6 +356,18 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
 
     # Write dynamic taxonomy dimensions (ON CONFLICT DO NOTHING — safe to re-run)
     await _upsert_repo_taxonomy(db, repo.id, item.model_dump())
+
+    # Write dependency data to repo_dependencies (not repo_taxonomy).
+    # Replace-all semantics: delete existing rows then insert fresh.
+    if item.dependencies:
+        await db.execute(RepoDependency.__table__.delete().where(RepoDependency.repo_id == repo.id))
+        for pkg_name in item.dependencies:
+            db.add(RepoDependency(
+                repo_id=repo.id,
+                package_name=pkg_name,
+                package_ecosystem=item.dep_ecosystem,
+                is_direct=True,
+            ))
 
     return repo
 
