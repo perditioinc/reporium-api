@@ -98,6 +98,25 @@ async def _setup_db():
     await db_module.engine.dispose()
 
 
+@pytest_asyncio.fixture(autouse=True)
+async def _clear_dependency_overrides():
+    """
+    Autouse fixture that clears app.dependency_overrides after every test.
+
+    Some tests in test_intelligence_quality.py set dependency_overrides[get_db]
+    before a ``with`` block that can raise AttributeError (e.g. when patching an
+    attribute that no longer exists on the module).  When that happens the
+    try/finally cleanup inside the ``with`` body never runs, leaving the mock
+    get_db override in place for all subsequent tests — causing those tests to
+    receive MagicMock rows from the DB instead of real SQLAlchemy rows.
+
+    Clearing dependency_overrides after each test is the safe belt-and-suspenders
+    fix that prevents override leaks regardless of how the individual test fails.
+    """
+    yield
+    app.dependency_overrides.clear()
+
+
 @pytest_asyncio.fixture
 async def client(_setup_db) -> AsyncGenerator[AsyncClient, None]:
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
