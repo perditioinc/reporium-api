@@ -1197,6 +1197,21 @@ async def admin_purge_query_logs(
     return {"purged": count, "cutoff_days": days}
 
 
+@router.post("/admin/cache/graph/invalidate", response_model=dict)
+async def invalidate_graph_cache(
+    _admin_key: None = Depends(require_admin_key),
+) -> dict:
+    """Bust all Redis cache entries for the knowledge graph endpoints.
+
+    Call this after a graph rebuild to ensure the next request re-queries
+    the DB instead of serving stale typed-edge data.
+    """
+    await cache.invalidate("graph_edges:*")
+    await cache.invalidate("graph_clusters:*")
+    await cache.invalidate("graph_clusters")
+    return {"invalidated": ["graph_edges:*", "graph_clusters:*", "graph_clusters"]}
+
+
 # ---------------------------------------------------------------------------
 # Issue #238 — ask_sessions retention + right-to-be-forgotten (RTBF)
 # ---------------------------------------------------------------------------
