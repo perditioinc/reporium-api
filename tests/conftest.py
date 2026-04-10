@@ -20,8 +20,11 @@ from app.main import app
 
 # Force-import models that are not imported transitively via app.main so that
 # Base.metadata.create_all() includes their tables in the test database.
-import app.models.query_log  # noqa: F401  — registers QueryLog → query_log table
-import app.models.audit_log  # noqa: F401  — registers AuditLog → audit_logs table
+# IMPORTANT: use importlib to avoid rebinding the local name 'app' to the
+# app package — 'import app.models.X' would shadow 'from app.main import app'.
+import importlib
+importlib.import_module("app.models.query_log")   # registers QueryLog → query_log table
+importlib.import_module("app.models.audit_log")   # registers AuditLog → audit_logs table
 
 TEST_API_KEY = "test-api-key"
 AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
