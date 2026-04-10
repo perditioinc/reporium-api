@@ -308,30 +308,45 @@ async def get_graph_edges(
                 "quality": _extract_quality(row.target_quality_signals),
             }
 
-    # Merge typed relationship edges from repo_edges — override SIMILAR_TO when same pair
+    # Merge typed relationship edges from repo_edges — override SIMILAR_TO when same pair.
+    # Use per-type ranked window to prevent any single type from starving the others
+    # (ALTERNATIVE_TO has 46k rows all at weight=1.0 and would fill a flat LIMIT).
     try:
         typed_sql = text("""
+            WITH ranked AS (
+                SELECT
+                    re.edge_type,
+                    re.weight,
+                    r1.name        AS source_name,
+                    r1.owner       AS source_owner,
+                    r1.description AS source_description,
+                    r1.primary_category AS source_category,
+                    r1.stargazers_count AS source_stars,
+                    r1.quality_signals  AS source_quality_signals,
+                    r2.name        AS target_name,
+                    r2.owner       AS target_owner,
+                    r2.description AS target_description,
+                    r2.primary_category AS target_category,
+                    r2.stargazers_count AS target_stars,
+                    r2.quality_signals  AS target_quality_signals,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY re.edge_type
+                        ORDER BY re.weight DESC NULLS LAST
+                    ) AS rn
+                FROM repo_edges re
+                JOIN repos r1 ON r1.id = re.source_repo_id AND r1.is_private = false
+                JOIN repos r2 ON r2.id = re.target_repo_id AND r2.is_private = false
+                WHERE re.edge_type IN ('ALTERNATIVE_TO', 'COMPATIBLE_WITH', 'DEPENDS_ON', 'EXTENDS')
+            )
             SELECT
-                re.edge_type,
-                re.weight,
-                r1.name        AS source_name,
-                r1.owner       AS source_owner,
-                r1.description AS source_description,
-                r1.primary_category AS source_category,
-                r1.stargazers_count AS source_stars,
-                r1.quality_signals  AS source_quality_signals,
-                r2.name        AS target_name,
-                r2.owner       AS target_owner,
-                r2.description AS target_description,
-                r2.primary_category AS target_category,
-                r2.stargazers_count AS target_stars,
-                r2.quality_signals  AS target_quality_signals
-            FROM repo_edges re
-            JOIN repos r1 ON r1.id = re.source_repo_id AND r1.is_private = false
-            JOIN repos r2 ON r2.id = re.target_repo_id AND r2.is_private = false
-            WHERE re.edge_type IN ('ALTERNATIVE_TO', 'COMPATIBLE_WITH', 'DEPENDS_ON', 'EXTENDS')
-            ORDER BY re.weight DESC NULLS LAST
-            LIMIT 5000
+                edge_type, weight,
+                source_name, source_owner, source_description, source_category,
+                source_stars, source_quality_signals,
+                target_name, target_owner, target_description, target_category,
+                target_stars, target_quality_signals
+            FROM ranked
+            WHERE rn <= 2000
+            ORDER BY weight DESC NULLS LAST
         """)
         typed_result = await db.execute(typed_sql)
         typed_rows = typed_result.fetchall()
