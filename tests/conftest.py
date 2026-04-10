@@ -18,6 +18,11 @@ import app.database as db_module
 from app.database import Base, get_db
 from app.main import app
 
+# Force-import models that are not imported transitively via app.main so that
+# Base.metadata.create_all() includes their tables in the test database.
+import app.models.query_log  # noqa: F401  — registers QueryLog → query_log table
+import app.models.audit_log  # noqa: F401  — registers AuditLog → audit_logs table
+
 TEST_API_KEY = "test-api-key"
 AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
 
@@ -30,7 +35,12 @@ async def _setup_db():
     # NullPool: no connection pooling → each session gets a fresh connection.
     # This prevents "Future attached to a different loop" errors when pytest-asyncio
     # creates a new event loop per test while the engine is session-scoped.
-    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=NullPool)
+    db_module.engine = create_async_engine(
+        TEST_DB_URL,
+        echo=False,
+        poolclass=NullPool,
+        connect_args={"command_timeout": 30},  # fail fast if DB hangs in tests
+    )
     db_module.async_session_factory.configure(bind=db_module.engine)
 
     async with db_module.engine.begin() as conn:
