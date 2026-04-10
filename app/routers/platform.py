@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, Request
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from sqlalchemy import func, select, text
+from sqlalchemy import distinct, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_ingest_key, require_metrics_access, verify_api_key
@@ -42,19 +42,19 @@ async def metrics_latest(
 
     repos_with_skills = (
         await db.execute(
-            select(func.count(func.distinct(RepoAIDevSkill.repo_id)))
+            select(func.count(distinct(RepoAIDevSkill.repo_id)))
         )
     ).scalar_one()
 
     repos_with_categories = (
         await db.execute(
-            select(func.count(func.distinct(RepoCategory.repo_id)))
+            select(func.count(distinct(RepoCategory.repo_id)))
         )
     ).scalar_one()
 
     lang_count = (
         await db.execute(
-            select(func.count(func.distinct(Repo.primary_language)))
+            select(func.count(distinct(Repo.primary_language)))
             .where(Repo.primary_language.is_not(None))
         )
     ).scalar_one()
