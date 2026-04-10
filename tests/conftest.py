@@ -42,7 +42,11 @@ async def _setup_db():
         TEST_DB_URL,
         echo=False,
         poolclass=NullPool,
-        connect_args={"command_timeout": 30},  # fail fast if DB hangs in tests
+        connect_args={
+            "command_timeout": 30,   # cancel any single command after 30s
+            "timeout": 10,           # fail fast if the TCP connection itself hangs
+            "server_settings": {"statement_timeout": "30000"},  # PostgreSQL-level 30s limit
+        },
     )
     db_module.async_session_factory.configure(bind=db_module.engine)
 
