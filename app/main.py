@@ -17,6 +17,7 @@ from slowapi.util import get_remote_address
 
 from app.cache import cache
 from app.rate_limit import rate_limit_storage
+from app.prometheus_metrics import record_http_request
 from app.slo_observer import slo_observer
 from app.database import async_session_factory, check_db_connection, engine
 from app.routers import admin, analytics, compare, dependencies, graph, ingest, intelligence, library, library_full, mentions, nl_filter, platform, recommendations, repos, search, taxonomy, trends, webhooks, wiki
@@ -242,6 +243,15 @@ async def log_requests(request: Request, call_next):
     try:
         slo_observer.record(request.url.path, duration_ms, response.status_code)
     except Exception:  # observer must never break the request path
+        pass
+    try:
+        record_http_request(
+            path=request.url.path,
+            method=request.method,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+        )
+    except Exception:
         pass
     # Redact query strings — they may contain user input, API keys, or PII
     safe_path = request.url.path
