@@ -69,6 +69,10 @@ async def test_metrics_latency_tracks_graph_edges(client):
 
 @pytest.mark.asyncio
 async def test_metrics_backfill_reports_progress(client):
+    baseline_resp = await client.get("/metrics/backfill")
+    assert baseline_resp.status_code == 200
+    baseline = baseline_resp.json()
+
     repo_a = await _insert_repo(name="repo-a")
     repo_b = await _insert_repo(name="repo-b")
     await _insert_repo(name="repo-c")
@@ -97,12 +101,16 @@ async def test_metrics_backfill_reports_progress(client):
 
     data = resp.json()
     assert data["available"] is True
-    assert data["repos"]["total"] == 3
-    assert data["repos"]["scanned"] == 2
-    assert data["repos"]["remaining"] == 1
-    assert data["repos"]["with_dependencies"] == 1
-    assert data["repos"]["marked_no_dependencies"] == 1
-    assert data["dependencies"]["rows"] == 1
+    assert data["repos"]["total"] == baseline["repos"]["total"] + 3
+    assert data["repos"]["scanned"] == baseline["repos"]["scanned"] + 2
+    assert data["repos"]["remaining"] == baseline["repos"]["remaining"] + 1
+    assert data["repos"]["with_dependencies"] == (
+        baseline["repos"]["with_dependencies"] + 1
+    )
+    assert data["repos"]["marked_no_dependencies"] == (
+        baseline["repos"]["marked_no_dependencies"] + 1
+    )
+    assert data["dependencies"]["rows"] == baseline["dependencies"]["rows"] + 1
 
 
 @pytest.mark.asyncio
