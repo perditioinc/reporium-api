@@ -24,6 +24,7 @@ from app.main import app
 # every table, including ones not transitively imported by main.py at startup.
 importlib.import_module("app.models.query_log")
 importlib.import_module("app.models.audit_log")
+importlib.import_module("app.models.dependency")
 importlib.import_module("app.models.mention")
 importlib.import_module("app.models.session")
 
