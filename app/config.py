@@ -76,6 +76,12 @@ class Settings(BaseSettings):
     redis_url: str | None = None
     cache_ttl_seconds: int = 300  # 5 minutes default
 
+    # Graph snapshot serving
+    graph_snapshot_bucket: str | None = None
+    graph_snapshot_object: str = "reporium/graph/knowledge-graph.json"
+    graph_snapshot_local_path: str | None = None
+    graph_snapshot_cache_ttl_seconds: int = 300
+
     # Auth
     ingestion_api_key: str
 
