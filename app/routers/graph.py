@@ -160,6 +160,7 @@ async def _build_graph_payload_from_db(
     neighbours: int,
     interval: str | None,
 ) -> dict:
+    """DEPRECATED - This function is dead code, never called. Kept for reference only."""
     # Build optional temporal WHERE clause
     since_clause = ""
     if interval:
