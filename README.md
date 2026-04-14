@@ -49,6 +49,9 @@ uvicorn app.main:app --reload
 | `ADMIN_API_KEY` | No | X-Admin-Key header for admin endpoints. Unset = open in dev. |
 | `INGEST_API_KEY` | No | X-Ingest-Key header for ingest endpoints. Unset = open in dev. |
 | `REDIS_URL` | No | Redis connection string — API works without it |
+| `GRAPH_SNAPSHOT_BUCKET` | No | GCS bucket for the published graph snapshot artifact |
+| `GRAPH_SNAPSHOT_OBJECT` | No | Object path for the graph snapshot artifact |
+| `GRAPH_SNAPSHOT_LOCAL_PATH` | No | Local graph snapshot file for development/tests |
 | `GH_USERNAME` | No | GitHub username |
 | `GH_TOKEN` | No | GitHub token |
 | `ENVIRONMENT` | No | `development` \| `production` |
@@ -56,6 +59,8 @@ uvicorn app.main:app --reload
 | `GCP_PROJECT_ID` | No | GCP project ID (default: `perditio-platform`) |
 
 > Secrets are resolved from GCP Secret Manager in production (no `.env` needed on Cloud Run).
+>
+> `GET /graph/edges` serves from the published graph snapshot artifact before attempting live database queries so the graph UI remains available during primary DB incidents.
 
 ---
 
