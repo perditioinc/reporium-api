@@ -116,7 +116,7 @@ class TestGraphSnapshotServing:
 
         try:
             with (
-                patch("app.routers.graph.cache") as mock_cache,
+                patch("app.routers.graph.redis_cache") as mock_cache,
                 patch("app.routers.graph.load_graph_snapshot", new=AsyncMock(return_value=_sample_snapshot())),
             ):
                 mock_cache.get = AsyncMock(return_value=None)

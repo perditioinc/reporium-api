@@ -440,7 +440,7 @@ async def get_graph_edges(
         except Exception as exc:
             logger.warning("Graph snapshot build failed; falling back to live DB: %s", exc)
         else:
-            await cache.set(cache_key, snapshot_payload, ttl=CACHE_TTL_GRAPH_EDGES)
+            await redis_cache.set(cache_key, snapshot_payload, ttl=CACHE_TTL_GRAPH_EDGES)
             return _json_graph_response(snapshot_payload)
 
     # Build optional temporal WHERE clause
