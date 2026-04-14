@@ -16,6 +16,33 @@ def _get_secret(secret_id: str, project_id: str = "perditio-platform") -> str:
     return response.payload.data.decode("UTF-8")
 
 
+def _normalize_env_aliases(*keys: str) -> str | None:
+    """Keep alias environment variables in sync and return the chosen value."""
+    chosen_value: str | None = None
+
+    for key in keys:
+        value = os.getenv(key)
+        if not value:
+            continue
+        if chosen_value is None:
+            chosen_value = value.strip()
+            continue
+        if value.strip() != chosen_value:
+            logger.warning(
+                "Conflicting values provided for %s; using %s",
+                ", ".join(keys),
+                keys[0],
+            )
+            break
+
+    if not chosen_value:
+        return None
+
+    for key in keys:
+        os.environ[key] = chosen_value
+    return chosen_value
+
+
 def _resolve_database_url() -> str:
     """Resolve DATABASE_URL from env or Secret Manager in production."""
     env_url = os.getenv("DATABASE_URL")
@@ -35,11 +62,19 @@ def _resolve_secrets():
     if os.getenv("ENVIRONMENT") == "production":
         project = os.getenv("GCP_PROJECT", "perditio-platform")
         if not os.getenv("DATABASE_URL"):
-            logger.info("Loading DATABASE_URL from Secret Manager")
-            os.environ["DATABASE_URL"] = _get_secret("reporium-db-url-async", project)
-        if not os.getenv("INGESTION_API_KEY"):
-            logger.info("Loading INGESTION_API_KEY from Secret Manager")
-            os.environ["INGESTION_API_KEY"] = _get_secret("reporium-ingestion-api-key", project)
+            try:
+                logger.info("Loading DATABASE_URL from Secret Manager")
+                os.environ["DATABASE_URL"] = _get_secret("reporium-db-url-async", project)
+            except Exception:
+                logger.warning("DATABASE_URL not found in Secret Manager")
+        if not _normalize_env_aliases("INGESTION_API_KEY", "INGEST_API_KEY"):
+            try:
+                logger.info("Loading INGESTION_API_KEY from Secret Manager")
+                ingest_key = _get_secret("reporium-ingestion-api-key", project).strip()
+                os.environ["INGESTION_API_KEY"] = ingest_key
+                os.environ["INGEST_API_KEY"] = ingest_key
+            except Exception:
+                logger.warning("INGESTION_API_KEY not found in Secret Manager")
         if not os.getenv("ADMIN_API_KEY"):
             try:
                 logger.info("Loading ADMIN_API_KEY from Secret Manager")
@@ -58,9 +93,7 @@ def _resolve_secrets():
                 os.environ["GITHUB_TOKEN"] = _get_secret("github-token", project).strip()
             except Exception:
                 logger.warning("GITHUB_TOKEN not found in Secret Manager")
-    # Normalise: if GH_TOKEN is set but GITHUB_TOKEN is not, copy it over
-    if os.getenv("GH_TOKEN") and not os.getenv("GITHUB_TOKEN"):
-        os.environ["GITHUB_TOKEN"] = os.getenv("GH_TOKEN")
+    _normalize_env_aliases("GITHUB_TOKEN", "GH_TOKEN")
     os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://postgres:postgres@localhost:5432/reporium")
 
 
@@ -83,7 +116,7 @@ class Settings(BaseSettings):
     graph_snapshot_cache_ttl_seconds: int = 300
 
     # Auth
-    ingestion_api_key: str
+    ingestion_api_key: str | None = None
 
     # GitHub (for any direct API calls)
     gh_token: str | None = None

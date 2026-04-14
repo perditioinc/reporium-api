@@ -38,6 +38,11 @@ jobs:
           service: reporium-api
           region: us-central1
           source: .
+          env_vars: |-
+            ENVIRONMENT=production
+            GRAPH_SNAPSHOT_BUCKET=perditio-platform-bucket
+            GRAPH_SNAPSHOT_OBJECT=reporium/graph/knowledge-graph.json
+          env_vars_update_strategy: merge
           flags: >-
             --memory=2Gi
             --cpu=1
@@ -45,7 +50,6 @@ jobs:
             --max-instances=10
             --concurrency=200
             --timeout=300
-            --set-env-vars=GRAPH_SNAPSHOT_BUCKET=perditio-platform-bucket,GRAPH_SNAPSHOT_OBJECT=reporium/graph/knowledge-graph.json
             --clear-vpc-connector
 
       - name: Prune old container images (keep latest 5)
