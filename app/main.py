@@ -2,6 +2,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 
 import sentry_sdk
@@ -24,8 +25,18 @@ from app.routers import admin, analytics, compare, dependencies, graph, ingest, 
 from app.telemetry import init_telemetry
 
 
+_EXTRA_FIELDS = frozenset({
+    "method", "path", "status_code", "duration_ms",
+    "request_id", "trace_id", "user_id", "route",
+})
+
+
 class _JsonFormatter(logging.Formatter):
-    """Emit each log record as a single-line JSON object for Cloud Run structured logging."""
+    """Emit each log record as a single-line JSON object for Cloud Run structured logging.
+
+    Includes all structured extra fields so Cloud Logging can index them,
+    plus the Cloud Trace ID for cross-service correlation.
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         payload = {
@@ -34,6 +45,10 @@ class _JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
             "logger": record.name,
         }
+        # Merge any extra structured fields attached by callers
+        for field in _EXTRA_FIELDS:
+            if hasattr(record, field):
+                payload[field] = getattr(record, field)
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload)
@@ -237,6 +252,12 @@ app.add_middleware(
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.perf_counter()
+    request_id = str(uuid.uuid4())[:8]
+
+    # Extract Cloud Trace ID for cross-service correlation in Cloud Logging
+    trace_header = request.headers.get("X-Cloud-Trace-Context", "")
+    trace_id = trace_header.split("/")[0] if trace_header else None
+
     response = await call_next(request)
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
     # Record against rolling SLO histogram (no-op for untracked routes).
@@ -257,15 +278,16 @@ async def log_requests(request: Request, call_next):
     safe_path = request.url.path
     if request.url.query:
         safe_path = f"{safe_path}?<redacted>"
-    logger.info(
-        "request",
-        extra={
-            "method": request.method,
-            "path": safe_path,
-            "status_code": response.status_code,
-            "duration_ms": duration_ms,
-        },
-    )
+    extra: dict = {
+        "request_id": request_id,
+        "method": request.method,
+        "path": safe_path,
+        "status_code": response.status_code,
+        "duration_ms": duration_ms,
+    }
+    if trace_id:
+        extra["trace_id"] = trace_id
+    logger.info("request", extra=extra)
     return response
 
 
