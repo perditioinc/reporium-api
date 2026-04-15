@@ -1212,6 +1212,158 @@ async def invalidate_graph_cache(
     return {"invalidated": ["graph_edges:*", "graph_clusters:*", "graph_clusters"]}
 
 
+@router.post("/admin/graph/rebuild-snapshot", response_model=dict)
+async def rebuild_graph_snapshot(
+    db: AsyncSession = Depends(get_db),
+    _admin_key: None = Depends(require_admin_key),
+) -> dict:
+    """Rebuild the GCS knowledge-graph snapshot from live DB data.
+
+    Queries repo_embeddings (pgvector) and repo_edges, builds snapshot JSON v1,
+    uploads to GCS, then invalidates Redis cache.  Call from Nightly Graph Build
+    workflow instead of running a separate script that needs direct DB access.
+    """
+    from datetime import timezone
+    import math
+    from app.graph_snapshot import load_graph_snapshot
+    from app.config import settings
+
+    if not settings.graph_snapshot_bucket:
+        raise HTTPException(status_code=503, detail="Graph snapshot GCS not configured")
+
+    # 1. Fetch all public repos
+    repo_rows = await db.execute(text("""
+        SELECT id, name, owner, description, primary_category,
+               COALESCE(parent_stars, stargazers_count, 0) AS stars,
+               updated_at, quality_signals
+        FROM repos WHERE is_private = false ORDER BY id
+    """))
+    repos = repo_rows.fetchall()
+
+    node_index: dict[int, dict] = {}
+    for row in repos:
+        quality = None
+        if row.quality_signals and isinstance(row.quality_signals, dict):
+            quality = row.quality_signals.get("quality")
+        node_index[row.id] = {
+            "repo_id": row.id,
+            "name": row.name,
+            "owner": row.owner,
+            "description": row.description,
+            "primary_category": row.primary_category,
+            "stars": int(row.stars or 0),
+            "stars_log": round(math.log10(max(int(row.stars or 0), 1)), 4),
+            "quality": quality,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+
+    # 2. Similarity edges via pgvector HNSW
+    sim_result = await db.execute(text("""
+        WITH ranked AS (
+            SELECT e1.repo_id AS source_id, e2.repo_id AS target_id,
+                   1 - (e1.embedding_vec <=> e2.embedding_vec) AS similarity,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY e1.repo_id
+                       ORDER BY e1.embedding_vec <=> e2.embedding_vec
+                   ) AS rank
+            FROM repo_embeddings e1
+            CROSS JOIN LATERAL (
+                SELECT e2_inner.repo_id, e2_inner.embedding_vec
+                FROM repo_embeddings e2_inner
+                WHERE e2_inner.repo_id != e1.repo_id
+                ORDER BY e1.embedding_vec <=> e2_inner.embedding_vec
+                LIMIT 8
+            ) e2
+            WHERE 1 - (e1.embedding_vec <=> e2.embedding_vec) >= 0.50
+        )
+        SELECT DISTINCT ON (LEAST(source_id, target_id), GREATEST(source_id, target_id))
+            source_id, target_id, similarity, rank
+        FROM ranked
+        ORDER BY LEAST(source_id, target_id), GREATEST(source_id, target_id), similarity DESC
+        LIMIT 20000
+    """))
+    sim_rows = sim_result.fetchall()
+    similarity_edges = [
+        {"source_repo_id": r.source_id, "target_repo_id": r.target_id,
+         "weight": round(float(r.similarity), 4), "rank": int(r.rank)}
+        for r in sim_rows
+        if r.source_id in node_index and r.target_id in node_index
+    ]
+
+    # 3. Typed edges from repo_edges
+    typed_result = await db.execute(text("""
+        SELECT source_repo_id, target_repo_id, edge_type, COALESCE(weight, 0.5) as weight
+        FROM repo_edges ORDER BY weight DESC
+    """))
+    typed_cap = 2000
+    type_counts: dict[str, int] = {}
+    typed_edges = []
+    for row in typed_result.fetchall():
+        if row.source_repo_id not in node_index or row.target_repo_id not in node_index:
+            continue
+        if row.edge_type == "SIMILAR_TO":
+            continue
+        cnt = type_counts.get(row.edge_type, 0)
+        if cnt >= typed_cap:
+            continue
+        typed_edges.append({
+            "source_repo_id": row.source_repo_id, "target_repo_id": row.target_repo_id,
+            "edge_type": row.edge_type, "weight": round(float(row.weight), 4),
+        })
+        type_counts[row.edge_type] = cnt + 1
+
+    # 4. Build + upload snapshot
+    repos_with_emb = len({e["source_repo_id"] for e in similarity_edges} |
+                         {e["target_repo_id"] for e in similarity_edges})
+    from datetime import datetime
+    snapshot = {
+        "snapshot_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "nodes": list(node_index.values()),
+        "similarity_edges": similarity_edges,
+        "typed_edges": typed_edges,
+        "parameters": {"min_similarity": 0.50, "max_neighbours": 8, "typed_cap_per_type": typed_cap},
+        "stats": {
+            "total_public_repos": len(node_index),
+            "repos_with_embeddings": repos_with_emb,
+            "similarity_edges": len(similarity_edges),
+            "typed_edges": len(typed_edges),
+            "typed_edge_breakdown": type_counts,
+        },
+    }
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False, default=str).encode("utf-8")
+
+    def _upload():
+        from google.cloud import storage
+        client = storage.Client(project=settings.gcp_project)
+        blob = client.bucket(settings.graph_snapshot_bucket).blob(settings.graph_snapshot_object)
+        blob.upload_from_string(snapshot_json, content_type="application/json")
+
+    await asyncio.to_thread(_upload)
+
+    # 5. Invalidate Redis cache
+    await cache.invalidate("graph_edges:*")
+    await cache.invalidate("graph_clusters:*")
+    await cache.invalidate("graph_clusters")
+
+    # 6. Force snapshot reload on next request
+    from app import graph_snapshot as gs
+    gs._snapshot_cache = None
+    gs._snapshot_cache_loaded_at = 0.0
+
+    size_kb = len(snapshot_json) // 1024
+    return {
+        "status": "ok",
+        "nodes": len(node_index),
+        "similarity_edges": len(similarity_edges),
+        "typed_edges": len(typed_edges),
+        "typed_edge_breakdown": type_counts,
+        "size_kb": size_kb,
+        "bucket": settings.graph_snapshot_bucket,
+        "object": settings.graph_snapshot_object,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Issue #238 — ask_sessions retention + right-to-be-forgotten (RTBF)
 # ---------------------------------------------------------------------------
