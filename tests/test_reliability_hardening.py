@@ -27,15 +27,17 @@ class TestPoolSizing:
 
     def test_pool_size_is_set(self):
         src = self._get_database_source()
-        assert "pool_size=20" in src, "database.py must set pool_size=20"
+        # pool_size=5: Cloud SQL f1-micro has max_connections=25; 5+2 overflow per
+        # instance keeps the total under 25 even with 3 concurrent Cloud Run instances.
+        assert "pool_size=5" in src, "database.py must set pool_size=5 (f1-micro max_connections=25 constraint)"
 
     def test_max_overflow_is_set(self):
         src = self._get_database_source()
-        assert "max_overflow=10" in src, "database.py must set max_overflow=10"
+        assert "max_overflow=2" in src, "database.py must set max_overflow=2 (f1-micro constraint)"
 
     def test_pool_recycle_is_set(self):
         src = self._get_database_source()
-        assert "pool_recycle=3600" in src, "database.py must set pool_recycle=3600"
+        assert "pool_recycle=1800" in src, "database.py must set pool_recycle=1800"
 
     def test_pool_pre_ping_is_enabled(self):
         src = self._get_database_source()
