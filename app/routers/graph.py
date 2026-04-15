@@ -441,6 +441,58 @@ async def get_graph_edges(
         except Exception as exc:
             logger.warning("Graph snapshot build failed; falling back to live DB: %s", exc)
         else:
+            # Merge typed edges (DEPENDS_ON etc.) from repo_edges DB table into snapshot payload.
+            # The GCS snapshot only has similarity_edges; repo_edges holds all typed edges.
+            try:
+                typed_sql = text("""
+                    SELECT re.edge_type, re.weight, re.metadata,
+                           r1.name AS source_name, r1.owner AS source_owner,
+                           r1.description AS source_desc, r1.primary_category AS source_cat,
+                           r1.stargazers_count AS source_stars, r1.quality_signals AS source_qs,
+                           r2.name AS target_name, r2.owner AS target_owner,
+                           r2.description AS target_desc, r2.primary_category AS target_cat,
+                           r2.stargazers_count AS target_stars, r2.quality_signals AS target_qs
+                    FROM repo_edges re
+                    JOIN repos r1 ON r1.id = re.source_repo_id AND r1.is_private = false
+                    JOIN repos r2 ON r2.id = re.target_repo_id AND r2.is_private = false
+                    WHERE re.edge_type IN ('DEPENDS_ON', 'ALTERNATIVE_TO', 'COMPATIBLE_WITH', 'EXTENDS')
+                    ORDER BY re.weight DESC NULLS LAST
+                    LIMIT 2000
+                """)
+                typed_rows = (await db.execute(typed_sql)).fetchall()
+                if typed_rows:
+                    existing_pairs = {
+                        (e["source"]["name"], e["target"]["name"])
+                        for e in snapshot_payload.get("edges", [])
+                    }
+                    new_edges = []
+                    seen_in_typed: set[tuple] = set()
+                    for tr in typed_rows:
+                        pair = (tr.source_name, tr.target_name)
+                        if pair in existing_pairs or pair in seen_in_typed:
+                            continue
+                        seen_in_typed.add(pair)
+                        new_edges.append({
+                            "edgeType": tr.edge_type,
+                            "weight": round(float(tr.weight or 0.5), 4),
+                            "evidence": None,
+                            "source": {
+                                "name": tr.source_name, "owner": tr.source_owner,
+                                "description": tr.source_desc, "category": tr.source_cat,
+                            },
+                            "target": {
+                                "name": tr.target_name, "owner": tr.target_owner,
+                                "description": tr.target_desc, "category": tr.target_cat,
+                            },
+                        })
+                    if new_edges:
+                        snapshot_payload["edges"] = snapshot_payload.get("edges", []) + new_edges
+                        # Update edgeTypes list
+                        all_types = list({e["edgeType"] for e in snapshot_payload["edges"]})
+                        snapshot_payload["edgeTypes"] = all_types
+                        snapshot_payload["total"] = len(snapshot_payload["edges"])
+            except Exception as merge_exc:
+                logger.warning("Could not merge typed edges from DB into snapshot: %s", merge_exc)
             await redis_cache.set(cache_key, snapshot_payload, ttl=CACHE_TTL_GRAPH_EDGES)
             return _json_graph_response(snapshot_payload)
 
