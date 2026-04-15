@@ -5,10 +5,17 @@ from fastapi.security import HTTPAuthorizationCredentials
 import app.auth as auth
 
 
+@pytest.fixture(autouse=True)
+def clean_ingest_env(monkeypatch):
+    """Ensure no env var leaks between ingest-auth tests."""
+    monkeypatch.delenv("INGEST_API_KEY", raising=False)
+    monkeypatch.delenv("INGESTION_API_KEY", raising=False)
+    monkeypatch.setattr(auth.settings, "ingestion_api_key", None)
+    yield
+
+
 @pytest.mark.asyncio
 async def test_verify_api_key_accepts_ingest_api_key_alias(monkeypatch):
-    monkeypatch.setattr(auth.settings, "ingestion_api_key", None)
-    monkeypatch.delenv("INGESTION_API_KEY", raising=False)
     monkeypatch.setenv("INGEST_API_KEY", "secret-ingest")
 
     credentials = HTTPAuthorizationCredentials(
@@ -22,8 +29,6 @@ async def test_verify_api_key_accepts_ingest_api_key_alias(monkeypatch):
 @pytest.mark.asyncio
 async def test_require_ingest_key_accepts_ingestion_api_key_alias(monkeypatch):
     monkeypatch.setattr(auth, "_IS_PRODUCTION", True)
-    monkeypatch.setattr(auth.settings, "ingestion_api_key", None)
-    monkeypatch.delenv("INGEST_API_KEY", raising=False)
     monkeypatch.setenv("INGESTION_API_KEY", "secret-ingest")
 
     assert await auth.require_ingest_key(
@@ -33,11 +38,8 @@ async def test_require_ingest_key_accepts_ingestion_api_key_alias(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_verify_api_key_returns_500_when_ingest_key_missing(monkeypatch):
-    monkeypatch.setattr(auth.settings, "ingestion_api_key", None)
-    monkeypatch.delenv("INGESTION_API_KEY", raising=False)
-    monkeypatch.delenv("INGEST_API_KEY", raising=False)
-
+async def test_verify_api_key_returns_500_when_ingest_key_missing():
+    # clean_ingest_env (autouse) already clears INGEST_API_KEY, INGESTION_API_KEY, settings
     credentials = HTTPAuthorizationCredentials(
         scheme="Bearer",
         credentials="anything",
