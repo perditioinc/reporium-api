@@ -61,7 +61,7 @@ jobs:
             ENVIRONMENT=production
             GRAPH_SNAPSHOT_BUCKET=perditio-platform-bucket
             GRAPH_SNAPSHOT_OBJECT=reporium/graph/knowledge-graph.json
-            EMBEDDINGS_AVAILABLE=false
+            EMBEDDINGS_AVAILABLE=true
           env_vars_update_strategy: merge
           flags: >-
             --memory=2Gi
@@ -156,6 +156,11 @@ jobs:
                   edge_count = len(payload.get("edges") or [])
                   if edge_count <= 0:
                       raise RuntimeError(f"graph endpoint returned no edges: {payload}")
+                  edge_types = payload.get("edgeTypes", [])
+                  depends_on_count = sum(
+                      1 for e in (payload.get("edges") or [])
+                      if e.get("edgeType") == "DEPENDS_ON"
+                  )
                   print(
                       "Graph smoke check passed:",
                       {
@@ -163,8 +168,18 @@ jobs:
                           "edge_count": edge_count,
                           "graph_source": payload.get("graph_source"),
                           "total_repos": payload.get("total_repos"),
+                          "edge_types": edge_types,
+                          "depends_on_in_sample": depends_on_count,
                       },
                   )
+                  # Regression guard: DEPENDS_ON edges must be present after nightly rebuild.
+                  # Warn if < 50 in sample (snapshot may not be rebuilt yet on first deploy).
+                  if "DEPENDS_ON" not in edge_types:
+                      print("::warning::DEPENDS_ON not in edgeTypes — snapshot may need rebuild via POST /admin/graph/rebuild-snapshot")
+                  elif depends_on_count < 50:
+                      print(f"::warning::Only {depends_on_count} DEPENDS_ON edges in 200-edge sample — run nightly graph build to backfill")
+                  else:
+                      print(f"DEPENDS_ON guard passed: {depends_on_count} edges in sample")
                   break
               except (urllib.error.URLError, urllib.error.HTTPError, RuntimeError, json.JSONDecodeError) as exc:
                   last_error = exc
