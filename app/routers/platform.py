@@ -494,6 +494,15 @@ async def metrics_latest(
     }
 
 
+@router.get("/platform/metrics", response_model=dict, include_in_schema=False)
+async def platform_metrics_alias(
+    db: AsyncSession = Depends(get_db),
+    _gate: None = Depends(require_metrics_access),
+) -> dict:
+    """Legacy alias for /metrics/latest — kept for Workato connector compatibility."""
+    return await metrics_latest(db=db, _gate=_gate)
+
+
 @router.get("/audit/status", response_model=dict)
 async def audit_status(
     db: AsyncSession = Depends(get_db),
