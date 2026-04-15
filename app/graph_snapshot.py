@@ -210,11 +210,29 @@ def build_graph_payload_from_snapshot(
             "_node_ids": (source_id, target_id),
         }
 
-    edges = sorted(
+    # Apply per-type cap before final limit so ALTERNATIVE_TO (46k edges @ weight=1.0)
+    # cannot crowd out DEPENDS_ON (~111 edges) and COMPATIBLE_WITH.
+    # Each typed type gets up to 40% of limit; SIMILAR_TO fills the rest.
+    typed_cap = max(200, limit // 5)
+    all_edges_sorted = sorted(
         edges_by_pair.values(),
         key=lambda edge: (float(edge["weight"]), edge["edgeType"] != "SIMILAR_TO"),
         reverse=True,
-    )[:limit]
+    )
+    per_type_counts: dict[str, int] = {}
+    balanced: list[dict] = []
+    deferred_similar: list[dict] = []
+    for edge in all_edges_sorted:
+        et = edge["edgeType"]
+        if et == "SIMILAR_TO":
+            deferred_similar.append(edge)
+        else:
+            if per_type_counts.get(et, 0) < typed_cap:
+                balanced.append(edge)
+                per_type_counts[et] = per_type_counts.get(et, 0) + 1
+    remaining = limit - len(balanced)
+    balanced.extend(deferred_similar[:max(0, remaining)])
+    edges = balanced[:limit]
 
     included_node_ids: set[str] = set()
     for edge in edges:
