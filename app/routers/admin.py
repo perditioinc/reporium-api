@@ -387,9 +387,9 @@ async def backfill_embeddings(
             async with db.begin_nested():  # savepoint per row
                 await db.execute(text(
                     """
-                    INSERT INTO repo_embeddings (repo_id, embedding, model, generated_at, embedding_vec)
-                    VALUES (:repo_id, :embedding, 'all-MiniLM-L6-v2', NOW(), CAST(:embedding_vec AS vector))
-                    ON CONFLICT (repo_id) DO UPDATE
+                    INSERT INTO repo_embeddings (repo_id, embedding, model, generated_at, embedding_vec, is_current)
+                    VALUES (:repo_id, :embedding, 'all-MiniLM-L6-v2', NOW(), CAST(:embedding_vec AS vector), TRUE)
+                    ON CONFLICT (repo_id) WHERE is_current = TRUE DO UPDATE
                         SET embedding = EXCLUDED.embedding,
                             embedding_vec = EXCLUDED.embedding_vec,
                             generated_at = NOW()
