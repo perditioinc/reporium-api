@@ -589,7 +589,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             result = await db.execute(text("""
                 SELECT name, owner, description, primary_category,
                        COALESCE(parent_stars, stargazers_count, 0) as stars,
-                       language, forked_from, readme_summary, problem_solved,
+                       primary_language AS language, forked_from, readme_summary, problem_solved,
                        license_spdx
                 FROM repos
                 WHERE is_private = false
@@ -633,7 +633,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         lang = m.group("lang").strip()
         result = await db.execute(text("""
             SELECT COUNT(*) FROM repos
-            WHERE is_private = false AND LOWER(language) = LOWER(:lang)
+            WHERE is_private = false AND LOWER(primary_language) = LOWER(:lang)
         """), {"lang": lang})
         count = result.scalar()
         return {
@@ -646,10 +646,10 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
     m = _ROUTE_LIST_LANGUAGES.match(q)
     if m:
         result = await db.execute(text("""
-            SELECT language, COUNT(*) as cnt
+            SELECT primary_language AS language, COUNT(*) as cnt
             FROM repos
-            WHERE is_private = false AND language IS NOT NULL
-            GROUP BY language
+            WHERE is_private = false AND primary_language IS NOT NULL
+            GROUP BY primary_language
             ORDER BY cnt DESC
             LIMIT 20
         """))
@@ -687,7 +687,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
                    primary_category, description
             FROM repos
-            WHERE is_private = false AND LOWER(language) = LOWER(:lang)
+            WHERE is_private = false AND LOWER(primary_language) = LOWER(:lang)
             ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
             LIMIT 15
         """), {"lang": lang})
@@ -767,7 +767,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             SELECT
                 COUNT(*) as total,
                 COUNT(DISTINCT primary_category) as categories,
-                COUNT(DISTINCT language) FILTER (WHERE language IS NOT NULL) as languages,
+                COUNT(DISTINCT primary_language) FILTER (WHERE primary_language IS NOT NULL) as languages,
                 SUM(COALESCE(parent_stars, stargazers_count, 0)) as total_stars,
                 COUNT(*) FILTER (WHERE forked_from IS NOT NULL) as forked,
                 COUNT(*) FILTER (WHERE forked_from IS NULL) as original
@@ -794,7 +794,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         name_a, name_b = m.group(1).strip(), m.group(2).strip()
         result_a = await db.execute(text("""
             SELECT name, owner, description, readme_summary, problem_solved,
-                   primary_category, language,
+                   primary_category, primary_language AS language,
                    COALESCE(parent_stars, stargazers_count, 0) as stars,
                    license_spdx, activity_score, has_tests, has_ci
             FROM repos
@@ -804,7 +804,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """), {"name": f"%{name_a}%"})
         result_b = await db.execute(text("""
             SELECT name, owner, description, readme_summary, problem_solved,
-                   primary_category, language,
+                   primary_category, primary_language AS language,
                    COALESCE(parent_stars, stargazers_count, 0) as stars,
                    license_spdx, activity_score, has_tests, has_ci
             FROM repos
@@ -2102,7 +2102,7 @@ async def _prepare_query(
             text("""
                 SELECT r.id, r.name, r.owner, r.forked_from, r.description,
                        r.parent_stars, r.readme_summary, r.problem_solved,
-                       r.primary_category, r.language, r.license_spdx,
+                       r.primary_category, r.primary_language AS language, r.license_spdx,
                        r.activity_score, r.has_tests, r.has_ci,
                        1 - (e.embedding_vec <=> CAST(:vec AS vector)) AS similarity
                 FROM repo_embeddings e
