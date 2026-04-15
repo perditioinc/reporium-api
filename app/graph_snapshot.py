@@ -234,13 +234,16 @@ def build_graph_payload_from_snapshot(
     balanced.extend(deferred_similar[:max(0, remaining)])
     edges = balanced[:limit]
 
-    included_node_ids: set[str] = set()
+    # Drop internal tracking field; we include ALL snapshot nodes below so
+    # isolated repos (no edges above threshold) still render in the graph.
     for edge in edges:
-        source_id, target_id = edge.pop("_node_ids")
-        included_node_ids.add(source_id)
-        included_node_ids.add(target_id)
+        edge.pop("_node_ids", None)
 
-    included_nodes = [_node_to_viz(node_index[node_id]) for node_id in included_node_ids]
+    # KAN-XX: include every public repo in the response, not just those with
+    # edges. Previously isolated repos were filtered out, reducing the
+    # rendered graph from 1,641 → ~1,307 nodes. Force-layout on the frontend
+    # places edgeless nodes at the periphery.
+    included_nodes = [_node_to_viz(node) for node in node_index.values()]
 
     stats = snapshot.get("stats", {})
     return {
