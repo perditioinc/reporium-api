@@ -14,9 +14,12 @@ engine = create_async_engine(
     settings.database_url,
     echo=settings.environment == "development",
     pool_pre_ping=True,
-    pool_size=20,
-    max_overflow=10,
-    pool_recycle=3600,
+    # db-f1-micro has max_connections=25. Keep pool small so multiple Cloud Run
+    # instances don't exhaust connections. 5 + 2 overflow = 7 per instance;
+    # at max 3 concurrent instances that is 21 — well under the limit.
+    pool_size=5,
+    max_overflow=2,
+    pool_recycle=1800,
 )
 
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
