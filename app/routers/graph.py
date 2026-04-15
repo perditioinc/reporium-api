@@ -400,7 +400,10 @@ async def _build_graph_payload_from_db(
 @_limiter.limit("20/minute")
 async def get_graph_edges(
     request: Request,
-    limit: int = Query(default=500, ge=1, le=10000),
+    # No upper-bound cap: this API sits behind NEXT_PUBLIC_APP_API_TOKEN and
+    # middleware rate-limiting, so callers may request the full edge set.
+    # "Show all" means all — do not introduce a new ceiling here.
+    limit: int = Query(default=500, ge=1),
     min_similarity: float = Query(default=0.55, ge=0.0, le=1.0,
                                   description="Minimum cosine similarity threshold"),
     neighbours: int = Query(default=8, ge=1, le=30,
