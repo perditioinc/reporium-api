@@ -133,6 +133,9 @@ class Settings(BaseSettings):
     # Mode
     environment: str = "development"  # development, production
 
+    # Feature flags
+    embeddings_available: bool = True  # Set to false when repo_embeddings table is empty (post-migration rebuild)
+
     # KAN-ask-spend: soft daily budget surfaced via /metrics/spend.
     # Purely advisory — hard cap still lives in app.cost_tracker (Redis-backed).
     # Not wired into deploy workflow env vars; defaults are fine for prod.
