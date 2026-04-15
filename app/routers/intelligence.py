@@ -504,9 +504,19 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         }
 
     # --- Count by category ---
+    # KAN-162: `_ROUTE_COUNT_CATEGORY` is greedy and captures queries that are
+    # really about languages ("how many repos use pytorch") or tags
+    # ("how many repos tagged with rag"). Let the more specific language/tag
+    # routes match first; if category DOES match, validate that the captured
+    # phrase actually resembles a real category before running the SQL —
+    # otherwise fall through to the LLM so the user gets a real answer
+    # instead of "No repos found with category 'pytorch'".
     m = _ROUTE_COUNT_CATEGORY.match(q)
-    if m:
+    if m and not _ROUTE_COUNT_LANGUAGE.match(q) and not _ROUTE_COUNT_TAGS.match(q):
         cat_query = m.group("category").strip().lower()
+        # Require an actual row match before claiming this route — if the
+        # captured phrase doesn't exist as a primary_category substring, let
+        # downstream routes or the LLM handle the question.
         result = await db.execute(text("""
             SELECT primary_category, COUNT(*) as cnt
             FROM repos
@@ -524,11 +534,9 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
                 "sources": [],
                 "route": "count_category",
             }
-        return {
-            "answer": f"No repos found with a category matching \"{cat_query}\". Try browsing categories on the home page.",
-            "sources": [],
-            "route": "count_category",
-        }
+        # No category matches — do NOT respond "no repos found"; fall through
+        # to LLM so questions like "how many repos use pytorch" get a real
+        # answer instead of a dead-end.
 
     # --- List categories ---
     m = _ROUTE_LIST_CATEGORIES.match(q)
