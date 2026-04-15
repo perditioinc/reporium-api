@@ -26,11 +26,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Start Cloud SQL Proxy for migrations
+        run: |
+          curl -sSLo cloud-sql-proxy \
+            https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.13.0/cloud-sql-proxy.linux.amd64
+          chmod +x cloud-sql-proxy
+          # Private IP only — proxy will fail if runner can't reach private VPC range.
+          # This is expected for GitHub-hosted runners. Migrations run via Cloud Run Job.
+          ./cloud-sql-proxy --port 5432 --private-ip \
+            perditio-platform:us-central1:reporium-db &
+          sleep 5
+          echo "Cloud SQL Proxy started (PID $!)"
+
       - name: Apply database migrations
+        continue-on-error: true
         env:
           ENVIRONMENT: production
           GCP_PROJECT: perditio-platform
-        run: alembic upgrade head
+          DATABASE_URL: postgresql+asyncpg://postgres:${{ secrets.CLOUDSQL_PG_PASS }}@127.0.0.1:5432/reporium
+        run: |
+          # Migrations run against local proxy (port 5432).
+          # On GitHub-hosted runners the proxy cannot reach the private Cloud SQL IP,
+          # so this step is best-effort. Run migrations manually via the
+          # reporium-alembic Cloud Run Job when adding new migrations.
+          alembic upgrade head || echo "Migration step skipped (runner cannot reach private Cloud SQL)"
 
       - uses: google-github-actions/deploy-cloudrun@v2
         id: deploy
@@ -42,6 +61,7 @@ jobs:
             ENVIRONMENT=production
             GRAPH_SNAPSHOT_BUCKET=perditio-platform-bucket
             GRAPH_SNAPSHOT_OBJECT=reporium/graph/knowledge-graph.json
+            EMBEDDINGS_AVAILABLE=false
           env_vars_update_strategy: merge
           flags: >-
             --memory=2Gi
@@ -50,7 +70,11 @@ jobs:
             --max-instances=10
             --concurrency=200
             --timeout=300
-            --clear-vpc-connector
+            --add-cloudsql-instances=perditio-platform:us-central1:reporium-db
+            --execution-environment=gen2
+            --network=default
+            --subnet=default
+            --vpc-egress=private-ranges-only
 
       - name: Prune old container images (keep latest 5)
         if: success()
