@@ -26,9 +26,13 @@ WINDOW_SECONDS = 24 * 60 * 60
 TRACKED_ROUTES: frozenset[str] = frozenset(
     {
         "/health",
+        "/library",
         "/library/full",
+        "/graph/edges",
+        "/graph/edges/search",
         "/intelligence/ask",
         "/intelligence/nl-filter",
+        "/stats",
     }
 )
 

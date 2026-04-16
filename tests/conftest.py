@@ -14,9 +14,19 @@ os.environ["REDIS_URL"] = ""  # disable Redis in tests
 os.environ["RATELIMIT_ENABLED"] = "0"  # disable rate limiting in tests
 os.environ["ENVIRONMENT"] = "test"  # skip embedding model pre-warm in tests
 
+import importlib
+
 import app.database as db_module
 from app.database import Base, get_db
 from app.main import app
+
+# Ensure all ORM models are imported so Base.metadata.create_all() creates
+# every table, including ones not transitively imported by main.py at startup.
+importlib.import_module("app.models.query_log")
+importlib.import_module("app.models.audit_log")
+importlib.import_module("app.models.dependency")
+importlib.import_module("app.models.mention")
+importlib.import_module("app.models.session")
 
 TEST_API_KEY = "test-api-key"
 AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
@@ -30,7 +40,12 @@ async def _setup_db():
     # NullPool: no connection pooling → each session gets a fresh connection.
     # This prevents "Future attached to a different loop" errors when pytest-asyncio
     # creates a new event loop per test while the engine is session-scoped.
-    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=NullPool)
+    db_module.engine = create_async_engine(
+        TEST_DB_URL,
+        echo=False,
+        poolclass=NullPool,
+        connect_args={"command_timeout": 30},
+    )
     db_module.async_session_factory.configure(bind=db_module.engine)
 
     async with db_module.engine.begin() as conn:
@@ -46,10 +61,47 @@ async def _setup_db():
         await conn.execute(
             text("ALTER TABLE repo_embeddings ADD COLUMN IF NOT EXISTS embedding_vec vector(384)")
         )
+        # Create repo_edges table (managed outside ORM by build_knowledge_graph.py)
+        await conn.execute(
+            text("""
+                CREATE TABLE IF NOT EXISTS repo_edges (
+                    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+                    source_repo_id UUID NOT NULL REFERENCES repos(id),
+                    target_repo_id UUID NOT NULL REFERENCES repos(id),
+                    edge_type TEXT NOT NULL,
+                    weight FLOAT DEFAULT 1.0,
+                    evidence JSONB DEFAULT '{}',
+                    created_at TIMESTAMPTZ DEFAULT NOW(),
+                    UNIQUE(source_repo_id, target_repo_id, edge_type)
+                )
+            """)
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS idx_repo_edges_source ON repo_edges(source_repo_id)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS idx_repo_edges_target ON repo_edges(target_repo_id)")
+        )
+        await conn.execute(
+            text("CREATE INDEX IF NOT EXISTS idx_repo_edges_type ON repo_edges(edge_type)")
+        )
+        # query_log.question_embedding_vec is added by migration in production;
+        # the ORM model doesn't include it, so we add it manually here.
+        await conn.execute(
+            text("ALTER TABLE query_log ADD COLUMN IF NOT EXISTS question_embedding_vec vector(384)")
+        )
     yield
     await db_module.engine.dispose()
-    db_module.engine = create_async_engine(TEST_DB_URL, echo=False, poolclass=NullPool)
+    db_module.engine = create_async_engine(
+        TEST_DB_URL,
+        echo=False,
+        poolclass=NullPool,
+        connect_args={"command_timeout": 30},
+    )
     async with db_module.engine.begin() as conn:
+        # Drop repo_edges first — it has FK constraints to repos and is not
+        # tracked by the ORM, so drop_all() would fail with DependentObjects.
+        await conn.execute(text("DROP TABLE IF EXISTS repo_edges CASCADE"))
         await conn.run_sync(Base.metadata.drop_all)
     await db_module.engine.dispose()
 

@@ -22,9 +22,10 @@ from slowapi.util import get_remote_address
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.cache import cache
+from app.cache import cache as redis_cache
 from app.database import get_db
 from app.embeddings import get_embedding_model
+from app.graph_snapshot import build_graph_payload_from_snapshot, load_graph_snapshot
 from app.rate_limit import rate_limit_storage
 from app.utils import vec_to_pg
 
@@ -63,9 +64,13 @@ def _parse_since(since: str | None) -> str | None:
 
 def _log_scale_stars(stars: int | None) -> float:
     """Return a log-scaled star value for node sizing (0.0 when no stars)."""
-    if not stars or stars <= 0:
+    try:
+        stars_value = int(stars or 0)
+    except (TypeError, ValueError):
         return 0.0
-    return round(math.log10(stars + 1), 4)
+    if stars_value <= 0:
+        return 0.0
+    return round(math.log10(stars_value + 1), 4)
 
 
 def _extract_quality(quality_signals: dict | None) -> float | None:
@@ -73,12 +78,19 @@ def _extract_quality(quality_signals: dict | None) -> float | None:
 
     Returns the ``overall`` key if present, else None.
     """
-    if not quality_signals:
+    if not isinstance(quality_signals, dict):
         return None
     overall = quality_signals.get("overall")
     if overall is not None:
         return round(float(overall), 4)
     return None
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _rows_to_edges(rows) -> list[dict]:
@@ -127,11 +139,257 @@ def _rows_to_nodes(rows) -> list[dict]:
                     "owner": getattr(row, f"{prefix}_owner"),
                     "description": getattr(row, f"{prefix}_description"),
                     "primary_category": getattr(row, f"{prefix}_category"),
-                    "stars": stars or 0,
+                    "stars": _safe_int(stars),
                     "stars_log": _log_scale_stars(stars),
                     "quality": _extract_quality(qs),
                 }
     return list(node_map.values())
+
+
+def _json_graph_response(payload: dict) -> JSONResponse:
+    response = JSONResponse(content=payload)
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
+
+
+async def _build_graph_payload_from_db(
+    db: AsyncSession,
+    *,
+    limit: int,
+    min_similarity: float,
+    neighbours: int,
+    interval: str | None,
+) -> dict:
+    """DEPRECATED - This function is dead code, never called. Kept for reference only."""
+    # Build optional temporal WHERE clause
+    since_clause = ""
+    if interval:
+        since_clause = (
+            "AND (r1.updated_at >= NOW() - :since_interval::interval "
+            "OR r2.updated_at >= NOW() - :since_interval::interval)"
+        )
+
+    # Use a CTE to find top-K neighbours per repo via HNSW index.
+    # The <=> operator returns cosine distance; 1 - distance = similarity.
+    # We lateral-join to get the K nearest neighbours per repo efficiently.
+    sql = text(f"""
+        WITH ranked AS (
+            SELECT
+                e1.repo_id   AS source_id,
+                e2.repo_id   AS target_id,
+                1 - (e1.embedding_vec <=> e2.embedding_vec) AS similarity
+            FROM repo_embeddings e1
+            CROSS JOIN LATERAL (
+                SELECT e2_inner.repo_id,
+                       e2_inner.embedding_vec
+                FROM repo_embeddings e2_inner
+                WHERE e2_inner.repo_id != e1.repo_id
+                ORDER BY e1.embedding_vec <=> e2_inner.embedding_vec
+                LIMIT :neighbours
+            ) e2
+            WHERE 1 - (e1.embedding_vec <=> e2.embedding_vec) >= :min_sim
+        ),
+        deduped AS (
+            SELECT DISTINCT ON (LEAST(source_id, target_id), GREATEST(source_id, target_id))
+                source_id, target_id, similarity
+            FROM ranked
+            ORDER BY LEAST(source_id, target_id), GREATEST(source_id, target_id),
+                     similarity DESC
+        ),
+        -- Orphan rescue: repos with embeddings but no edges above threshold
+        orphan_edges AS (
+            SELECT DISTINCT ON (LEAST(e1.repo_id, e2.repo_id), GREATEST(e1.repo_id, e2.repo_id))
+                e1.repo_id AS source_id,
+                e2.repo_id AS target_id,
+                1 - (e1.embedding_vec <=> e2.embedding_vec) AS similarity
+            FROM repo_embeddings e1
+            CROSS JOIN LATERAL (
+                SELECT e2_inner.repo_id,
+                       e2_inner.embedding_vec
+                FROM repo_embeddings e2_inner
+                WHERE e2_inner.repo_id != e1.repo_id
+                ORDER BY e1.embedding_vec <=> e2_inner.embedding_vec
+                LIMIT 1
+            ) e2
+            WHERE NOT EXISTS (
+                SELECT 1 FROM deduped d
+                WHERE d.source_id = e1.repo_id OR d.target_id = e1.repo_id
+            )
+            ORDER BY LEAST(e1.repo_id, e2.repo_id), GREATEST(e1.repo_id, e2.repo_id),
+                     similarity DESC
+        ),
+        all_edges AS (
+            SELECT source_id, target_id, similarity FROM deduped
+            UNION
+            SELECT source_id, target_id, similarity FROM orphan_edges
+        )
+        SELECT
+            ae.similarity,
+            r1.name               AS source_name,
+            r1.description        AS source_description,
+            r1.primary_category   AS source_category,
+            r1.owner              AS source_owner,
+            r1.stargazers_count   AS source_stars,
+            r1.quality_signals    AS source_quality_signals,
+            r1.updated_at         AS source_updated_at,
+            r2.name               AS target_name,
+            r2.description        AS target_description,
+            r2.primary_category   AS target_category,
+            r2.owner              AS target_owner,
+            r2.stargazers_count   AS target_stars,
+            r2.quality_signals    AS target_quality_signals,
+            r2.updated_at         AS target_updated_at
+        FROM all_edges ae
+        JOIN repos r1 ON r1.id = ae.source_id AND r1.is_private = false
+        JOIN repos r2 ON r2.id = ae.target_id AND r2.is_private = false
+        WHERE 1=1 {since_clause}
+        ORDER BY ae.similarity DESC
+        LIMIT :limit
+    """)
+
+    params: dict = {
+        "neighbours": neighbours,
+        "min_sim": min_similarity,
+        "limit": limit,
+    }
+    if interval:
+        params["since_interval"] = interval
+
+    result = await db.execute(sql, params)
+    rows = result.fetchall()
+
+    # Build similarity edges, keyed by (source, target) for dedup
+    edges_by_pair: dict[tuple[str, str], dict] = {}
+    node_map: dict[str, dict] = {}
+
+    for row in rows:
+        key = (row.source_name, row.target_name)
+        if key not in edges_by_pair:
+            edges_by_pair[key] = {
+                "edgeType": "SIMILAR_TO",
+                "weight": round(float(row.similarity), 4),
+                "evidence": None,
+                "source": {
+                    "name": row.source_name, "owner": row.source_owner,
+                    "description": row.source_description, "category": row.source_category,
+                },
+                "target": {
+                    "name": row.target_name, "owner": row.target_owner,
+                    "description": row.target_description, "category": row.target_category,
+                },
+            }
+        if row.source_name not in node_map:
+            node_map[row.source_name] = {
+                "name": row.source_name, "owner": row.source_owner,
+                "description": row.source_description,
+                "primary_category": row.source_category,
+                "stars": _safe_int(row.source_stars),
+                "stars_log": _log_scale_stars(row.source_stars),
+                "quality": _extract_quality(row.source_quality_signals),
+            }
+        if row.target_name not in node_map:
+            node_map[row.target_name] = {
+                "name": row.target_name, "owner": row.target_owner,
+                "description": row.target_description,
+                "primary_category": row.target_category,
+                "stars": _safe_int(row.target_stars),
+                "stars_log": _log_scale_stars(row.target_stars),
+                "quality": _extract_quality(row.target_quality_signals),
+            }
+
+    # Merge typed relationship edges from repo_edges â€” override SIMILAR_TO when same pair
+    try:
+        typed_sql = text("""
+            SELECT
+                re.edge_type,
+                re.weight,
+                r1.name        AS source_name,
+                r1.owner       AS source_owner,
+                r1.description AS source_description,
+                r1.primary_category AS source_category,
+                r1.stargazers_count AS source_stars,
+                r1.quality_signals  AS source_quality_signals,
+                r2.name        AS target_name,
+                r2.owner       AS target_owner,
+                r2.description AS target_description,
+                r2.primary_category AS target_category,
+                r2.stargazers_count AS target_stars,
+                r2.quality_signals  AS target_quality_signals
+            FROM repo_edges re
+            JOIN repos r1 ON r1.id = re.source_repo_id AND r1.is_private = false
+            JOIN repos r2 ON r2.id = re.target_repo_id AND r2.is_private = false
+            WHERE re.edge_type IN ('ALTERNATIVE_TO', 'COMPATIBLE_WITH', 'DEPENDS_ON', 'EXTENDS')
+            ORDER BY re.weight DESC NULLS LAST
+            LIMIT 5000
+        """)
+        typed_result = await db.execute(typed_sql)
+        typed_rows = typed_result.fetchall()
+
+        for trow in typed_rows:
+            if not isinstance(getattr(trow, "edge_type", None), str):
+                continue
+            key = (trow.source_name, trow.target_name)
+            # Typed edge overrides similarity edge for same pair
+            edges_by_pair[key] = {
+                "edgeType": trow.edge_type,
+                "weight": round(float(trow.weight or 0.5), 4),
+                "evidence": None,
+                "source": {
+                    "name": trow.source_name, "owner": trow.source_owner,
+                    "description": trow.source_description, "category": trow.source_category,
+                },
+                "target": {
+                    "name": trow.target_name, "owner": trow.target_owner,
+                    "description": trow.target_description, "category": trow.target_category,
+                },
+            }
+            if trow.source_name not in node_map:
+                node_map[trow.source_name] = {
+                    "name": trow.source_name, "owner": trow.source_owner,
+                    "description": trow.source_description,
+                    "primary_category": trow.source_category,
+                    "stars": _safe_int(trow.source_stars),
+                    "stars_log": _log_scale_stars(trow.source_stars),
+                    "quality": _extract_quality(trow.source_quality_signals),
+                }
+            if trow.target_name not in node_map:
+                node_map[trow.target_name] = {
+                    "name": trow.target_name, "owner": trow.target_owner,
+                    "description": trow.target_description,
+                    "primary_category": trow.target_category,
+                    "stars": _safe_int(trow.target_stars),
+                    "stars_log": _log_scale_stars(trow.target_stars),
+                    "quality": _extract_quality(trow.target_quality_signals),
+                }
+    except Exception as exc:
+        # repo_edges table may not exist yet â€” degrade gracefully
+        logger.warning("Could not fetch typed graph edges: %s", exc)
+
+    edges = list(edges_by_pair.values())
+    nodes = list(node_map.values())
+
+    # Count repos with and without embeddings for diagnostics
+    counts = await db.execute(text("""
+        SELECT
+            (SELECT COUNT(*) FROM repos WHERE is_private = false) AS total_public,
+            (SELECT COUNT(DISTINCT re.repo_id)
+             FROM repo_embeddings re
+             JOIN repos r ON r.id = re.repo_id
+             WHERE r.is_private = false
+               AND re.embedding_vec IS NOT NULL) AS with_embeddings
+    """))
+    count_row = counts.fetchone()
+
+    return {
+        "total": len(edges),
+        "total_repos": len(nodes),
+        "total_public_repos": count_row.total_public if count_row else 0,
+        "repos_with_embeddings": count_row.with_embeddings if count_row else 0,
+        "edgeTypes": sorted({e["edgeType"] for e in edges}),
+        "nodes": nodes,
+        "edges": edges,
+        "graph_source": "database",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -142,7 +400,10 @@ def _rows_to_nodes(rows) -> list[dict]:
 @_limiter.limit("20/minute")
 async def get_graph_edges(
     request: Request,
-    limit: int = Query(default=500, ge=1, le=10000),
+    # No upper-bound cap: this API sits behind NEXT_PUBLIC_APP_API_TOKEN and
+    # middleware rate-limiting, so callers may request the full edge set.
+    # "Show all" means all — do not introduce a new ceiling here.
+    limit: int = Query(default=500, ge=1),
     min_similarity: float = Query(default=0.55, ge=0.0, le=1.0,
                                   description="Minimum cosine similarity threshold"),
     neighbours: int = Query(default=8, ge=1, le=30,
@@ -166,11 +427,27 @@ async def get_graph_edges(
 
     # --- Redis cache check ---
     cache_key = f"graph_edges:{limit}:{min_similarity}:{neighbours}:{since or 'all'}"
-    cached = await cache.get(cache_key)
+    cached = await redis_cache.get(cache_key)
     if cached is not None:
-        response = JSONResponse(content=cached)
-        response.headers["Cache-Control"] = "public, max-age=3600"
-        return response
+        return _json_graph_response(cached)
+
+    snapshot = await load_graph_snapshot()
+    if snapshot is not None:
+        try:
+            snapshot_payload = build_graph_payload_from_snapshot(
+                snapshot,
+                limit=limit,
+                min_similarity=min_similarity,
+                neighbours=neighbours,
+                since_interval=interval,
+            )
+        except Exception as exc:
+            logger.warning("Graph snapshot build failed; falling back to live DB: %s", exc)
+        else:
+            # build_graph_payload_from_snapshot already merges typed_edges from the
+            # snapshot (DEPENDS_ON etc.). No extra DB call needed here.
+            await redis_cache.set(cache_key, snapshot_payload, ttl=CACHE_TTL_GRAPH_EDGES)
+            return _json_graph_response(snapshot_payload)
 
     # Build optional temporal WHERE clause
     since_clause = ""
@@ -294,7 +571,7 @@ async def get_graph_edges(
                 "name": row.source_name, "owner": row.source_owner,
                 "description": row.source_description,
                 "primary_category": row.source_category,
-                "stars": row.source_stars or 0,
+                "stars": _safe_int(row.source_stars),
                 "stars_log": _log_scale_stars(row.source_stars),
                 "quality": _extract_quality(row.source_quality_signals),
             }
@@ -303,40 +580,57 @@ async def get_graph_edges(
                 "name": row.target_name, "owner": row.target_owner,
                 "description": row.target_description,
                 "primary_category": row.target_category,
-                "stars": row.target_stars or 0,
+                "stars": _safe_int(row.target_stars),
                 "stars_log": _log_scale_stars(row.target_stars),
                 "quality": _extract_quality(row.target_quality_signals),
             }
 
-    # Merge typed relationship edges from repo_edges — override SIMILAR_TO when same pair
+    # Merge typed relationship edges from repo_edges — override SIMILAR_TO when same pair.
+    # Use per-type ranked window to prevent any single type from starving the others
+    # (ALTERNATIVE_TO has 46k rows all at weight=1.0 and would fill a flat LIMIT).
     try:
         typed_sql = text("""
+            WITH ranked AS (
+                SELECT
+                    re.edge_type,
+                    re.weight,
+                    r1.name        AS source_name,
+                    r1.owner       AS source_owner,
+                    r1.description AS source_description,
+                    r1.primary_category AS source_category,
+                    r1.stargazers_count AS source_stars,
+                    r1.quality_signals  AS source_quality_signals,
+                    r2.name        AS target_name,
+                    r2.owner       AS target_owner,
+                    r2.description AS target_description,
+                    r2.primary_category AS target_category,
+                    r2.stargazers_count AS target_stars,
+                    r2.quality_signals  AS target_quality_signals,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY re.edge_type
+                        ORDER BY re.weight DESC NULLS LAST
+                    ) AS rn
+                FROM repo_edges re
+                JOIN repos r1 ON r1.id = re.source_repo_id AND r1.is_private = false
+                JOIN repos r2 ON r2.id = re.target_repo_id AND r2.is_private = false
+                WHERE re.edge_type IN ('ALTERNATIVE_TO', 'COMPATIBLE_WITH', 'DEPENDS_ON', 'EXTENDS')
+            )
             SELECT
-                re.edge_type,
-                re.weight,
-                r1.name        AS source_name,
-                r1.owner       AS source_owner,
-                r1.description AS source_description,
-                r1.primary_category AS source_category,
-                r1.stargazers_count AS source_stars,
-                r1.quality_signals  AS source_quality_signals,
-                r2.name        AS target_name,
-                r2.owner       AS target_owner,
-                r2.description AS target_description,
-                r2.primary_category AS target_category,
-                r2.stargazers_count AS target_stars,
-                r2.quality_signals  AS target_quality_signals
-            FROM repo_edges re
-            JOIN repos r1 ON r1.id = re.source_repo_id AND r1.is_private = false
-            JOIN repos r2 ON r2.id = re.target_repo_id AND r2.is_private = false
-            WHERE re.edge_type IN ('ALTERNATIVE_TO', 'COMPATIBLE_WITH', 'DEPENDS_ON', 'EXTENDS')
-            ORDER BY re.weight DESC NULLS LAST
-            LIMIT 5000
+                edge_type, weight,
+                source_name, source_owner, source_description, source_category,
+                source_stars, source_quality_signals,
+                target_name, target_owner, target_description, target_category,
+                target_stars, target_quality_signals
+            FROM ranked
+            WHERE rn <= 2000
+            ORDER BY weight DESC NULLS LAST
         """)
         typed_result = await db.execute(typed_sql)
         typed_rows = typed_result.fetchall()
 
         for trow in typed_rows:
+            if not isinstance(getattr(trow, "edge_type", None), str):
+                continue
             key = (trow.source_name, trow.target_name)
             # Typed edge overrides similarity edge for same pair
             edges_by_pair[key] = {
@@ -357,7 +651,7 @@ async def get_graph_edges(
                     "name": trow.source_name, "owner": trow.source_owner,
                     "description": trow.source_description,
                     "primary_category": trow.source_category,
-                    "stars": trow.source_stars or 0,
+                    "stars": _safe_int(trow.source_stars),
                     "stars_log": _log_scale_stars(trow.source_stars),
                     "quality": _extract_quality(trow.source_quality_signals),
                 }
@@ -366,7 +660,7 @@ async def get_graph_edges(
                     "name": trow.target_name, "owner": trow.target_owner,
                     "description": trow.target_description,
                     "primary_category": trow.target_category,
-                    "stars": trow.target_stars or 0,
+                    "stars": _safe_int(trow.target_stars),
                     "stars_log": _log_scale_stars(trow.target_stars),
                     "quality": _extract_quality(trow.target_quality_signals),
                 }
@@ -385,7 +679,8 @@ async def get_graph_edges(
              FROM repo_embeddings re
              JOIN repos r ON r.id = re.repo_id
              WHERE r.is_private = false
-               AND re.embedding_vec IS NOT NULL) AS with_embeddings
+               AND re.embedding_vec IS NOT NULL) AS with_embeddings,
+            (SELECT COUNT(*) FROM repo_edges) AS total_graph_edges
     """))
     count_row = counts.fetchone()
 
@@ -394,17 +689,16 @@ async def get_graph_edges(
         "total_repos": len(nodes),
         "total_public_repos": count_row.total_public if count_row else 0,
         "repos_with_embeddings": count_row.with_embeddings if count_row else 0,
+        "total_knowledge_graph_edges": count_row.total_graph_edges if count_row else 0,
         "edgeTypes": sorted({e["edgeType"] for e in edges}),
         "nodes": nodes,
         "edges": edges,
     }
 
     # Store in Redis cache
-    await cache.set(cache_key, result_payload, ttl=CACHE_TTL_GRAPH_EDGES)
+    await redis_cache.set(cache_key, result_payload, ttl=CACHE_TTL_GRAPH_EDGES)
 
-    response = JSONResponse(content=result_payload)
-    response.headers["Cache-Control"] = "public, max-age=3600"
-    return response
+    return _json_graph_response(result_payload)
 
 
 # ---------------------------------------------------------------------------
@@ -432,7 +726,7 @@ async def search_graph_edges(
     # --- Redis cache ---
     query_hash = hashlib.sha256(query.lower().strip().encode()).hexdigest()[:16]
     cache_key = f"graph_search:{query_hash}:{top_k}:{neighbours}:{min_similarity}"
-    cached = await cache.get(cache_key)
+    cached = await redis_cache.get(cache_key)
     if cached is not None:
         return cached
 
@@ -519,7 +813,7 @@ async def search_graph_edges(
         "edges": edges,
     }
 
-    await cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_SEARCH)
+    await redis_cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_SEARCH)
     return payload
 
 
@@ -548,7 +842,7 @@ async def get_repo_subgraph(
     Redis cached with 30-min TTL.
     """
     cache_key = f"graph_subgraph:{repo_name}:{neighbours}:{min_similarity}"
-    cached = await cache.get(cache_key)
+    cached = await redis_cache.get(cache_key)
     if cached is not None:
         return cached
 
@@ -676,7 +970,7 @@ async def get_repo_subgraph(
         "edges": edges,
     }
 
-    await cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_SUBGRAPH)
+    await redis_cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_SUBGRAPH)
     return payload
 
 
@@ -698,7 +992,7 @@ async def get_graph_clusters(
     Redis cached with 1-hr TTL.
     """
     cache_key = "graph_clusters"
-    cached = await cache.get(cache_key)
+    cached = await redis_cache.get(cache_key)
     if cached is not None:
         return cached
 
@@ -802,7 +1096,7 @@ async def get_graph_clusters(
         "clusters": cluster_list,
     }
 
-    await cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_CLUSTERS)
+    await redis_cache.set(cache_key, payload, ttl=CACHE_TTL_GRAPH_CLUSTERS)
     return payload
 
 

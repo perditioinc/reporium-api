@@ -13,51 +13,54 @@ import pytest
 
 
 class TestPoolSizing:
-    """Verify the async engine is configured with explicit pool parameters."""
+    """Verify the async engine is configured with explicit pool parameters.
+
+    The test engine uses NullPool (to prevent event-loop issues in pytest-asyncio),
+    so we inspect the database.py source code to confirm the production values are set
+    rather than reading live pool attributes.
+    """
+
+    def _get_database_source(self) -> str:
+        import inspect
+        import app.database as db_module
+        return inspect.getsource(db_module)
 
     def test_pool_size_is_set(self):
-        from app.database import engine
-
-        pool = engine.pool
-        assert pool.size() == 20, f"Expected pool_size=20, got {pool.size()}"
+        src = self._get_database_source()
+        # pool_size=5: Cloud SQL f1-micro has max_connections=25; 5+2 overflow per
+        # instance keeps the total under 25 even with 3 concurrent Cloud Run instances.
+        assert "pool_size=5" in src, "database.py must set pool_size=5 (f1-micro max_connections=25 constraint)"
 
     def test_max_overflow_is_set(self):
-        from app.database import engine
-
-        pool = engine.pool
-        assert pool._max_overflow == 10, f"Expected max_overflow=10, got {pool._max_overflow}"
+        src = self._get_database_source()
+        assert "max_overflow=2" in src, "database.py must set max_overflow=2 (f1-micro constraint)"
 
     def test_pool_recycle_is_set(self):
-        from app.database import engine
-
-        pool = engine.pool
-        assert pool._recycle == 3600, f"Expected pool_recycle=3600, got {pool._recycle}"
+        src = self._get_database_source()
+        assert "pool_recycle=1800" in src, "database.py must set pool_recycle=1800"
 
     def test_pool_pre_ping_is_enabled(self):
-        from app.database import engine
-
-        assert engine.pool._pre_ping is True, "pool_pre_ping should be True"
+        src = self._get_database_source()
+        assert "pool_pre_ping=True" in src, "database.py must set pool_pre_ping=True"
 
 
 class TestTaskDoneCallback:
     """Verify _task_done_callback logs warnings for failed tasks and stays silent for successful ones."""
 
-    def test_logs_warning_for_failed_task(self, caplog):
+    @pytest.mark.asyncio
+    async def test_logs_warning_for_failed_task(self, caplog):
         from app.routers.intelligence import _task_done_callback
 
         async def _failing():
             raise RuntimeError("boom")
 
-        async def _run():
-            task = asyncio.create_task(_failing())
-            try:
-                await task
-            except RuntimeError:
-                pass
-            with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
-                _task_done_callback(task)
-
-        asyncio.get_event_loop().run_until_complete(_run())
+        task = asyncio.create_task(_failing())
+        try:
+            await task
+        except RuntimeError:
+            pass
+        with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
+            _task_done_callback(task)
 
         assert any("boom" in record.message for record in caplog.records), (
             "Expected a warning log containing 'boom'"
@@ -66,42 +69,38 @@ class TestTaskDoneCallback:
             "Expected log message to mention 'Background task'"
         )
 
-    def test_no_log_for_successful_task(self, caplog):
+    @pytest.mark.asyncio
+    async def test_no_log_for_successful_task(self, caplog):
         from app.routers.intelligence import _task_done_callback
 
         async def _ok():
             return 42
 
-        async def _run():
-            task = asyncio.create_task(_ok())
-            await task
-            with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
-                _task_done_callback(task)
-
-        asyncio.get_event_loop().run_until_complete(_run())
+        task = asyncio.create_task(_ok())
+        await task
+        with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
+            _task_done_callback(task)
 
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) == 0, (
             f"Expected no warning logs for a successful task, got: {warning_records}"
         )
 
-    def test_no_log_for_cancelled_task(self, caplog):
+    @pytest.mark.asyncio
+    async def test_no_log_for_cancelled_task(self, caplog):
         from app.routers.intelligence import _task_done_callback
 
         async def _slow():
             await asyncio.sleep(100)
 
-        async def _run():
-            task = asyncio.create_task(_slow())
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
-            with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
-                _task_done_callback(task)
-
-        asyncio.get_event_loop().run_until_complete(_run())
+        task = asyncio.create_task(_slow())
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        with caplog.at_level(logging.WARNING, logger="app.routers.intelligence"):
+            _task_done_callback(task)
 
         warning_records = [r for r in caplog.records if r.levelno >= logging.WARNING]
         assert len(warning_records) == 0, (

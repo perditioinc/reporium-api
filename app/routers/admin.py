@@ -389,9 +389,9 @@ async def backfill_embeddings(
             async with db.begin_nested():  # savepoint per row
                 await db.execute(text(
                     """
-                    INSERT INTO repo_embeddings (repo_id, embedding, model, generated_at, embedding_vec)
-                    VALUES (:repo_id, :embedding, 'all-MiniLM-L6-v2', NOW(), CAST(:embedding_vec AS vector))
-                    ON CONFLICT (repo_id) DO UPDATE
+                    INSERT INTO repo_embeddings (repo_id, embedding, model, generated_at, embedding_vec, is_current)
+                    VALUES (:repo_id, :embedding, 'all-MiniLM-L6-v2', NOW(), CAST(:embedding_vec AS vector), TRUE)
+                    ON CONFLICT (repo_id) WHERE is_current = TRUE DO UPDATE
                         SET embedding = EXCLUDED.embedding,
                             embedding_vec = EXCLUDED.embedding_vec,
                             generated_at = NOW()
@@ -1197,6 +1197,173 @@ async def admin_purge_query_logs(
 
     count = await purge_old_query_logs(days=days)
     return {"purged": count, "cutoff_days": days}
+
+
+@router.post("/admin/cache/graph/invalidate", response_model=dict)
+async def invalidate_graph_cache(
+    _admin_key: None = Depends(require_admin_key),
+) -> dict:
+    """Bust all Redis cache entries for the knowledge graph endpoints.
+
+    Call this after a graph rebuild to ensure the next request re-queries
+    the DB instead of serving stale typed-edge data.
+    """
+    await cache.invalidate("graph_edges:*")
+    await cache.invalidate("graph_clusters:*")
+    await cache.invalidate("graph_clusters")
+    return {"invalidated": ["graph_edges:*", "graph_clusters:*", "graph_clusters"]}
+
+
+@router.post("/admin/graph/rebuild-snapshot", response_model=dict)
+async def rebuild_graph_snapshot(
+    db: AsyncSession = Depends(get_db),
+    _admin_key: None = Depends(require_admin_key),
+) -> dict:
+    """Rebuild the GCS knowledge-graph snapshot from live DB data.
+
+    Queries repo_embeddings (pgvector) and repo_edges, builds snapshot JSON v1,
+    uploads to GCS, then invalidates Redis cache.  Call from Nightly Graph Build
+    workflow instead of running a separate script that needs direct DB access.
+    """
+    from datetime import timezone
+    import math
+    from app.graph_snapshot import load_graph_snapshot
+    from app.config import settings
+
+    if not settings.graph_snapshot_bucket:
+        raise HTTPException(status_code=503, detail="Graph snapshot GCS not configured")
+
+    # 1. Fetch all public repos
+    repo_rows = await db.execute(text("""
+        SELECT id, name, owner, description, primary_category,
+               COALESCE(parent_stars, stargazers_count, 0) AS stars,
+               updated_at, quality_signals
+        FROM repos WHERE is_private = false ORDER BY id
+    """))
+    repos = repo_rows.fetchall()
+
+    node_index: dict[int, dict] = {}
+    for row in repos:
+        quality = None
+        if row.quality_signals and isinstance(row.quality_signals, dict):
+            quality = row.quality_signals.get("quality")
+        node_index[row.id] = {
+            "repo_id": row.id,
+            "name": row.name,
+            "owner": row.owner,
+            "description": row.description,
+            "primary_category": row.primary_category,
+            "stars": int(row.stars or 0),
+            "stars_log": round(math.log10(max(int(row.stars or 0), 1)), 4),
+            "quality": quality,
+            "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+        }
+
+    # 2. Similarity edges via pgvector HNSW
+    sim_result = await db.execute(text("""
+        WITH ranked AS (
+            SELECT e1.repo_id AS source_id, e2.repo_id AS target_id,
+                   1 - (e1.embedding_vec <=> e2.embedding_vec) AS similarity,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY e1.repo_id
+                       ORDER BY e1.embedding_vec <=> e2.embedding_vec
+                   ) AS rank
+            FROM repo_embeddings e1
+            CROSS JOIN LATERAL (
+                SELECT e2_inner.repo_id, e2_inner.embedding_vec
+                FROM repo_embeddings e2_inner
+                WHERE e2_inner.repo_id != e1.repo_id
+                ORDER BY e1.embedding_vec <=> e2_inner.embedding_vec
+                LIMIT 8
+            ) e2
+            WHERE 1 - (e1.embedding_vec <=> e2.embedding_vec) >= 0.50
+        )
+        SELECT DISTINCT ON (LEAST(source_id, target_id), GREATEST(source_id, target_id))
+            source_id, target_id, similarity, rank
+        FROM ranked
+        ORDER BY LEAST(source_id, target_id), GREATEST(source_id, target_id), similarity DESC
+        LIMIT 20000
+    """))
+    sim_rows = sim_result.fetchall()
+    similarity_edges = [
+        {"source_repo_id": r.source_id, "target_repo_id": r.target_id,
+         "weight": round(float(r.similarity), 4), "rank": int(r.rank)}
+        for r in sim_rows
+        if r.source_id in node_index and r.target_id in node_index
+    ]
+
+    # 3. Typed edges from repo_edges
+    typed_result = await db.execute(text("""
+        SELECT source_repo_id, target_repo_id, edge_type, COALESCE(weight, 0.5) as weight
+        FROM repo_edges ORDER BY weight DESC
+    """))
+    typed_cap = 2000
+    type_counts: dict[str, int] = {}
+    typed_edges = []
+    for row in typed_result.fetchall():
+        if row.source_repo_id not in node_index or row.target_repo_id not in node_index:
+            continue
+        if row.edge_type == "SIMILAR_TO":
+            continue
+        cnt = type_counts.get(row.edge_type, 0)
+        if cnt >= typed_cap:
+            continue
+        typed_edges.append({
+            "source_repo_id": row.source_repo_id, "target_repo_id": row.target_repo_id,
+            "edge_type": row.edge_type, "weight": round(float(row.weight), 4),
+        })
+        type_counts[row.edge_type] = cnt + 1
+
+    # 4. Build + upload snapshot
+    repos_with_emb = len({e["source_repo_id"] for e in similarity_edges} |
+                         {e["target_repo_id"] for e in similarity_edges})
+    from datetime import datetime
+    snapshot = {
+        "snapshot_version": 1,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "nodes": list(node_index.values()),
+        "similarity_edges": similarity_edges,
+        "typed_edges": typed_edges,
+        "parameters": {"min_similarity": 0.50, "max_neighbours": 8, "typed_cap_per_type": typed_cap},
+        "stats": {
+            "total_public_repos": len(node_index),
+            "repos_with_embeddings": repos_with_emb,
+            "similarity_edges": len(similarity_edges),
+            "typed_edges": len(typed_edges),
+            "typed_edge_breakdown": type_counts,
+        },
+    }
+    snapshot_json = json.dumps(snapshot, ensure_ascii=False, default=str).encode("utf-8")
+
+    def _upload():
+        from google.cloud import storage
+        client = storage.Client(project=settings.gcp_project)
+        blob = client.bucket(settings.graph_snapshot_bucket).blob(settings.graph_snapshot_object)
+        blob.upload_from_string(snapshot_json, content_type="application/json")
+
+    await asyncio.to_thread(_upload)
+
+    # 5. Invalidate Redis cache
+    await cache.invalidate("graph_edges:*")
+    await cache.invalidate("graph_clusters:*")
+    await cache.invalidate("graph_clusters")
+
+    # 6. Force snapshot reload on next request
+    from app import graph_snapshot as gs
+    gs._snapshot_cache = None
+    gs._snapshot_cache_loaded_at = 0.0
+
+    size_kb = len(snapshot_json) // 1024
+    return {
+        "status": "ok",
+        "nodes": len(node_index),
+        "similarity_edges": len(similarity_edges),
+        "typed_edges": len(typed_edges),
+        "typed_edge_breakdown": type_counts,
+        "size_kb": size_kb,
+        "bucket": settings.graph_snapshot_bucket,
+        "object": settings.graph_snapshot_object,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2062,9 +2229,33 @@ async def backfill_dependencies(
 # HN Mentions Backfill — free HN Algolia API
 # ---------------------------------------------------------------------------
 
+
+def _hn_hit_to_mention(hit: dict, repo_id) -> dict:
+    """Convert a raw HN Algolia hit dict to a repo_mentions insert dict."""
+    from datetime import datetime, timezone
+
+    created_at_i = hit.get("created_at_i")
+    published_at = (
+        datetime.fromtimestamp(created_at_i, tz=timezone.utc) if created_at_i else None
+    )
+    title = hit.get("title") or "(no title)"
+    return {
+        "repo_id": repo_id,
+        "source": "hackernews",
+        "external_id": str(hit.get("objectID", "")),
+        "title": title[:500],
+        "url": f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}",
+        "score": hit.get("points"),
+        "comment_count": hit.get("num_comments"),
+        "author": hit.get("author"),
+        "published_at": published_at,
+    }
+
+
 @router.post("/admin/backfill-hn-mentions", response_model=dict)
 async def backfill_hn_mentions(
     request: Request,
+    dry_run: bool = Query(default=False, description="Preview without writing"),
     limit: int = Query(200, ge=1, le=2000, description="Max repos to scan"),
     db: AsyncSession = Depends(get_db),
     _api_key: str = Depends(verify_api_key),
@@ -2088,10 +2279,17 @@ async def backfill_hn_mentions(
     rows = result.fetchall()
 
     if not rows:
-        return {"total": 0, "with_mentions": 0, "mentions_inserted": 0, "failed": 0, "skipped": len(rows)}
+        return {
+            "dry_run": dry_run,
+            "total_repos": 0,
+            "mentions_found": 0,
+            "mentions_inserted": 0,
+            "failed": 0,
+            "skipped": 0,
+        }
 
-    total = len(rows)
-    with_mentions = 0
+    total_repos = len(rows)
+    mentions_found = 0
     mentions_inserted = 0
     failed = 0
     skipped = 0
@@ -2107,8 +2305,8 @@ async def backfill_hn_mentions(
                     timeout=15.0,
                 )
                 if resp.status_code == 429:
-                    logger.warning("HN Algolia rate limited at repo %d/%d, stopping", i + 1, total)
-                    skipped += total - i
+                    logger.warning("HN Algolia rate limited at repo %d/%d, stopping", i + 1, total_repos)
+                    skipped += total_repos - i
                     break
                 resp.raise_for_status()
                 data = resp.json()
@@ -2126,24 +2324,29 @@ async def backfill_hn_mentions(
                         url_lower = (story_url or "").lower()
                         title_lower = title.lower()
                         if not (
-                            (f"github.com/" in url_lower and f"/{repo_name_lower}" in url_lower) or
+                            ("github.com/" in url_lower and f"/{repo_name_lower}" in url_lower) or
                             repo_name_lower in title_lower
                         ):
                             continue
+                        mentions_found += 1
+                        if dry_run:
+                            continue
                         try:
+                            mention = _hn_hit_to_mention(hit, row.id)
                             await db.execute(text("""
                                 INSERT INTO repo_mentions (id, repo_id, source, external_id, title, url, score, comment_count, author, published_at)
-                                VALUES (gen_random_uuid(), :repo_id, 'hackernews', :external_id, :title, :url, :score, :comment_count, :author, to_timestamp(:created_at))
+                                VALUES (gen_random_uuid(), :repo_id, :source, :external_id, :title, :url, :score, :comment_count, :author, :published_at)
                                 ON CONFLICT ON CONSTRAINT uq_repo_mentions_repo_source_ext DO NOTHING
                             """), {
-                                "repo_id": str(row.id),
-                                "external_id": str(hit.get("objectID", "")),
-                                "title": (hit.get("title") or "")[:500],
-                                "url": f"https://news.ycombinator.com/item?id={hit.get('objectID', '')}",
-                                "score": hit.get("points"),
-                                "comment_count": hit.get("num_comments"),
-                                "author": hit.get("author"),
-                                "created_at": hit.get("created_at_i", 0),
+                                "repo_id": str(mention["repo_id"]),
+                                "source": mention["source"],
+                                "external_id": mention["external_id"],
+                                "title": mention["title"],
+                                "url": mention["url"],
+                                "score": mention["score"],
+                                "comment_count": mention["comment_count"],
+                                "author": mention["author"],
+                                "published_at": mention["published_at"],
                             })
                             repo_count += 1
                         except Exception as exc:
@@ -2151,13 +2354,13 @@ async def backfill_hn_mentions(
                             failed += 1
 
                     if repo_count > 0:
-                        with_mentions += 1
                         mentions_inserted += repo_count
 
-                    await db.commit()
+                    if not dry_run:
+                        await db.commit()
 
                 # Respect rate limit: ~1 req/s
-                if i < total - 1:
+                if i < total_repos - 1:
                     await asyncio.sleep(1.0)
 
             except Exception as exc:
@@ -2165,8 +2368,9 @@ async def backfill_hn_mentions(
                 failed += 1
 
     return {
-        "total": total,
-        "with_mentions": with_mentions,
+        "dry_run": dry_run,
+        "total_repos": total_repos,
+        "mentions_found": mentions_found,
         "mentions_inserted": mentions_inserted,
         "failed": failed,
         "skipped": skipped,

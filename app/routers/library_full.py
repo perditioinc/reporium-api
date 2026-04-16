@@ -1198,30 +1198,28 @@ async def _fetch_page_repos(
     repo_dicts = [dict(zip(columns, row)) for row in rows]
     page_ids = [str(r["id"]) for r in repo_dicts]
 
-    # Fetch junction data only for this page
-    def _junction(query: str) -> dict:
-        return {}  # placeholder — populated by async calls below
-
+    # Fetch junction data only for this page.
+    # CAST(:ids AS uuid[]) rather than :ids::uuid[] — asyncpg's parameter parser
+    # chokes on the :: suffix immediately after a named bind parameter.
     async def _fetch_junction(q: str) -> list:
         r = await db.execute(text(q), {"ids": page_ids})
         return r.fetchall()
 
-    lang_rows, cat_rows, skill_rows, tag_rows, pm_rows, builder_rows, taxonomy_rows, commit_rows, industry_rows = (
-        await asyncio.gather(
-            _fetch_junction("SELECT repo_id, language, bytes, percentage FROM repo_languages WHERE repo_id::text = ANY(:ids)"),
-            _fetch_junction("SELECT repo_id, category_name, is_primary FROM repo_categories WHERE repo_id::text = ANY(:ids)"),
-            _fetch_junction("SELECT repo_id, raw_value AS skill FROM repo_taxonomy WHERE dimension = 'skill_area' AND repo_id::text = ANY(:ids)"),
-            _fetch_junction("SELECT repo_id, tag FROM repo_tags WHERE repo_id::text = ANY(:ids)"),
-            _fetch_junction("SELECT repo_id, skill FROM repo_pm_skills WHERE repo_id::text = ANY(:ids)"),
-            _fetch_junction("SELECT repo_id, login, display_name, org_category, is_known_org FROM repo_builders WHERE repo_id::text = ANY(:ids)"),
-            _fetch_junction("SELECT repo_id, dimension, raw_value, similarity_score, assigned_by FROM repo_taxonomy WHERE repo_id::text = ANY(:ids)"),
-            _fetch_junction(
-                "SELECT repo_id, sha, message, author, committed_at, url FROM repo_commits "
-                "WHERE repo_id::text = ANY(:ids) ORDER BY committed_at DESC"
-            ),
-            _fetch_junction("SELECT repo_id, industry FROM repo_industries WHERE repo_id::text = ANY(:ids)"),
-        )
+    # Run junction fetches sequentially — asyncpg connections are strictly serial;
+    # concurrent await calls on the same session cause InterfaceError.
+    # Migration 036 added indexes so each query is a fast index scan.
+    lang_rows = await _fetch_junction("SELECT repo_id, language, bytes, percentage FROM repo_languages WHERE repo_id = ANY(CAST(:ids AS uuid[]))")
+    cat_rows = await _fetch_junction("SELECT repo_id, category_name, is_primary FROM repo_categories WHERE repo_id = ANY(CAST(:ids AS uuid[]))")
+    skill_rows = await _fetch_junction("SELECT repo_id, raw_value AS skill FROM repo_taxonomy WHERE dimension = 'skill_area' AND repo_id = ANY(CAST(:ids AS uuid[]))")
+    tag_rows = await _fetch_junction("SELECT repo_id, tag FROM repo_tags WHERE repo_id = ANY(CAST(:ids AS uuid[]))")
+    pm_rows = await _fetch_junction("SELECT repo_id, skill FROM repo_pm_skills WHERE repo_id = ANY(CAST(:ids AS uuid[]))")
+    builder_rows = await _fetch_junction("SELECT repo_id, login, display_name, org_category, is_known_org FROM repo_builders WHERE repo_id = ANY(CAST(:ids AS uuid[]))")
+    taxonomy_rows = await _fetch_junction("SELECT repo_id, dimension, raw_value, similarity_score, assigned_by FROM repo_taxonomy WHERE repo_id = ANY(CAST(:ids AS uuid[]))")
+    commit_rows = await _fetch_junction(
+        "SELECT repo_id, sha, message, author, committed_at, url FROM repo_commits "
+        "WHERE repo_id = ANY(CAST(:ids AS uuid[])) ORDER BY committed_at DESC"
     )
+    industry_rows = await _fetch_junction("SELECT repo_id, industry FROM repo_industries WHERE repo_id = ANY(CAST(:ids AS uuid[]))")
 
     all_languages: dict = defaultdict(list)
     for r in lang_rows:
