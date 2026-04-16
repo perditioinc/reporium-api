@@ -6,6 +6,9 @@ from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from fastapi.responses import JSONResponse
+
+from app.config import settings
 from app.database import get_db
 from app.embeddings import get_embedding_model
 from app.models.repo import Repo
@@ -208,4 +211,10 @@ async def semantic_search_repos(
     limit: int = Query(default=10, ge=1, le=MAX_SEMANTIC_RESULTS),
     db: AsyncSession = Depends(get_db),
 ) -> list[RepoSemanticResult]:
+    if not settings.embeddings_available:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "Semantic search temporarily unavailable (embeddings rebuilding)"},
+            headers={"X-Degraded": "embeddings"},
+        )
     return await _semantic_search(db, query=q, limit=limit)

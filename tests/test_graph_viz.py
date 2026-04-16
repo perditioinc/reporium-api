@@ -57,6 +57,7 @@ def _make_counts_row(total_public=100, with_embeddings=80):
     row = MagicMock()
     row.total_public = total_public
     row.with_embeddings = with_embeddings
+    row.total_graph_edges = 0
     return row
 
 
@@ -186,11 +187,11 @@ class TestGraphEdgesNodes:
                            target_quality={"overall": 0.6}),
         ]
         counts_row = _make_counts_row()
-        _, db_override = _override_db_multi([edge_rows, counts_row])
+        _, db_override = _override_db_multi([edge_rows, [], counts_row])
         app.dependency_overrides[get_db] = db_override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=None)
                 mock_cache.set = AsyncMock()
 
@@ -224,11 +225,11 @@ class TestGraphEdgesNodes:
         """Passing ?since=7d should include the param in cache key."""
         edge_rows = [_make_edge_row()]
         counts_row = _make_counts_row()
-        _, db_override = _override_db_multi([edge_rows, counts_row])
+        _, db_override = _override_db_multi([edge_rows, [], counts_row])
         app.dependency_overrides[get_db] = db_override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=None)
                 mock_cache.set = AsyncMock()
 
@@ -249,11 +250,11 @@ class TestGraphEdgesNodes:
     async def test_edges_without_since_uses_all(self):
         """Without ?since, cache key should include 'all'."""
         counts_row = _make_counts_row()
-        _, db_override = _override_db_multi([[], counts_row])
+        _, db_override = _override_db_multi([[], [], counts_row])
         app.dependency_overrides[get_db] = db_override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=None)
                 mock_cache.set = AsyncMock()
 
@@ -276,11 +277,11 @@ class TestGraphEdgesNodes:
             _make_edge_row("repo-a", "repo-c", 0.8),
         ]
         counts_row = _make_counts_row()
-        _, db_override = _override_db_multi([edge_rows, counts_row])
+        _, db_override = _override_db_multi([edge_rows, [], counts_row])
         app.dependency_overrides[get_db] = db_override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=None)
                 mock_cache.set = AsyncMock()
 
@@ -316,7 +317,7 @@ class TestGraphSubgraph:
         app.dependency_overrides[get_db] = db_override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=None)
                 mock_cache.set = AsyncMock()
 
@@ -355,7 +356,7 @@ class TestGraphSubgraph:
         app.dependency_overrides[get_db] = _override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=None)
 
                 async with AsyncClient(
@@ -387,7 +388,7 @@ class TestGraphSubgraph:
         app.dependency_overrides[get_db] = _override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=cached)
 
                 async with AsyncClient(
@@ -410,7 +411,7 @@ class TestGraphSubgraph:
         app.dependency_overrides[get_db] = db_override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=None)
                 mock_cache.set = AsyncMock()
 
@@ -448,7 +449,7 @@ class TestGraphClusters:
         app.dependency_overrides[get_db] = db_override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=None)
                 mock_cache.set = AsyncMock()
 
@@ -490,7 +491,7 @@ class TestGraphClusters:
         app.dependency_overrides[get_db] = _override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=cached)
 
                 async with AsyncClient(
@@ -511,7 +512,7 @@ class TestGraphClusters:
         app.dependency_overrides[get_db] = db_override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=None)
                 mock_cache.set = AsyncMock()
 
@@ -541,7 +542,7 @@ class TestGraphClusters:
         app.dependency_overrides[get_db] = db_override
 
         try:
-            with patch("app.routers.graph.cache") as mock_cache:
+            with patch("app.routers.graph.redis_cache") as mock_cache:
                 mock_cache.get = AsyncMock(return_value=None)
                 mock_cache.set = AsyncMock()
 

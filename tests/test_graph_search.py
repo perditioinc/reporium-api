@@ -26,6 +26,7 @@ def _make_edge_row(
     """Simulate a DB row from the graph search SQL."""
     row = MagicMock()
     row.similarity = similarity
+    row.edge_type = None  # similarity rows have no edge_type
     row.source_name = source_name
     row.source_owner = "perditioinc"
     row.source_description = f"{source_name} desc"

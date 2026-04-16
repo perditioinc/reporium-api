@@ -235,7 +235,7 @@ async def test_repo_ingested_event_skips_embed_failure_and_still_returns_200(cli
     assert data["taxonomy_rebuild"]["upserted"] == 3
     assert data["taxonomy_embed"]["status"] == "skipped"
     assert data["taxonomy_embed"]["embedded"] == 0
-    assert "model load failed" in data["taxonomy_embed"]["error"]
+    assert "embed_taxonomy failed" in data["taxonomy_embed"]["error"]
     assert data["taxonomy_assign"]["assigned"] == 11
     assert data["gap_rebuild"]["gap_rows"] == 8
     assert data["portfolio_insights"]["taxonomy_gap_count"] == 4

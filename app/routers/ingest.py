@@ -35,6 +35,7 @@ from app.routers.intelligence import _portfolio_insights
 from app.routers.library_full import invalidate_library_cache
 from app.routers.taxonomy import AssignBody, RebuildBody, assign_taxonomy, embed_taxonomy, rebuild_taxonomy
 from app.schemas.repo import IngestResponse, RepoEnrichItem, RepoIngestItem
+from app.utils import canonicalize_tags
 from app.schemas.trend import GapAnalysisIn, GapAnalysisOut, IngestionLogIn, IngestionLogOut, TrendSnapshotIn, TrendSnapshotOut
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,8 @@ limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 MAX_BATCH = 100
 
 # Mapping from ingest payload field → taxonomy dimension string
+# NOTE: "dependencies" is intentionally absent — deps are written to the
+# repo_dependencies table, not repo_taxonomy (migration 031 backfilled these).
 _TAXONOMY_DIMENSION_MAP = {
     "skill_areas": "skill_area",
     "industries": "industry",
@@ -63,7 +66,6 @@ _TAXONOMY_DIMENSION_MAP = {
     "modalities": "modality",
     "ai_trends": "ai_trend",
     "deployment_context": "deployment_context",
-    "dependencies": "dependency",
 }
 
 
@@ -170,9 +172,12 @@ async def _enrich_repo_with_haiku(repo: Repo, db: AsyncSession) -> dict:
     # Write enrichment columns
     repo.readme_summary = data.get("readme_summary") or repo.readme_summary
     repo.problem_solved = data.get("problem_solved") or repo.problem_solved
-    repo.integration_tags = [
-        t.lower().strip() for t in data.get("integration_tags", []) if t and isinstance(t, str)
-    ] or repo.integration_tags
+    raw_tags = [
+        t.strip() for t in data.get("integration_tags", []) if t and isinstance(t, str)
+    ]
+    if raw_tags:
+        repo.raw_integration_tags = raw_tags
+        repo.integration_tags = canonicalize_tags(raw_tags) or repo.integration_tags
     repo.quality_signals = {"quality": quality, "maturity": maturity}
     repo.updated_at = datetime.now(timezone.utc)
 
@@ -299,7 +304,7 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
     repo_fields = item.model_dump(
         exclude={"tags", "categories", "builders", "ai_dev_skills", "pm_skills", "languages", "commits",
                  "skill_areas", "industries", "use_cases", "modalities", "ai_trends", "deployment_context",
-                 "dependencies"}
+                 "dependencies", "dep_ecosystem"}
     )
 
     if repo is None:
@@ -309,8 +314,11 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
         for key, val in repo_fields.items():
             # readme_summary and quality_signals are written by the AI enricher —
             # never overwrite them with NULL during a bulk ingest upsert.
-            if key in {"readme_summary", "quality_signals", "problem_solved", "integration_tags"}:
-                if val is not None:
+            if key in {"readme_summary", "quality_signals", "problem_solved",
+                       "integration_tags", "raw_integration_tags", "activity_score_breakdown"}:
+                # Never overwrite enricher-written fields with None or empty list —
+                # the ingestion pipeline sends [] for integration_tags before AI enrichment.
+                if val is not None and val != []:
                     setattr(repo, key, val)
             elif val is not None or key in {"description", "forked_from", "primary_language",
                                              "fork_sync_state", "github_updated_at",

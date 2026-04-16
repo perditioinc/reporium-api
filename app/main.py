@@ -2,7 +2,10 @@ import json
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
+
+import sentry_sdk
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,14 +18,25 @@ from slowapi.util import get_remote_address
 
 from app.cache import cache
 from app.rate_limit import rate_limit_storage
+from app.prometheus_metrics import record_http_request
 from app.slo_observer import slo_observer
 from app.database import async_session_factory, check_db_connection, engine
 from app.routers import admin, analytics, compare, dependencies, graph, ingest, intelligence, library, library_full, mentions, nl_filter, platform, recommendations, repos, search, taxonomy, trends, webhooks, wiki
 from app.telemetry import init_telemetry
 
 
+_EXTRA_FIELDS = frozenset({
+    "method", "path", "status_code", "duration_ms",
+    "request_id", "trace_id", "user_id", "route",
+})
+
+
 class _JsonFormatter(logging.Formatter):
-    """Emit each log record as a single-line JSON object for Cloud Run structured logging."""
+    """Emit each log record as a single-line JSON object for Cloud Run structured logging.
+
+    Includes all structured extra fields so Cloud Logging can index them,
+    plus the Cloud Trace ID for cross-service correlation.
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         payload = {
@@ -31,6 +45,10 @@ class _JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
             "logger": record.name,
         }
+        # Merge any extra structured fields attached by callers
+        for field in _EXTRA_FIELDS:
+            if hasattr(record, field):
+                payload[field] = getattr(record, field)
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         return json.dumps(payload)
@@ -47,6 +65,13 @@ def _configure_logging() -> None:
 
 _configure_logging()
 logger = logging.getLogger(__name__)
+
+sentry_sdk.init(
+    dsn=os.getenv("SENTRY_DSN"),
+    traces_sample_rate=1.0,
+    send_default_pii=True,
+    environment=os.getenv("ENVIRONMENT", "production"),
+)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -227,6 +252,12 @@ app.add_middleware(
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = time.perf_counter()
+    request_id = str(uuid.uuid4())[:8]
+
+    # Extract Cloud Trace ID for cross-service correlation in Cloud Logging
+    trace_header = request.headers.get("X-Cloud-Trace-Context", "")
+    trace_id = trace_header.split("/")[0] if trace_header else None
+
     response = await call_next(request)
     duration_ms = round((time.perf_counter() - start) * 1000, 2)
     # Record against rolling SLO histogram (no-op for untracked routes).
@@ -234,19 +265,29 @@ async def log_requests(request: Request, call_next):
         slo_observer.record(request.url.path, duration_ms, response.status_code)
     except Exception:  # observer must never break the request path
         pass
+    try:
+        record_http_request(
+            path=request.url.path,
+            method=request.method,
+            status_code=response.status_code,
+            duration_ms=duration_ms,
+        )
+    except Exception:
+        pass
     # Redact query strings — they may contain user input, API keys, or PII
     safe_path = request.url.path
     if request.url.query:
         safe_path = f"{safe_path}?<redacted>"
-    logger.info(
-        "request",
-        extra={
-            "method": request.method,
-            "path": safe_path,
-            "status_code": response.status_code,
-            "duration_ms": duration_ms,
-        },
-    )
+    extra: dict = {
+        "request_id": request_id,
+        "method": request.method,
+        "path": safe_path,
+        "status_code": response.status_code,
+        "duration_ms": duration_ms,
+    }
+    if trace_id:
+        extra["trace_id"] = trace_id
+    logger.info("request", extra=extra)
     return response
 
 
@@ -269,6 +310,7 @@ async def add_security_headers(request: Request, call_next):
 
 app.include_router(library.router)
 app.include_router(graph.router)
+app.include_router(mentions.router)
 app.include_router(repos.router)
 app.include_router(search.router)
 app.include_router(analytics.router)
@@ -282,7 +324,6 @@ app.include_router(nl_filter.router)
 app.include_router(recommendations.router)
 app.include_router(library_full.router)
 app.include_router(taxonomy.router, prefix="/taxonomy")
-app.include_router(mentions.router)
 app.include_router(compare.router)
 app.include_router(admin.router)
 app.include_router(webhooks.router)

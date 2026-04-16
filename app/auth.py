@@ -22,7 +22,7 @@ def _secrets_equal(provided: str | None, expected: str | None) -> bool:
     Constant-time comparison of two secret strings.
 
     hmac.compare_digest requires both operands to be non-empty bytes of equal
-    length — otherwise it effectively returns False in constant time. We still
+    length; otherwise it effectively returns False in constant time. We still
     guard against None / empty explicitly so callers can differentiate
     "missing credential" from "wrong credential" for HTTP status selection.
     """
@@ -31,12 +31,30 @@ def _secrets_equal(provided: str | None, expected: str | None) -> bool:
     return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
 
 
+def _configured_ingestion_api_key() -> str | None:
+    key = settings.ingestion_api_key or os.getenv("INGESTION_API_KEY") or os.getenv("INGEST_API_KEY")
+    return key.strip() if key else None
+
+
+def _configured_ingest_header_key() -> str | None:
+    key = os.getenv("INGEST_API_KEY")
+    if key:
+        return key.strip()
+    if _IS_PRODUCTION:
+        return _configured_ingestion_api_key()
+    return None
+
+
 async def verify_api_key(
     credentials: HTTPAuthorizationCredentials = Security(security),
 ) -> str:
     # Issue #237: timing-safe comparison of the bearer token against the
     # configured ingestion API key.
-    if not _secrets_equal(credentials.credentials, settings.ingestion_api_key):
+    expected_key = _configured_ingestion_api_key()
+    if not expected_key:
+        logger.error("INGESTION_API_KEY / INGEST_API_KEY not set - rejecting request")
+        raise HTTPException(status_code=500, detail="Server misconfiguration")
+    if not _secrets_equal(credentials.credentials, expected_key):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid API key",
@@ -57,9 +75,9 @@ async def require_admin_key(
     admin_key = os.getenv("ADMIN_API_KEY")
     if not admin_key:
         if _IS_PRODUCTION:
-            logger.error("ADMIN_API_KEY not set in production — rejecting request")
+            logger.error("ADMIN_API_KEY not set in production - rejecting request")
             raise HTTPException(status_code=500, detail="Server misconfiguration")
-        return  # No key configured — allow in dev mode only
+        return  # No key configured - allow in dev mode only
     # Issue #237: timing-safe comparison.
     if not _secrets_equal(x_admin_key, admin_key):
         raise HTTPException(status_code=403, detail="Invalid admin key")
@@ -74,18 +92,18 @@ async def require_metrics_access(
     When ``METRICS_REQUIRE_AUTH=1`` is set, this dependency enforces the same
     X-Admin-Key semantics as :func:`require_admin_key`. When the env var is
     unset or empty, this is a no-op so the /metrics/* and /audit/status
-    endpoints stay open — matching pre-#236 behavior for backward compat.
+    endpoints stay open, matching pre-#236 behavior for backward compat.
 
     Closes #236.
     """
     if os.getenv("METRICS_REQUIRE_AUTH", "").strip() != "1":
-        return  # gate disabled — endpoints stay open (default)
+        return  # gate disabled - endpoints stay open (default)
     admin_key = os.getenv("ADMIN_API_KEY", "")
     if not admin_key:
         if _IS_PRODUCTION:
             logger.error("METRICS_REQUIRE_AUTH=1 but ADMIN_API_KEY not set")
             raise HTTPException(status_code=500, detail="Server misconfiguration")
-        return  # Dev mode with flag on but no key — allow
+        return  # Dev mode with flag on but no key - allow
     if not _secrets_equal(x_admin_key, admin_key):
         raise HTTPException(
             status_code=403, detail="Admin key required for metrics endpoints"
@@ -105,12 +123,12 @@ async def require_ingest_key(
     x_ingest_key: str | None = Security(_INGEST_KEY_HEADER),
     x_admin_key: str | None = Security(_LEGACY_INGEST_KEY_HEADER),
 ) -> None:
-    ingest_key = os.getenv("INGEST_API_KEY")
+    ingest_key = _configured_ingest_header_key()
     if not ingest_key:
         if _IS_PRODUCTION:
-            logger.error("INGEST_API_KEY not set in production — rejecting request")
+            logger.error("INGESTION_API_KEY / INGEST_API_KEY not set - rejecting request")
             raise HTTPException(status_code=500, detail="Server misconfiguration")
-        return  # No key configured — allow in dev mode only
+        return  # No key configured - allow in dev mode only
     # Issue #237: timing-safe comparison for both headers. Both branches run
     # regardless of the first result so an attacker cannot distinguish which
     # header was matched via response timing.
@@ -134,12 +152,12 @@ async def require_app_token(
     """
     Lightweight app verification for expensive endpoints.
     The token is a simple shared secret set via APP_API_TOKEN env var.
-    Not full auth — just prevents random scripts from hitting LLM endpoints.
+    Not full auth - just prevents random scripts from hitting LLM endpoints.
     """
     expected = os.getenv("APP_API_TOKEN", "")
     if not expected:
         if _IS_PRODUCTION:
-            logger.error("APP_API_TOKEN not set in production — rejecting")
+            logger.error("APP_API_TOKEN not set in production - rejecting")
             raise HTTPException(status_code=500, detail="Server misconfiguration")
         return  # Dev mode
     # Issue #237: timing-safe comparison.
@@ -166,7 +184,7 @@ async def get_app_token_hash(
     """
     FastAPI dependency: return the SHA-256 hex of the presented X-App-Token.
 
-    Does NOT validate the token — `require_app_token` already does that via
+    Does NOT validate the token - `require_app_token` already does that via
     its own Depends() on the same endpoint. Returns None in dev mode when no
     token is required. Safe to use alongside `require_app_token`.
     """
@@ -180,9 +198,9 @@ async def require_pubsub_push(
     audience = settings.pubsub_audience
     if not audience:
         if _IS_PRODUCTION:
-            logger.error("pubsub_audience not set in production — rejecting request")
+            logger.error("pubsub_audience not set in production - rejecting request")
             raise HTTPException(status_code=500, detail="Server misconfiguration")
-        return  # No audience configured — allow in dev/manual mode only
+        return  # No audience configured - allow in dev/manual mode only
     if credentials is None or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing Pub/Sub bearer token")
 
