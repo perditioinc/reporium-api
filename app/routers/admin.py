@@ -3,17 +3,19 @@ import json
 import logging
 import os
 from dataclasses import dataclass, field as dc_field
-from datetime import date
+from datetime import date, datetime
+from typing import Optional
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from slowapi import Limiter
 from slowapi.util import get_remote_address
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_admin_key, verify_api_key
+from app.models.query_log import QueryLog
 from app.cache import cache
 from app.database import get_db
 from app.models.repo import IngestRun, Repo, RepoCategory, RepoEmbedding, RepoTag
@@ -2169,3 +2171,123 @@ async def backfill_hn_mentions(
         "failed": failed,
         "skipped": skipped,
     }
+
+
+# ── KAN-165: JIRA × Reporium AI ask admin endpoints (Workato Recipe 2) ───────
+
+class AskRow(BaseModel):
+    """Serialised view of a query_log row returned by the asks admin endpoints."""
+
+    id: int
+    created_at: datetime
+    query: str
+    model: Optional[str]
+    input_tokens: Optional[int]
+    output_tokens: Optional[int]
+    cost_cents: Optional[int]
+    jira_ticket_key: Optional[str]
+    jira_status: Optional[str]
+    action_taken: Optional[str]
+    sentiment: Optional[str]
+    latency_ms: Optional[int]
+    user_ip_hash: Optional[str]
+
+    class Config:
+        from_attributes = True
+
+
+class AskPatchRequest(BaseModel):
+    """Partial-update body for PATCH /admin/asks/{ask_id}."""
+
+    jira_ticket_key: Optional[str] = None
+    jira_status: Optional[str] = None
+    action_taken: Optional[str] = None
+    sentiment: Optional[str] = None
+
+
+def _row_to_ask(row: QueryLog) -> dict:
+    return {
+        "id": row.id,
+        "created_at": row.timestamp.isoformat() if row.timestamp else None,
+        "query": row.question,
+        "model": row.model,
+        "input_tokens": row.tokens_prompt,
+        "output_tokens": row.tokens_completion,
+        "cost_cents": row.cost_cents,
+        "jira_ticket_key": row.jira_ticket_key,
+        "jira_status": row.jira_status,
+        "action_taken": row.action_taken,
+        "sentiment": row.sentiment,
+        "latency_ms": row.latency_ms,
+        "user_ip_hash": row.hashed_ip,
+    }
+
+
+@router.get("/admin/asks", response_model=dict)
+async def list_asks(
+    limit: int = Query(default=50, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
+    since: Optional[datetime] = Query(default=None, description="ISO8601 timestamp — filter created_at >= since"),
+    jira_status: Optional[str] = Query(default=None, description="Filter by jira_status value"),
+    has_ticket: Optional[bool] = Query(default=None, description="When true, only rows with non-null jira_ticket_key"),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """List /ask log entries with optional filters. Used by Workato Recipe 2."""
+
+    base_q = select(QueryLog)
+    count_q = select(func.count()).select_from(QueryLog)
+
+    if since is not None:
+        base_q = base_q.where(QueryLog.timestamp >= since)
+        count_q = count_q.where(QueryLog.timestamp >= since)
+
+    if jira_status is not None:
+        base_q = base_q.where(QueryLog.jira_status == jira_status)
+        count_q = count_q.where(QueryLog.jira_status == jira_status)
+
+    if has_ticket is True:
+        base_q = base_q.where(QueryLog.jira_ticket_key.isnot(None))
+        count_q = count_q.where(QueryLog.jira_ticket_key.isnot(None))
+    elif has_ticket is False:
+        base_q = base_q.where(QueryLog.jira_ticket_key.is_(None))
+        count_q = count_q.where(QueryLog.jira_ticket_key.is_(None))
+
+    total_result = await db.execute(count_q)
+    total = total_result.scalar() or 0
+
+    rows_result = await db.execute(
+        base_q.order_by(QueryLog.timestamp.desc()).offset(offset).limit(limit)
+    )
+    rows = rows_result.scalars().all()
+
+    return {
+        "total": total,
+        "asks": [_row_to_ask(r) for r in rows],
+    }
+
+
+@router.patch("/admin/asks/{ask_id}", response_model=dict)
+async def patch_ask(
+    ask_id: int,
+    body: AskPatchRequest,
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """Partially update a query_log row (JIRA fields). Called by Workato Recipe 2."""
+
+    result = await db.execute(select(QueryLog).where(QueryLog.id == ask_id))
+    row = result.scalar_one_or_none()
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"Ask {ask_id} not found")
+
+    patch_data = body.model_dump(exclude_unset=True)
+    if patch_data:
+        for field, value in patch_data.items():
+            setattr(row, field, value)
+        await db.commit()
+        await db.refresh(row)
+
+    return _row_to_ask(row)
