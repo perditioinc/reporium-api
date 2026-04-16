@@ -483,6 +483,33 @@ async def metrics_latest(
         await db.execute(select(func.max(Repo.updated_at)))
     ).scalar_one()
 
+    # KAN-122: additive aliases expected by the frontend dashboard.
+    # total_public_repos / repos_with_embeddings exclude private repos.
+    counts_row = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM repos WHERE is_private = false) AS total_public,
+                    (SELECT COUNT(DISTINCT re.repo_id)
+                     FROM repo_embeddings re
+                     JOIN repos r ON r.id = re.repo_id
+                     WHERE r.is_private = false
+                       AND re.embedding_vec IS NOT NULL) AS with_embeddings
+                """
+            )
+        )
+    ).fetchone()
+    total_public = int(counts_row.total_public or 0) if counts_row else 0
+    with_embeddings = int(counts_row.with_embeddings or 0) if counts_row else 0
+
+    # snapshot_generated_at: read from the in-memory snapshot cache so this
+    # endpoint needs no extra GCS round-trip.
+    from app.graph_snapshot import _snapshot_cache  # local import; module already loaded
+    snapshot_generated_at = (
+        _snapshot_cache.get("generated_at") if _snapshot_cache else None
+    )
+
     return {
         "repos_tracked": total,
         "repos_with_ai_skills": repos_with_skills,
@@ -491,6 +518,10 @@ async def metrics_latest(
         "last_sync": last_updated.isoformat() if last_updated else None,
         "api_version": os.getenv("APP_VERSION", os.getenv("GITHUB_SHA", "unknown")[:7]),
         "build_number": os.getenv("BUILD_NUMBER", "0"),
+        # Frontend-expected aliases (additive — do NOT remove the keys above)
+        "total_public_repos": total_public,
+        "repos_with_embeddings": with_embeddings,
+        "snapshot_generated_at": snapshot_generated_at,
     }
 
 
