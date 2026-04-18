@@ -75,7 +75,10 @@ async def ingest_batch(
                 resp = await client.post(
                     f"{API_URL}/ingest/repos",
                     json=batch,
-                    headers={"Authorization": f"Bearer {API_KEY}"},
+                    headers={
+                        "Authorization": f"Bearer {API_KEY}",
+                        "X-Ingest-Key": API_KEY,
+                    },
                     timeout=60,
                 )
                 if resp.status_code == 200:
@@ -96,6 +99,10 @@ async def ingest_batch(
                         stats["failed"] += len(batch)
                         stats["error_details"].append(
                             {"batch_names": [r["name"] for r in batch], "status": resp.status_code, "body": resp.text[:200]}
+                        )
+                        print(
+                            f"[ingest-fail] {resp.status_code} {resp.text[:200]}",
+                            file=sys.stderr,
                         )
             except Exception as e:
                 if attempt < MAX_RETRIES - 1:
