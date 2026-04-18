@@ -24,8 +24,9 @@ if not API_KEY:
     sys.exit(1)
 
 BATCH_SIZE = 50
-MAX_RETRIES = 3
-CONCURRENCY = 20
+MAX_RETRIES = 5
+CONCURRENCY = 1  # API rate limit is 30/min on /ingest/repos — serialize batches
+RATE_LIMIT_BACKOFF_SEC = 65  # On 429, wait past the 60s window
 
 
 def map_repo(raw: dict) -> dict:
@@ -70,6 +71,8 @@ async def ingest_batch(
 ):
     """POST a batch of repos to the ingest endpoint with retry."""
     async with semaphore:
+        # Serialize batches and respect 30 req/min rate limit (2.1s/batch)
+        await asyncio.sleep(2.1)
         for attempt in range(MAX_RETRIES):
             try:
                 resp = await client.post(
@@ -91,6 +94,20 @@ async def ingest_batch(
                     return
                 elif resp.status_code == 409:
                     stats["existed"] += len(batch)
+                    return
+                elif resp.status_code == 429:
+                    # Rate limited — wait past the 60s window, then retry
+                    if attempt < MAX_RETRIES - 1:
+                        await asyncio.sleep(RATE_LIMIT_BACKOFF_SEC)
+                        continue
+                    stats["failed"] += len(batch)
+                    stats["error_details"].append(
+                        {"batch_names": [r["name"] for r in batch], "status": 429, "body": resp.text[:200]}
+                    )
+                    print(
+                        f"[ingest-fail] 429 {resp.text[:200]}",
+                        file=sys.stderr,
+                    )
                     return
                 else:
                     if attempt < MAX_RETRIES - 1:
