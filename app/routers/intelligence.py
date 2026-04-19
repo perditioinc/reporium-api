@@ -1193,28 +1193,91 @@ def _format_stars(stars: int | None) -> str:
     return str(stars)
 
 
+def _build_pros_cons_snippet(pros_cons: dict | None) -> str:
+    """
+    Return a compact flat-text pros/cons block for the LLM context.
+
+    Budget: top-3 pros and top-3 cons, each item truncated to 80 chars.
+    Format (Haiku-friendly, no JSON):
+      pros: X; Y; Z
+      cons: A; B; C
+
+    Returns empty string if pros_cons is None or malformed.
+    Does NOT surface internal scoring fields or user-generated PII.
+    """
+    if not pros_cons or not isinstance(pros_cons, dict):
+        return ""
+    try:
+        pros = pros_cons.get("pros") or []
+        cons = pros_cons.get("cons") or []
+        parts: list[str] = []
+        if pros:
+            top_pros = [str(p)[:80] for p in pros[:3]]
+            parts.append(f"  pros: {'; '.join(top_pros)}")
+        if cons:
+            top_cons = [str(c)[:80] for c in cons[:3]]
+            parts.append(f"  cons: {'; '.join(top_cons)}")
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def _build_community_signals_snippet(
+    community_health_pct: int | None,
+    contributors_count: int | None,
+    issue_close_rate: float | None,
+    pr_merge_rate: float | None,
+) -> str:
+    """
+    Return a compact flat-text community-health line for the LLM context.
+
+    Only numeric signals from the public GitHub API — no internal fields.
+    Format (Haiku-friendly, no JSON):
+      community: health=82%, contributors=340, issue_close=71%, pr_merge=68%
+
+    Returns empty string if all values are None.
+    """
+    parts: list[str] = []
+    if community_health_pct is not None:
+        parts.append(f"health={community_health_pct}%")
+    if contributors_count is not None:
+        parts.append(f"contributors={contributors_count}")
+    if issue_close_rate is not None:
+        parts.append(f"issue_close={round(issue_close_rate * 100)}%")
+    if pr_merge_rate is not None:
+        parts.append(f"pr_merge={round(pr_merge_rate * 100)}%")
+    if not parts:
+        return ""
+    return f"  community: {', '.join(parts)}"
+
+
 def _build_sources_block(repos: list[dict]) -> str:
     """
     Build the numbered sources block sent to Claude in the user message.
 
-    Context hygiene (KAN-ask-cache): only these fields are included per repo:
-      - name
-      - owner
-      - primary_category
+    Context hygiene (KAN-ask-cache): core fields per repo:
+      - name, owner, primary_category
       - stars (compact notation)
       - description (truncated to _SOURCES_DESCRIPTION_MAX chars)
 
-    Deliberately excluded (to minimize cached-sources input tokens and avoid
-    leaking noisy data into the context window):
+    Enrichment fields (surfaced when populated, budget <=25% growth per repo):
+      - pros_cons: top-3 pros / top-3 cons (Haiku-generated, public repo data)
+      - community signals: contributors, issue_close_rate, pr_merge_rate,
+        community_health_pct (aggregated numbers from GitHub public API)
+
+    Deliberately excluded (noisy data or internal-only fields):
       - readme_summary, problem_solved
       - language, license_spdx, activity_score
       - has_tests, has_ci, relevance_score
       - forked_from, secondary_category lists
-      - embedding arrays
-      - created_at / updated_at / last_push_at timestamps
+      - embedding arrays, timestamps
+      - trust_score computation internals, ingestion_id, admin-only flags
 
-    Output format (compact numbered list — saves ~165 tokens vs XML tags):
+    Output format:
       1. owner/repo (1.2k★, Category): Description text
+         pros: X; Y; Z
+         cons: A; B; C
+         community: health=82%, contributors=340, issue_close=71%, pr_merge=68%
     """
     lines: list[str] = []
     for i, repo in enumerate(repos, 1):
@@ -1236,7 +1299,26 @@ def _build_sources_block(repos: list[dict]) -> str:
         meta = f" ({', '.join(meta_parts)})" if meta_parts else ""
 
         suffix = f": {description}" if description else ""
-        lines.append(f"{i}. {full_name}{meta}{suffix}")
+        entry = f"{i}. {full_name}{meta}{suffix}"
+
+        # Append enrichment lines when available
+        enrichment_lines: list[str] = []
+        pc_snippet = _build_pros_cons_snippet(repo.get("pros_cons"))
+        if pc_snippet:
+            enrichment_lines.append(pc_snippet)
+        cs_snippet = _build_community_signals_snippet(
+            repo.get("community_health_pct"),
+            repo.get("contributors_count"),
+            repo.get("issue_close_rate"),
+            repo.get("pr_merge_rate"),
+        )
+        if cs_snippet:
+            enrichment_lines.append(cs_snippet)
+
+        if enrichment_lines:
+            entry = entry + "\n" + "\n".join(enrichment_lines)
+
+        lines.append(entry)
     return "\n".join(lines)
 
 logger = logging.getLogger(__name__)
@@ -1267,6 +1349,7 @@ Rules:
 - Be specific about what each repo does based on its summary and problem_solved fields.
 - If the context doesn't contain enough information to answer, say so honestly.
 - Keep answers concise but informative — 2-4 paragraphs max.
+- Each repo source may include a brief pros/cons from reviewers and community-health signals (contributors, issue close rate). Surface relevant trade-offs when comparing tools.
 
 Domain boundary (STRICTLY enforced — no exceptions):
 - You ONLY help with: finding repos, comparing tools, explaining what repos do, recommending AI/ML frameworks, answering questions about the Reporium library.
@@ -2153,6 +2236,12 @@ async def _prepare_query(
             "activity_score": row.activity_score,
             "has_tests": row.has_tests,
             "has_ci": row.has_ci,
+            # Enrichment fields (KAN pros-cons / community signals)
+            "pros_cons": row.pros_cons,
+            "community_health_pct": row.community_health_pct,
+            "contributors_count": row.contributors_count,
+            "issue_close_rate": row.issue_close_rate,
+            "pr_merge_rate": row.pr_merge_rate,
             "similarity": float(row.similarity),
         })
 
