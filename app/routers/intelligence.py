@@ -2112,6 +2112,9 @@ async def _prepare_query(
                        r.parent_stars, r.readme_summary, r.problem_solved,
                        r.primary_category, r.primary_language AS language, r.license_spdx,
                        r.activity_score, r.has_tests, r.has_ci,
+                       r.pros_cons,
+                       r.community_health_pct, r.contributors_count,
+                       r.issue_close_rate, r.pr_merge_rate,
                        1 - (e.embedding_vec <=> CAST(:vec AS vector)) AS similarity
                 FROM repo_embeddings e
                 JOIN repos r ON r.id = e.repo_id
@@ -2324,7 +2327,13 @@ async def _run_query(
     effective_session_id = session_id or req.session_id
 
     # --- Off-topic domain boundary filter (pre-Claude, $0) ---
-    if _is_off_topic(req.question):
+    try:
+        is_off_topic = _is_off_topic(req.question)
+    except Exception as exc:
+        logger.warning("injection-defense error: %s", exc)
+        is_off_topic = True  # Treat unparseable input as off-topic for safety
+
+    if is_off_topic:
         logger.info("off-topic query rejected: %s", req.question[:80])
         return QueryResponse(
             answer=_OFF_TOPIC_RESPONSE,
