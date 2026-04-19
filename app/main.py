@@ -243,7 +243,7 @@ if os.getenv("ENVIRONMENT") != "production":
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
-    allow_origin_regex=r"https://reporium(-[a-z0-9]+)*\.vercel\.app",
+    allow_origin_regex=r"https://(reporium|reposhark)(-[a-z0-9]+)*\.vercel\.app",
     allow_methods=["GET", "POST"],
     allow_headers=["Authorization", "Content-Type", "X-Admin-Key", "X-Ingest-Key", "X-App-Token", "X-Sandbox", "Accept"],
 )
