@@ -200,11 +200,16 @@ async def test_ask_injection_defense_error_handling(client: AsyncClient):
         f"Expected 200 with off-topic response, got {response.status_code}: {response.text}"
     )
 
-    # Verify the response contains the off-topic message
+    # Verify the response contains the off-topic refusal message.
+    # Match on phrases from _OFF_TOPIC_RESPONSE that signal refusal.
     data = response.json()
-    assert "off-topic" in data.get("answer", "").lower() or \
-           "cannot help with" in data.get("answer", "").lower(), (
+    answer = data.get("answer", "").lower()
+    assert ("can't help with" in answer) or ("reporium intelligence assistant" in answer), (
         f"Expected off-topic refusal, got: {data.get('answer', '')}"
+    )
+    # Off-topic path must not hit the LLM
+    assert data.get("model") == "off-topic", (
+        f"Expected model=off-topic, got: {data.get('model')}"
     )
 
 
