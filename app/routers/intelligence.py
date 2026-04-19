@@ -2431,6 +2431,7 @@ async def _run_query(
             model="off-topic",
             answered_at=datetime.now(timezone.utc).isoformat(),
             embedding_candidates=0,
+            tokens_used={"input_tokens": 0, "output_tokens": 0},
         )
 
     qctx = await _prepare_query(
