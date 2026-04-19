@@ -1041,6 +1041,62 @@
       integration_tags: [llm, rag, agents, prompt]
 
 # ---------------------------------------------------------------------------
+# 53  Trade-off comparison with pros/cons enrichment (feat/ask-surface-pros-cons-signals)
+# ---------------------------------------------------------------------------
+# Validates that the LLM surfaces trade-offs from pros_cons and community_health
+# fields now included in the per-source context block.
+# Pass criterion: answer must contain at least one negative indicator word —
+# "however", "but", "limitation", or "drawback" (case-insensitive grep check).
+
+- question: "what are the trade-offs of using langchain vs llamaindex"
+  expected_themes: ["langchain", "llamaindex"]
+  expected_repos: ["langchain-ai/langchain", "run-llama/llama_index"]
+  answer_must_match_any: ["however", "but", "limitation", "drawback"]
+  difficulty: medium
+  max_tokens_soft_budget: 4500
+  fixture_repos:
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "Orchestrating LLMs with tools, memory, and retrieval"
+      similarity: 0.94
+      stars: 88000
+      integration_tags: [llm, rag, agents]
+      pros_cons:
+        pros:
+          - "Massive ecosystem with hundreds of integrations out of the box"
+          - "Active community and regular releases"
+          - "Flexible abstractions for chains, agents, and memory"
+        cons:
+          - "Rapidly changing API surface makes upgrades painful"
+          - "Heavy dependency footprint for simple use-cases"
+          - "Abstraction leakage can make debugging difficult"
+      community_health_pct: 87
+      contributors_count: 2800
+      issue_close_rate: 0.61
+      pr_merge_rate: 0.55
+    - owner: run-llama
+      name: llama_index
+      description: "LlamaIndex is a data framework for LLM applications to ingest, structure, and access private or domain-specific data"
+      problem_solved: "Connecting LLMs to external data sources with advanced retrieval"
+      similarity: 0.91
+      stars: 33000
+      integration_tags: [rag, llm, data]
+      pros_cons:
+        pros:
+          - "Purpose-built for RAG with superior out-of-the-box retrieval quality"
+          - "Data connectors for 100+ sources including PDFs, Notion, and SQL"
+          - "Query engines and response synthesizers are well-structured"
+        cons:
+          - "Smaller agent ecosystem compared to LangChain"
+          - "Steeper learning curve for non-RAG use-cases"
+          - "Fewer tutorials and third-party guides available"
+      community_health_pct: 81
+      contributors_count: 920
+      issue_close_rate: 0.74
+      pr_merge_rate: 0.67
+
+# ---------------------------------------------------------------------------
 # Edge cases — these assert HTTP behavior rather than quality scores.
 # ---------------------------------------------------------------------------
 
