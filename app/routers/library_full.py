@@ -1330,7 +1330,10 @@ async def _fetch_aggregates(db: AsyncSession) -> dict:
 
 
 @router.get("/library/full", response_model=dict)
-@_limiter.limit("5/minute")
+# 60/minute: the frontend paginates (page_size=500, ~4 pages) so a single
+# homepage load consumes ~4 requests. 5/minute caused 429s on any refresh.
+# Responses are served from Redis + in-memory cache so cost is negligible.
+@_limiter.limit("60/minute")
 async def library_full(
     request: Request,
     response: Response,
