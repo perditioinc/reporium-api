@@ -26,6 +26,27 @@ async def test_cors_allowed_origin_github_pages(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_cors_allowed_origin_reposhark_vercel(client: AsyncClient):
+    """reposhark.vercel.app (public frontend) must be allowed."""
+    response = await client.get("/health", headers={"Origin": "https://reposhark.vercel.app"})
+    assert response.headers.get("access-control-allow-origin") == "https://reposhark.vercel.app"
+
+
+@pytest.mark.asyncio
+async def test_cors_allowed_origin_reposhark_preview(client: AsyncClient):
+    """reposhark-<hash>.vercel.app preview deploys must be allowed."""
+    response = await client.get("/health", headers={"Origin": "https://reposhark-git-main.vercel.app"})
+    assert response.headers.get("access-control-allow-origin") == "https://reposhark-git-main.vercel.app"
+
+
+@pytest.mark.asyncio
+async def test_cors_allowed_origin_reporium_vercel(client: AsyncClient):
+    """Legacy reporium.vercel.app must remain allowed."""
+    response = await client.get("/health", headers={"Origin": "https://reporium.vercel.app"})
+    assert response.headers.get("access-control-allow-origin") == "https://reporium.vercel.app"
+
+
+@pytest.mark.asyncio
 async def test_cors_blocked_unknown_origin(client: AsyncClient):
     """Unknown origins must not receive allow-origin header."""
     response = await client.get("/health", headers={"Origin": "https://evil.example.com"})
