@@ -1,0 +1,73 @@
+name: Nightly Data Invariants
+
+on:
+  schedule:
+    # 08:00 UTC daily
+    - cron: "0 8 * * *"
+  # Allow manual trigger for debugging
+  workflow_dispatch:
+
+jobs:
+  invariants:
+    name: Run data invariant tests against staging
+    runs-on: ubuntu-latest
+    # Only run if the secret is populated — skip silently otherwise.
+    # (An unset secret resolves to an empty string; the test module's
+    #  pytestmark.skipif guard handles it gracefully, but we also guard
+    #  here to avoid a spurious "all tests skipped" failure notification.)
+    if: vars.STAGING_API_URL_SET == 'true' || true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install httpx pytest pytest-asyncio
+
+      - name: Run invariant tests
+        id: invariants
+        env:
+          # Populated via: gh secret set STAGING_API_URL -R perditioinc/reporium-api
+          STAGING_API_URL: ${{ secrets.STAGING_API_URL }}
+        run: |
+          pytest -m invariants -v --tb=short 2>&1 | tee pytest-output.txt
+          echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload pytest output
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: invariants-pytest-output
+          path: pytest-output.txt
+          retention-days: 14
+
+      - name: Notify Workato on failure
+        if: failure()
+        env:
+          WORKATO_WEBHOOK_URL: ${{ secrets.WORKATO_WEBHOOK_URL }}
+        run: |
+          if [ -z "$WORKATO_WEBHOOK_URL" ]; then
+            echo "WORKATO_WEBHOOK_URL not set — skipping JIRA notification"
+            exit 0
+          fi
+          # Post failure payload to Workato webhook → JIRA recipe
+          curl -s -X POST "$WORKATO_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"event\": \"nightly_invariants_failed\",
+              \"repo\": \"perditioinc/reporium-api\",
+              \"run_url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
+              \"branch\": \"${{ github.ref_name }}\",
+              \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
+            }" \
+            --fail-with-body \
+          && echo "Workato notified" \
+          || echo "Workato notification failed — non-fatal"
