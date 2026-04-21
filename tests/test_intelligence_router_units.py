@@ -29,6 +29,8 @@ import pytest
 from app.routers.intelligence import (
     _MODEL_HAIKU,
     _MODEL_SONNET,
+    _ROUTE_TOP_STARRED,
+    _ROUTE_TOP_STARRED_BY_TOPIC,
     _build_community_signals_snippet,
     _build_pros_cons_snippet,
     _coerce_cached_sources,
@@ -396,3 +398,49 @@ class TestHasEncodedPayloadFalsePositives:
     def test_rot13_requires_word_boundary(self):
         """Naively matching 'rot13' inside 'carrot13k' would be a false positive."""
         assert _has_encoded_payload("the carrot13k library is great") is False
+
+
+# ---------------------------------------------------------------------------
+# _ROUTE_TOP_STARRED_BY_TOPIC — regression guard for the MiniLM "stars"
+# celestial-sense drift that dropped "show me X with the most stars" below
+# _MIN_RETRIEVAL_SIMILARITY and triggered the early-exit canned response.
+# ---------------------------------------------------------------------------
+
+class TestRouteTopStarredByTopic:
+    """The new sibling route must catch 'X with the most stars' shapes and
+    leave the canonical 'top/most-starred repos' shape to the original route.
+    """
+
+    def test_rag_tools_with_most_stars_matches_topic_route(self):
+        """Reported production regression: canned not-enough-info response."""
+        m = _ROUTE_TOP_STARRED_BY_TOPIC.match("Show me RAG tools with the most stars")
+        assert m is not None
+        assert m.group("topic").strip().lower() == "rag tools"
+
+    def test_ai_agent_repos_with_most_stars_matches_topic_route(self):
+        m = _ROUTE_TOP_STARRED_BY_TOPIC.match(
+            "what are the AI agent repos with the most stars"
+        )
+        assert m is not None
+        assert m.group("topic").strip().lower() == "ai agent repos"
+
+    def test_bare_tools_with_most_stars_matches_with_generic_topic(self):
+        """No specific topic — captured 'tools' is stripped to empty by the
+        handler's noun-suffix cleanup, so it behaves like the bare route.
+        """
+        m = _ROUTE_TOP_STARRED_BY_TOPIC.match("show tools with the most stars")
+        assert m is not None
+        assert m.group("topic").strip().lower() == "tools"
+
+    def test_canonical_top_starred_still_matches_original_route(self):
+        """Regression guard: the original shape must keep matching the
+        original regex after the sibling route was added.
+        """
+        assert _ROUTE_TOP_STARRED.match("show the top 10 repos") is not None
+        assert _ROUTE_TOP_STARRED.match("what are the most starred repos") is not None
+
+    def test_repo_info_query_does_not_match_topic_route(self):
+        """'tell me about kestra' must fall through to the repo-info route,
+        not get swallowed by the new stars-topic pattern.
+        """
+        assert _ROUTE_TOP_STARRED_BY_TOPIC.match("tell me about kestra") is None

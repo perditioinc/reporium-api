@@ -214,6 +214,16 @@ _ROUTE_TOP_STARRED = re.compile(
     r"^(what|which|show|list)\s+(are\s+)?(the\s+)?(?:top|most[- ]starred|popular|best)\s+(\d+\s+)?(repos?|repositories|tools?|projects?)?\?*$",
     re.IGNORECASE,
 )
+# KAN-ask-stars-topic: sibling route for "X with the most stars" phrasing.
+# MiniLM-L6-v2 embeds "stars" toward the celestial sense, so vector retrieval
+# falls below _MIN_RETRIEVAL_SIMILARITY and the LLM early-exits. Catching the
+# shape here bypasses retrieval entirely. Captures an optional topic / category
+# ("RAG tools", "AI agents") so the SQL can narrow by primary_category.
+_ROUTE_TOP_STARRED_BY_TOPIC = re.compile(
+    r"^(?:what|which|show|list|give|tell)\s+(?:me\s+)?(?:are\s+)?(?:the\s+)?"
+    r"(?P<topic>.+?)\s+with\s+(?:the\s+)?(?:most|highest|top)\s+stars\s*\?*$",
+    re.IGNORECASE,
+)
 _ROUTE_REPO_INFO = re.compile(
     r"^(what is|tell me about|describe|info about|explain)\s+(?:the\s+)?(?:repo(?:sitory)?\s+)?(?P<name>[a-zA-Z0-9_-]+(?:/[a-zA-Z0-9_-]+)?)\s*\?*$",
     re.IGNORECASE,
@@ -556,20 +566,58 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             "route": "list_categories",
         }
 
-    # --- Top starred repos ---
-    m = _ROUTE_TOP_STARRED.match(q)
-    if m:
-        limit = int(m.group(4).strip()) if m.group(4) else 10
+    # --- Top starred repos (with optional topic filter) ---
+    # KAN-ask-stars-topic: check the "X with the most stars" shape FIRST so we
+    # can narrow by category; fall back to the bare _ROUTE_TOP_STARRED shape
+    # for plain "top/most starred repos" queries.
+    topic_match = _ROUTE_TOP_STARRED_BY_TOPIC.match(q)
+    bare_match = _ROUTE_TOP_STARRED.match(q)
+    if topic_match or bare_match:
+        topic: str | None = None
+        if topic_match:
+            raw_topic = topic_match.group("topic").strip().lower()
+            # Strip trailing generic noun so "RAG tools" → "rag", "AI agent repos" → "ai agent".
+            raw_topic = re.sub(
+                r"\s*(?:repos?|repositories|tools?|projects?|libraries?|frameworks?)\s*$",
+                "",
+                raw_topic,
+            ).strip()
+            topic = raw_topic or None
+
+        limit = 10
+        if bare_match and bare_match.group(4):
+            limit = int(bare_match.group(4).strip())
         limit = min(limit, 25)  # cap
-        result = await db.execute(text("""
-            SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
-                   primary_category, description
-            FROM repos
-            WHERE is_private = false
-            ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
-            LIMIT :limit
-        """), {"limit": limit})
+
+        if topic:
+            sql = text("""
+                SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
+                       primary_category, description
+                FROM repos
+                WHERE is_private = false
+                  AND LOWER(primary_category) LIKE :topic
+                ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+                LIMIT :limit
+            """)
+            params = {"limit": limit, "topic": f"%{topic}%"}
+        else:
+            sql = text("""
+                SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
+                       primary_category, description
+                FROM repos
+                WHERE is_private = false
+                ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+                LIMIT :limit
+            """)
+            params = {"limit": limit}
+
+        result = await db.execute(sql, params)
         rows = result.fetchall()
+        # If a topic was specified but nothing matched, fall through to the LLM
+        # rather than dead-ending with "Top 10 ... in <topic>" and an empty list.
+        if topic and not rows:
+            return None
+
         parts = []
         sources = []
         for row in rows:
@@ -583,8 +631,13 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
                 "forked_from": None, "problem_solved": None,
                 "integration_tags": [],
             })
+        header = (
+            f"Top {len(rows)} most-starred repos in \"{topic}\":"
+            if topic
+            else f"Top {limit} most-starred repos in Reporium:"
+        )
         return {
-            "answer": f"Top {limit} most-starred repos in Reporium:\n\n" + "\n".join(parts),
+            "answer": f"{header}\n\n" + "\n".join(parts),
             "sources": sources,
             "route": "top_starred",
         }
