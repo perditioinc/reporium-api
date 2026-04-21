@@ -304,3 +304,61 @@ async def test_evaluation_endpoint_returns_404_when_no_evaluation(client: AsyncC
     response = await client.get("/repos/eval-test-no-pros/evaluation")
     assert response.status_code == 404
     assert "No evaluation" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_evaluation_endpoint_surfaces_community_health_fields(client: AsyncClient):
+    """Success path: evaluation response must include community-health signals
+    (contributors_count, issue_close_rate, pr_merge_rate, community_health_pct)
+    alongside the AI-generated pros/cons.
+    """
+    from sqlalchemy import text as _text
+
+    # Seed a repo
+    await client.post(
+        "/ingest/repos",
+        json=[{
+            "name": "eval-test-with-pros",
+            "owner": "testowner",
+            "description": "Test repo with evaluation",
+            "is_fork": False,
+            "primary_language": "Python",
+            "github_url": "https://github.com/testowner/eval-test-with-pros",
+            "tags": ["ai"],
+        }],
+        headers=AUTH_HEADERS,
+    )
+
+    # Write pros_cons + community-health fields directly via DB
+    import app.database as db_module
+    async with db_module.async_session_factory() as session:
+        await session.execute(
+            _text(
+                "UPDATE repos SET pros_cons = :pc, pros_cons_generated_at = NOW(), "
+                "contributors_count = :cc, issue_close_rate = :icr, "
+                "pr_merge_rate = :pmr, community_health_pct = :chp "
+                "WHERE name = :name"
+            ),
+            {
+                "pc": json.dumps(_GOOD_EVALUATION),
+                "cc": 42,
+                "icr": 85.0,
+                "pmr": 72.5,
+                "chp": 90,
+                "name": "eval-test-with-pros",
+            },
+        )
+        await session.commit()
+
+    response = await client.get("/repos/eval-test-with-pros/evaluation")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["repo"] == "eval-test-with-pros"
+    assert body["owner"] == "testowner"
+    assert body["evaluation"]["pros"] == _GOOD_EVALUATION["pros"]
+    assert body["generated_at"] is not None
+    # New fields — the core assertion of this regression test
+    assert body["contributors_count"] == 42
+    assert body["issue_close_rate"] == 85.0
+    assert body["pr_merge_rate"] == 72.5
+    assert body["community_health_pct"] == 90
