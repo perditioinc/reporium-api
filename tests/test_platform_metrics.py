@@ -28,9 +28,6 @@ async def _insert_repo(
     async with async_session_factory() as session:
         repo_id = str(uuid.uuid4())
         await session.execute(
-            text("ALTER TABLE repos ADD COLUMN IF NOT EXISTS integration_tags JSONB")
-        )
-        await session.execute(
             text(
                 """
                 INSERT INTO repos (id, name, owner, github_url, forked_from, is_fork, is_private, integration_tags)
