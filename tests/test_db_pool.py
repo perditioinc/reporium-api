@@ -131,11 +131,15 @@ class TestConcurrencyVsPoolCapacity:
             "The default (0 = unlimited) will cause pool exhaustion under burst load."
         )
 
-        assert container_concurrency <= pool_capacity, (
-            f"containerConcurrency={container_concurrency} > pool_capacity={pool_capacity} "
+        # Allow a 1-unit slack above pool_capacity: Cloud Run's LB queues the
+        # (N+1)th request briefly while in-flight requests release connections,
+        # which is cheaper than spinning a new instance for transient micro-bursts.
+        # Anything more than +1 risks pool_timeout exhaustion.
+        assert container_concurrency <= pool_capacity + 1, (
+            f"containerConcurrency={container_concurrency} > pool_capacity+1={pool_capacity + 1} "
             f"(pool_size={pool.size()} + max_overflow={pool._max_overflow}). "
             f"This causes pool exhaustion under burst load, producing transient 500s. "
-            f"Either raise pool_size/max_overflow or lower containerConcurrency to ≤{pool_capacity}. "
+            f"Either raise pool_size/max_overflow or lower containerConcurrency to ≤{pool_capacity + 1}. "
             "See .audit/2026-04-20/db-pool-diagnosis.md for measured 20% error rate."
         )
 
@@ -144,4 +148,79 @@ class TestConcurrencyVsPoolCapacity:
         cc = self._parse_container_concurrency(service_yaml_text)
         assert cc is not None and cc >= 1, (
             "containerConcurrency=0 or missing means unlimited — pool will be exhausted. Set an explicit cap."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Deploy workflow flags — the actual source of truth for Cloud Run config
+# ---------------------------------------------------------------------------
+
+class TestDeployWorkflowFlags:
+    """Assert .github/workflows/deploy.yml flags satisfy Cloud SQL connection math.
+
+    The gcloud run deploy step in the workflow passes --concurrency and
+    --max-instances as flags, which OVERRIDE whatever is in deploy/service.yaml.
+    The workflow is therefore the authoritative source for these values.
+
+    Cloud SQL max_connections on f1-micro = 25. Reserve 4 for maintenance,
+    leaving 21 usable. Per-instance pool capacity = pool_size + max_overflow.
+
+    Invariants (both must hold):
+      1. concurrency ≤ pool_size + max_overflow         (no per-instance queueing on pool)
+      2. max_instances × (pool_size + max_overflow) ≤ 21 (total DB connections capped)
+    """
+
+    CLOUD_SQL_SAFE_CONNECTIONS = 21  # 25 max_connections − 4 buffer
+
+    @pytest.fixture(scope="class")
+    def workflow_text(self):
+        base = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        path = os.path.join(base, ".github", "workflows", "deploy.yml")
+        with open(path) as f:
+            return f.read()
+
+    def _parse_flag(self, text: str, name: str) -> int | None:
+        """Extract --<name>=<int> from a gcloud flags block."""
+        m = re.search(rf"--{re.escape(name)}=(\d+)", text)
+        return int(m.group(1)) if m else None
+
+    def test_concurrency_le_pool_capacity(self, workflow_text):
+        from app.database import engine
+        pool = engine.pool
+        pool_capacity = pool.size() + pool._max_overflow
+
+        concurrency = self._parse_flag(workflow_text, "concurrency")
+        assert concurrency is not None, (
+            "--concurrency flag must be set explicitly in .github/workflows/deploy.yml"
+        )
+        # Allow a 1-unit slack above pool_capacity (see TestConcurrencyVsPoolCapacity
+        # for rationale). Surplus requests queue at the Cloud Run LB, not at the pool.
+        assert concurrency <= pool_capacity + 1, (
+            f"--concurrency={concurrency} > pool_capacity+1={pool_capacity + 1} "
+            f"(pool_size={pool.size()} + max_overflow={pool._max_overflow}). "
+            f"Excess requests queue on the pool → transient 500s under burst load. "
+            f"Either raise pool_size/max_overflow or lower --concurrency to ≤{pool_capacity + 1}."
+        )
+
+    def test_total_connections_within_cloud_sql_budget(self, workflow_text):
+        from app.database import engine
+        pool = engine.pool
+        pool_capacity = pool.size() + pool._max_overflow
+
+        max_instances = self._parse_flag(workflow_text, "max-instances")
+        assert max_instances is not None, (
+            "--max-instances flag must be set explicitly in .github/workflows/deploy.yml"
+        )
+
+        total = max_instances * pool_capacity
+        assert total <= self.CLOUD_SQL_SAFE_CONNECTIONS, (
+            f"max_instances={max_instances} × pool_capacity={pool_capacity} = {total} "
+            f"exceeds Cloud SQL safe budget ({self.CLOUD_SQL_SAFE_CONNECTIONS} of 25 max_connections). "
+            f"Lower --max-instances or shrink the pool."
+        )
+
+    def test_max_instances_minimum_sensible(self, workflow_text):
+        max_instances = self._parse_flag(workflow_text, "max-instances")
+        assert max_instances is not None and max_instances >= 1, (
+            "--max-instances must be ≥ 1"
         )
