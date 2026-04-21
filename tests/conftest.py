@@ -1,6 +1,9 @@
 import os
+import socket
 from collections.abc import AsyncGenerator
+from urllib.parse import urlparse
 
+import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy import text
@@ -34,8 +37,40 @@ AUTH_HEADERS = {"Authorization": f"Bearer {TEST_API_KEY}"}
 TEST_DB_URL = os.environ["DATABASE_URL"]
 
 
+def _test_db_available() -> bool:
+    """Quick TCP probe to see if the test Postgres is reachable.
+
+    If HAS_TEST_DB=1 is set explicitly (e.g. in CI), trust it and don't probe.
+    Otherwise, try a short socket connect to the DATABASE_URL host:port.
+    This lets local dev runs skip DB-dependent tests cleanly instead of
+    failing with ConnectionRefusedError x200+.
+    """
+    if os.getenv("HAS_TEST_DB") == "1":
+        return True
+    # Allow explicit opt-out for CI safety — treat CI as always having DB.
+    if os.getenv("CI") == "true":
+        return True
+    try:
+        # DATABASE_URL looks like postgresql+asyncpg://user:pw@host:port/db
+        parsed = urlparse(TEST_DB_URL.replace("postgresql+asyncpg://", "postgresql://"))
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 5432
+        with socket.create_connection((host, port), timeout=1.0):
+            return True
+    except (OSError, socket.timeout):
+        return False
+
+
+_TEST_DB_AVAILABLE = _test_db_available()
+
+
 @pytest_asyncio.fixture(scope="session")
 async def _setup_db():
+    if not _TEST_DB_AVAILABLE:
+        pytest.skip(
+            "Test Postgres not reachable at DATABASE_URL. "
+            "Start Postgres and set HAS_TEST_DB=1 (or run in CI) to enable DB-dependent tests."
+        )
     await db_module.engine.dispose()
     # NullPool: no connection pooling → each session gets a fresh connection.
     # This prevents "Future attached to a different loop" errors when pytest-asyncio
