@@ -26,30 +26,29 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Start Cloud SQL Proxy for migrations
-        run: |
-          curl -sSLo cloud-sql-proxy \
-            https://storage.googleapis.com/cloud-sql-connectors/cloud-sql-proxy/v2.13.0/cloud-sql-proxy.linux.amd64
-          chmod +x cloud-sql-proxy
-          # Private IP only — proxy will fail if runner can't reach private VPC range.
-          # This is expected for GitHub-hosted runners. Migrations run via Cloud Run Job.
-          ./cloud-sql-proxy --port 5432 --private-ip \
-            perditio-platform:us-central1:reporium-db &
-          sleep 5
-          echo "Cloud SQL Proxy started (PID $!)"
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@77e7a554d41e2ee56fc945c52dfd3f27b12cd0b5 # v2.1.4
 
-      - name: Apply database migrations
-        continue-on-error: true
-        env:
-          ENVIRONMENT: production
-          GCP_PROJECT: perditio-platform
-          DATABASE_URL: postgresql+asyncpg://postgres:${{ secrets.CLOUDSQL_PG_PASS }}@127.0.0.1:5432/reporium
+      - name: Apply database migrations (via Cloud Run Job)
+        # The Cloud SQL instance `reporium-db` is private-IP only (no public IPv4),
+        # so neither direct TCP nor the Cloud SQL Auth Proxy can reach it from a
+        # GitHub-hosted runner — the proxy still needs network path to the
+        # instance endpoint, and the private VPC is unreachable from GitHub's
+        # network. Instead we execute the pre-provisioned `reporium-alembic`
+        # Cloud Run Job, which runs inside the VPC and has direct access.
+        #
+        # `--wait` makes this synchronous and propagates a non-zero exit on
+        # migration failure, so the deploy step below is properly gated.
+        # This replaces the previous `continue-on-error: true` bypass that
+        # silently let schema-dependent code deploy unmigrated.
         run: |
-          # Migrations run against local proxy (port 5432).
-          # On GitHub-hosted runners the proxy cannot reach the private Cloud SQL IP,
-          # so this step is best-effort. Run migrations manually via the
-          # reporium-alembic Cloud Run Job when adding new migrations.
-          alembic upgrade head || echo "Migration step skipped (runner cannot reach private Cloud SQL)"
+          set -euo pipefail
+          echo "Executing reporium-alembic Cloud Run Job (alembic upgrade head)..."
+          gcloud run jobs execute reporium-alembic \
+            --project perditio-platform \
+            --region us-central1 \
+            --wait
+          echo "Migrations completed successfully."
 
       - uses: google-github-actions/deploy-cloudrun@251330ba9a8a34bfbc1622895f42e1d53fd14522 # v2.7.6
         id: deploy
@@ -62,6 +61,7 @@ jobs:
             GRAPH_SNAPSHOT_BUCKET=perditio-platform-bucket
             GRAPH_SNAPSHOT_OBJECT=reporium/graph/knowledge-graph.json
             EMBEDDINGS_AVAILABLE=true
+            METRICS_REQUIRE_AUTH=1
           env_vars_update_strategy: merge
           flags: >-
             --memory=2Gi

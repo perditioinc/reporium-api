@@ -67,10 +67,13 @@ def _configure_logging() -> None:
 _configure_logging()
 logger = logging.getLogger(__name__)
 
+# Sentry: sample 10% of traces (enough to detect P99 regressions at a fraction
+# of the cost) and disable default PII capture so user identifiers from
+# ask/audit surfaces don't leak into error reports.
 sentry_sdk.init(
     dsn=os.getenv("SENTRY_DSN"),
-    traces_sample_rate=1.0,
-    send_default_pii=True,
+    traces_sample_rate=0.1,
+    send_default_pii=False,
     environment=os.getenv("ENVIRONMENT", "production"),
 )
 

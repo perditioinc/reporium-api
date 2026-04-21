@@ -241,3 +241,45 @@ async def test_repo_ingested_event_skips_embed_failure_and_still_returns_200(cli
     assert data["portfolio_insights"]["taxonomy_gap_count"] == 4
     assert invalidate_cache.await_count == 3
     invalidate_memory.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_ingest_flows_tags_and_categories_into_repo_taxonomy(client: AsyncClient):
+    """Regression: tags and categories from the ingest payload must be written
+    into repo_taxonomy so /taxonomy/* endpoints can surface them as dimensions.
+    Previously these were excluded alongside junction-table fields, leaving
+    /taxonomy blind to them.
+    """
+    from sqlalchemy import text as _text
+    import app.database as db_module
+
+    fixture = {
+        **TEST_REPO_FIXTURE,
+        "name": "taxonomy-flow-repo",
+        "github_url": "https://github.com/testuser/taxonomy-flow-repo",
+        "tags": ["ai", "rag", "vector-db"],
+        "categories": [
+            {"category_id": "ai-agents", "category_name": "AI Agents", "is_primary": True},
+            {"category_id": "dev-tools", "category_name": "Developer Tools", "is_primary": False},
+        ],
+    }
+
+    response = await client.post("/ingest/repos", json=[fixture], headers=AUTH_HEADERS)
+    assert response.status_code == 200
+    assert response.json()["upserted"] == 1
+
+    async with db_module.async_session_factory() as session:
+        result = await session.execute(
+            _text(
+                "SELECT dimension, raw_value FROM repo_taxonomy rt "
+                "JOIN repos r ON r.id = rt.repo_id WHERE r.name = :name"
+            ),
+            {"name": "taxonomy-flow-repo"},
+        )
+        rows = {(dim, val) for dim, val in result.all()}
+
+    assert ("tag", "ai") in rows
+    assert ("tag", "rag") in rows
+    assert ("tag", "vector-db") in rows
+    assert ("category", "AI Agents") in rows
+    assert ("category", "Developer Tools") in rows

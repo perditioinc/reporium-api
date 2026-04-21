@@ -381,6 +381,12 @@ async def repo_evaluation(
         "owner": repo.owner,
         "evaluation": repo.pros_cons,
         "generated_at": repo.pros_cons_generated_at.isoformat() if repo.pros_cons_generated_at else None,
+        # Community-health signals — surface alongside AI-generated evaluation so
+        # consumers can cross-reference the model's verdict with raw metrics.
+        "contributors_count": repo.contributors_count,
+        "issue_close_rate": repo.issue_close_rate,
+        "pr_merge_rate": repo.pr_merge_rate,
+        "community_health_pct": repo.community_health_pct,
     }
 
 
