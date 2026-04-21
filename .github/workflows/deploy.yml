@@ -29,12 +29,32 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@77e7a554d41e2ee56fc945c52dfd3f27b12cd0b5 # v2.1.4
 
+      # Option B1 — no-traffic candidate revision + migrate + promote.
+      #
+      # Prior approach (Option A) deployed the revision to 100% traffic FIRST, then
+      # ran migrations. Codex flagged this: if migrations fail, new code is already
+      # live against the old schema. Option B1 eliminates that window entirely:
+      #
+      #   1. Build + deploy a new revision with `no_traffic: true` and a
+      #      `candidate-<sha>` traffic tag. Current revision keeps 100% of traffic.
+      #   2. Resolve that revision's image URI back from Cloud Run.
+      #   3. Point `reporium-alembic` at that image and `--command=alembic`
+      #      `--args=upgrade,head`.
+      #   4. Execute the job with `--wait`. If migrations fail, the workflow fails
+      #      here — the candidate revision continues to serve 0% traffic and the
+      #      old revision keeps serving users. Nothing is promoted.
+      #   5. Only on migration success, shift traffic to the new revision.
+      #
+      # `no_traffic` and `tag` are supported inputs on
+      # google-github-actions/deploy-cloudrun@v2.7.6 (verified in action.yml).
       - uses: google-github-actions/deploy-cloudrun@251330ba9a8a34bfbc1622895f42e1d53fd14522 # v2.7.6
         id: deploy
         with:
           service: reporium-api
           region: us-central1
           source: .
+          no_traffic: true
+          tag: candidate-${{ github.sha }}
           env_vars: |-
             ENVIRONMENT=production
             GRAPH_SNAPSHOT_BUCKET=perditio-platform-bucket
@@ -55,36 +75,51 @@ jobs:
             --subnet=default
             --vpc-egress=private-ranges-only
 
-      - name: Resolve deployed image URI
+      - name: Resolve candidate revision image URI
         id: image
-        # deploy-cloudrun with `source: .` uses Cloud Build to produce a commit-tagged
-        # image (typically gcr.io/perditio-platform/reporium-api:<sha>). Rather than
-        # guess the URI pattern, read it back from the live service spec we just
-        # deployed — this is bulletproof across any Cloud Build naming changes.
+        # The candidate revision carries tag `candidate-<sha>` but serves 0% traffic.
+        # Read the image URI from the tagged revision in `status.traffic[]` — do NOT
+        # use `spec.template.spec.containers[0].image`, which reflects the newest
+        # template but not necessarily the revision actually referenced by the tag.
+        # Cross-referencing the tag with `status.traffic[].revisionName` and looking
+        # up that revision's image is bulletproof across Cloud Build naming changes.
         run: |
           set -euo pipefail
-          IMAGE_URI="$(gcloud run services describe reporium-api \
+          TAG="candidate-${{ github.sha }}"
+          REVISION="$(gcloud run services describe reporium-api \
             --project=perditio-platform \
             --region=us-central1 \
-            --format='value(spec.template.spec.containers[0].image)')"
-          if [ -z "${IMAGE_URI}" ]; then
-            echo "Failed to resolve deployed image URI for reporium-api" >&2
+            --format="value(status.traffic.filter(\"tag:${TAG}\").extract(revisionName).flatten())")"
+          if [ -z "${REVISION}" ]; then
+            echo "Failed to resolve revision for tag ${TAG}" >&2
+            gcloud run services describe reporium-api \
+              --project=perditio-platform --region=us-central1 \
+              --format="value(status.traffic)" >&2 || true
             exit 1
           fi
-          echo "Resolved deployed image: ${IMAGE_URI}"
+          IMAGE_URI="$(gcloud run revisions describe "${REVISION}" \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --format='value(spec.containers[0].image)')"
+          if [ -z "${IMAGE_URI}" ]; then
+            echo "Failed to resolve image URI for revision ${REVISION}" >&2
+            exit 1
+          fi
+          echo "Candidate revision: ${REVISION}"
+          echo "Candidate image:    ${IMAGE_URI}"
+          echo "revision=${REVISION}" >> "$GITHUB_OUTPUT"
           echo "uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
 
-      - name: Point alembic job at current commit image
+      - name: Point alembic job at candidate image
         # Codex audit on PR #392: `gcloud run jobs execute reporium-alembic` runs the
         # image currently configured on the job, NOT the commit being deployed. New
-        # Alembic revisions in this PR would not exist in the stale job image at
-        # execute time, producing a "nothing to do" false success and deploying an
-        # API that expects a schema the DB doesn't have.
+        # Alembic revisions would not exist in the stale job image at execute time,
+        # producing a "nothing to do" false success.
         #
-        # Update the job to the just-deployed API image (which contains this commit's
-        # migrations/ directory and alembic CLI) before executing it. `--command` /
-        # `--args` are set explicitly so behaviour does not depend on the job's
-        # previously-provisioned entrypoint.
+        # Update the job to the candidate API image (contains this commit's
+        # migrations/ directory and the alembic CLI via requirements.txt).
+        # `--command` / `--args` are set explicitly so behaviour does not depend on
+        # the job's previously-provisioned entrypoint.
         run: |
           set -euo pipefail
           echo "Pointing reporium-alembic job at ${{ steps.image.outputs.uri }}"
@@ -99,22 +134,13 @@ jobs:
         # The Cloud SQL instance `reporium-db` is private-IP only (no public IPv4),
         # so neither direct TCP nor the Cloud SQL Auth Proxy can reach it from a
         # GitHub-hosted runner. Instead we execute the pre-provisioned
-        # `reporium-alembic` Cloud Run Job, which runs inside the VPC and has direct
-        # access. The job was pointed at this commit's image in the step above, so
-        # any new revisions under migrations/ are present at execute time.
+        # `reporium-alembic` Cloud Run Job, which runs inside the VPC.
         #
         # `--wait` makes this synchronous and propagates a non-zero exit on
-        # migration failure — NO `continue-on-error: true`. This preserves the
-        # strict failure semantics introduced in PR #392.
-        #
-        # Tradeoff (Option A ordering): migrations run AFTER the service is updated
-        # to new code, so there is a brief window where the new revision serves
-        # traffic against the old schema. This is acceptable for additive
-        # migrations. For breaking/destructive migrations, gate the deploy behind a
-        # manual migration run (execute this job via `gcloud run jobs execute`
-        # before merging) or switch to Option B (pre-build the image with
-        # `gcloud builds submit`, run migrations, then `deploy-cloudrun` with
-        # `image:` instead of `source:`) as a follow-up.
+        # migration failure — NO `continue-on-error: true`. If this step fails, the
+        # subsequent traffic-promotion step will NOT run (GitHub Actions stops the
+        # job at the first failed step), so the candidate revision stays at 0%
+        # traffic and the old revision continues serving users.
         run: |
           set -euo pipefail
           echo "Executing reporium-alembic Cloud Run Job (alembic upgrade head)..."
@@ -123,6 +149,25 @@ jobs:
             --region=us-central1 \
             --wait
           echo "Migrations completed successfully."
+
+      - name: Promote candidate revision to 100% traffic
+        # Only runs if every prior step (including the migration execute) succeeded.
+        # Shifts production traffic from the old revision to the candidate revision
+        # identified by its traffic tag. `--to-tags=candidate-<sha>=100` is precise:
+        # it does not rely on "latest" semantics and is unambiguous about which
+        # revision is being promoted.
+        #
+        # After this succeeds, the tag remains on the revision (harmless) so you can
+        # still curl the tagged URL for post-promotion comparison if needed.
+        run: |
+          set -euo pipefail
+          TAG="candidate-${{ github.sha }}"
+          echo "Promoting tag ${TAG} (revision ${{ steps.image.outputs.revision }}) to 100% traffic"
+          gcloud run services update-traffic reporium-api \
+            --to-tags="${TAG}=100" \
+            --project=perditio-platform \
+            --region=us-central1
+          echo "Traffic shifted to candidate revision."
 
       - name: Prune old container images (keep latest 5)
         if: success()
