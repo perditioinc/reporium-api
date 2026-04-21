@@ -9,7 +9,11 @@ spec:
         autoscaling.knative.dev/minScale: "0"
         autoscaling.knative.dev/maxScale: "3"
     spec:
-      containerConcurrency: 20
+      # Capped at 8 (≤ pool_size+max_overflow=7) to prevent DB pool saturation.
+      # At 20 concurrency the pool exhausted under burst load, causing ~20%
+      # transient 500s. Cloud Run will scale out a new instance before a
+      # single instance is overwhelmed. See .audit/2026-04-20/db-pool-diagnosis.md
+      containerConcurrency: 8
       timeoutSeconds: 60
       containers:
         - image: gcr.io/PROJECT_ID/reporium-api:latest
