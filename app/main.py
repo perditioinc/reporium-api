@@ -1,3 +1,4 @@
+import asyncio
 import json
 import logging
 import os
@@ -94,9 +95,8 @@ async def lifespan(app: FastAPI):
     # Cloud Run. The model is ~90 MB and loads once per process.
     # Skip in test environments to avoid slow model downloads in CI.
     if os.environ.get("ENVIRONMENT", "").lower() != "test":
-        import asyncio as _asyncio
         from app.embeddings import get_embedding_model as _get_embedding_model
-        loop = _asyncio.get_event_loop()
+        loop = asyncio.get_event_loop()
         _emb_start = time.perf_counter()
         await loop.run_in_executor(None, _get_embedding_model)
         _emb_ms = round((time.perf_counter() - _emb_start) * 1000, 1)
@@ -105,7 +105,7 @@ async def lifespan(app: FastAPI):
         logger.info("Skipping embedding model pre-warm (test environment)")
     # Start query_log retention purge loop (fire-and-forget background task).
     from app.retention import retention_loop
-    _asyncio.create_task(retention_loop())
+    asyncio.create_task(retention_loop())
     logger.info("Retention purge loop scheduled")
     yield
     await cache.disconnect()
