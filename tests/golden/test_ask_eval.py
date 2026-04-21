@@ -82,6 +82,23 @@ RESULTS_PATH = RESULTS_DIR / "latest.json"
 ASK_PATH = "/intelligence/ask"
 DEFAULT_TIMEOUT_S = 60.0
 
+# ---------------------------------------------------------------------------
+# Rate-limit pacing
+# ---------------------------------------------------------------------------
+# The `/intelligence/ask` endpoint is rate-limited at 6/minute, 60/day per IP.
+# Fire-and-forget in a tight loop would trip the limiter and record false
+# failures, so the runner paces itself and optionally caps the question count.
+#
+#   ASK_EVAL_SLEEP_SECONDS  seconds to sleep between requests (default 11;
+#                           headroom under the 6/min limit). Set to 0 to
+#                           opt out entirely (e.g. local runs against a mock).
+#   ASK_EVAL_MAX_QUESTIONS  cap on how many questions the run sends. Unset
+#                           = unlimited. Useful for a cheap smoke pass
+#                           before spending the full daily quota.
+_SLEEP = float(os.environ.get("ASK_EVAL_SLEEP_SECONDS", "11"))
+_MAX = os.environ.get("ASK_EVAL_MAX_QUESTIONS")
+_MAX_INT = int(_MAX) if _MAX else None
+
 
 # ---------------------------------------------------------------------------
 # Loading
@@ -157,6 +174,11 @@ def test_ask_golden_eval_baseline():
     questions = _load_questions()
     assert len(questions) == 50, f"Expected 50 questions, got {len(questions)}"
 
+    # Apply the optional cap BEFORE iterating so summary counts match what we
+    # actually sent. The full 50-question YAML is still validated above.
+    if _MAX_INT is not None:
+        questions = questions[:_MAX_INT]
+
     RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
     per_entry: list[dict[str, Any]] = []
@@ -164,8 +186,13 @@ def test_ask_golden_eval_baseline():
 
     started_at = time.time()
 
+    print(
+        f"[eval] pacing: {_SLEEP}s between requests, "
+        f"max={_MAX_INT if _MAX_INT is not None else 'unlimited'}"
+    )
+
     with _make_client() as client:
-        for q in questions:
+        for idx, q in enumerate(questions):
             qid = q.get("id", "?")
             question = q.get("question", "")
             category = q.get("category", "?")
@@ -193,6 +220,10 @@ def test_ask_golden_eval_baseline():
                         "error": repr(e),
                     }
                 )
+                # Still pace after a transport error so repeated failures
+                # don't hammer the endpoint.
+                if _SLEEP > 0 and idx < len(questions) - 1:
+                    time.sleep(_SLEEP)
                 continue
 
             answer = (payload or {}).get("answer", "") or ""
@@ -222,6 +253,11 @@ def test_ask_golden_eval_baseline():
                     "answer_len": len(answer),
                 }
             )
+
+            # Pace ourselves under the 6/min, 60/day per-IP rate limit.
+            # Skip the trailing sleep after the last question.
+            if _SLEEP > 0 and idx < len(questions) - 1:
+                time.sleep(_SLEEP)
 
     finished_at = time.time()
 

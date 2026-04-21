@@ -55,6 +55,33 @@ ASK_EVAL_APP_TOKEN=<your X-App-Token> \
 
 Results are written to `tests/golden/.results/latest.json` (gitignored).
 
+### Rate limit pacing
+
+The `/intelligence/ask` endpoint is rate-limited at **6 requests/minute and
+60 requests/day per IP**. Firing all 50 questions in a tight loop will trip
+the limiter and record false failures (and burn the daily quota on noise).
+The runner exposes two env vars to pace itself:
+
+| env var | default | purpose |
+| --- | --- | --- |
+| `ASK_EVAL_SLEEP_SECONDS` | `11` | Seconds to sleep between requests. `11` keeps us safely under the 6/min ceiling. Set to `0` to opt out entirely (e.g. local runs against a mock). |
+| `ASK_EVAL_MAX_QUESTIONS` | unset (unlimited) | Cap on how many questions the run sends. Useful for a cheap smoke pass before spending the full daily quota. |
+
+Recommended **first baseline** against a live API — short pass to confirm
+the harness is wired correctly before committing 50 questions of quota:
+
+```bash
+ASK_EVAL_MAX_QUESTIONS=10 \
+ASK_EVAL_SLEEP_SECONDS=12 \
+RUN_GOLDEN_EVAL=1 \
+ASK_EVAL_BASE_URL=http://localhost:8000 \
+ASK_EVAL_APP_TOKEN=<your X-App-Token> \
+    pytest tests/golden/test_ask_eval.py -v -s
+```
+
+A full 50-question run at the default 11-second pacing takes ~9 minutes of
+wall clock and uses 50 of the 60 daily requests — plan accordingly.
+
 ## Question schema
 
 ```yaml
