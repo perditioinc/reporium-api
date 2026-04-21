@@ -66,6 +66,11 @@ _TAXONOMY_DIMENSION_MAP = {
     "modalities": "modality",
     "ai_trends": "ai_trend",
     "deployment_context": "deployment_context",
+    # Tags and categories are stored in their own junction tables (repo_tags,
+    # repo_categories) but also need to flow into repo_taxonomy so the /taxonomy
+    # endpoints and rebuild job can surface them as dimensions.
+    "tags": "tag",
+    "categories": "category",
 }
 
 
@@ -286,6 +291,15 @@ async def _upsert_repo_taxonomy(db: AsyncSession, repo_id, item_dict: dict) -> N
         for raw_value in values:
             if not raw_value:
                 continue
+            # Categories arrive as dicts (category_id/category_name/is_primary);
+            # flatten to the human-readable name so the taxonomy surface is
+            # consistent with how other dimensions store raw_value as a string.
+            if isinstance(raw_value, dict):
+                raw_value = raw_value.get("category_name") or raw_value.get("category_id")
+                if not raw_value:
+                    continue
+            if not isinstance(raw_value, str):
+                raw_value = str(raw_value)
             await db.execute(
                 _text(
                     "INSERT INTO repo_taxonomy (repo_id, dimension, raw_value, assigned_by) "
