@@ -45,6 +45,15 @@ jobs:
 
       - run: pip install pytest pytest-asyncio==0.24.0 httpx pytest-timeout==2.3.1
 
+      # Alembic migration smoke test: run `alembic upgrade head` against the
+      # pgvector service BEFORE pytest. Catches deploy-blocking migration bugs
+      # in CI (e.g. bad DDL, autocommit_block misuse, missing env support) that
+      # previously only surfaced in the production deploy job or ingestion CI.
+      # See #400/#403/#404 — several escaped unit tests.
+      - name: Alembic upgrade head (migration smoke test)
+        run: alembic upgrade head
+        timeout-minutes: 3
+
       - run: pytest tests/ -v --timeout=60
         timeout-minutes: 10
 
