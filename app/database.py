@@ -17,9 +17,22 @@ engine = create_async_engine(
     # db-f1-micro has max_connections=25. Keep pool small so multiple Cloud Run
     # instances don't exhaust connections. 5 + 2 overflow = 7 per instance;
     # at max 3 concurrent instances that is 21 — well under the limit.
+    #
+    # containerConcurrency in deploy/service.yaml is set to 8 (≤ pool_size+max_overflow)
+    # to prevent pool starvation: requests beyond 7 concurrent DB connections
+    # would queue and hit the 30s pool_timeout under normal f1-micro latency,
+    # causing transient 500s (~20% error rate measured 2026-04-20).
     pool_size=5,
     max_overflow=2,
+    # Fail fast on pool exhaustion (10s) rather than waiting the default 30s.
+    # Under pool saturation a fast 500 is better than a 30s hanging request
+    # that delays the client's retry and blocks Uvicorn workers.
+    pool_timeout=10,
     pool_recycle=1800,
+    # asyncpg statement-level timeout: abort any single query that runs longer
+    # than 20s. Prevents a rogue slow query from holding a connection and
+    # starving the pool even when concurrency is within bounds.
+    connect_args={"command_timeout": 20},
 )
 
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
