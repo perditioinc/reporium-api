@@ -130,10 +130,15 @@ jobs:
         run: |
           set -euo pipefail
           echo "Pointing reporium-alembic job at ${{ steps.image.outputs.uri }}"
+          # ENVIRONMENT=production triggers app/config.py._resolve_database_url()
+          # to fetch DATABASE_URL from Secret Manager (reporium-db-url-async).
+          # Without it, the container falls back to localhost:5432 and hits
+          # ConnectionRefusedError. Matches env vars on the reporium-api service.
           gcloud run jobs update reporium-alembic \
             --image="${{ steps.image.outputs.uri }}" \
             --command=alembic \
             --args=upgrade,head \
+            --set-env-vars=ENVIRONMENT=production,GCP_PROJECT=perditio-platform \
             --project=perditio-platform \
             --region=us-central1
 
