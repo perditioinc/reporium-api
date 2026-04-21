@@ -62,6 +62,7 @@ jobs:
             GRAPH_SNAPSHOT_BUCKET=perditio-platform-bucket
             GRAPH_SNAPSHOT_OBJECT=reporium/graph/knowledge-graph.json
             EMBEDDINGS_AVAILABLE=true
+            METRICS_REQUIRE_AUTH=1
           env_vars_update_strategy: merge
           flags: >-
             --memory=2Gi
