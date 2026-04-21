@@ -18,6 +18,24 @@ cache, evidence packs) have a numerical reference to beat.
 **All 50 questions are currently `source: synthetic`.** Replace them with
 redacted real traffic from `query_log` as it becomes available.
 
+## 🔒 Privacy boundary (READ BEFORE ADDING QUESTIONS)
+
+This golden set is **synthetic-only** and safe for public CI.
+
+**Do NOT add to this file**:
+- Production logs or real user questions
+- PII, IP addresses, session identifiers, or any user-derived strings
+- API tokens, keys, or any credential material
+- Customer-specific prompts or proprietary query patterns
+
+Sensitive or user-derived eval examples belong in the private overlay repo
+**`perditioinc/reporium-evals`**, which is reserved for exactly that purpose.
+The runner in this repo will be extended in a later sprint to merge the
+public base with the private overlay at load time.
+
+If you are unsure whether a question belongs here or in the private overlay,
+default to the private overlay.
+
 ## How to run
 
 The eval is **not** part of the default `pytest` run because it makes real
