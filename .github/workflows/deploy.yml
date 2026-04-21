@@ -29,6 +29,13 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@77e7a554d41e2ee56fc945c52dfd3f33d12def9a # v2.1.4
 
+      # Cloud Run constraint: traffic tag + service name must be ≤ 46 chars.
+      # service="reporium-api" (12) + "-" + tag → tag must be ≤ 33 chars.
+      # Short SHA (7 chars) + "candidate-" prefix (10) = 17 chars. Safe.
+      - name: Compute short SHA
+        id: meta
+        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
       # Option B1 — no-traffic candidate revision + migrate + promote.
       #
       # Prior approach (Option A) deployed the revision to 100% traffic FIRST, then
@@ -54,7 +61,7 @@ jobs:
           region: us-central1
           source: .
           no_traffic: true
-          tag: candidate-${{ github.sha }}
+          tag: candidate-${{ steps.meta.outputs.short_sha }}
           env_vars: |-
             ENVIRONMENT=production
             GRAPH_SNAPSHOT_BUCKET=perditio-platform-bucket
@@ -85,7 +92,7 @@ jobs:
         # up that revision's image is bulletproof across Cloud Build naming changes.
         run: |
           set -euo pipefail
-          TAG="candidate-${{ github.sha }}"
+          TAG="candidate-${{ steps.meta.outputs.short_sha }}"
           REVISION="$(gcloud run services describe reporium-api \
             --project=perditio-platform \
             --region=us-central1 \
@@ -161,7 +168,7 @@ jobs:
         # still curl the tagged URL for post-promotion comparison if needed.
         run: |
           set -euo pipefail
-          TAG="candidate-${{ github.sha }}"
+          TAG="candidate-${{ steps.meta.outputs.short_sha }}"
           echo "Promoting tag ${TAG} (revision ${{ steps.image.outputs.revision }}) to 100% traffic"
           gcloud run services update-traffic reporium-api \
             --to-tags="${TAG}=100" \
