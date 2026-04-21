@@ -400,7 +400,9 @@ async def ingest_repos(
 
 
 @router.post("/repos/{name}/enrich", response_model=dict)
+@limiter.limit("600/minute")  # belt-and-suspenders; endpoint is X-Ingest-Key gated
 async def enrich_repo(
+    request: Request,
     name: str,
     item: RepoEnrichItem,
     db: AsyncSession = Depends(get_db),
@@ -445,7 +447,9 @@ async def enrich_repo(
 
 
 @router.post("/trends/snapshot", response_model=list[TrendSnapshotOut])
+@limiter.limit("600/minute")  # belt-and-suspenders; endpoint is X-Ingest-Key gated
 async def ingest_trend_snapshot(
+    request: Request,
     items: list[TrendSnapshotIn],
     db: AsyncSession = Depends(get_db),
 ) -> list[TrendSnapshotOut]:
@@ -466,7 +470,9 @@ async def ingest_trend_snapshot(
 
 
 @router.post("/gaps", response_model=list[GapAnalysisOut])
+@limiter.limit("600/minute")  # belt-and-suspenders; endpoint is X-Ingest-Key gated
 async def ingest_gaps(
+    request: Request,
     items: list[GapAnalysisIn],
     db: AsyncSession = Depends(get_db),
 ) -> list[GapAnalysisOut]:
@@ -486,7 +492,9 @@ async def ingest_gaps(
 
 
 @router.post("/log", response_model=IngestionLogOut)
+@limiter.limit("600/minute")  # belt-and-suspenders; endpoint is X-Ingest-Key gated
 async def ingest_log(
+    request: Request,
     item: IngestionLogIn,
     db: AsyncSession = Depends(get_db),
 ) -> IngestionLogOut:
@@ -524,6 +532,7 @@ async def ingest_log(
 
 
 @events_router.post("/repo-ingested", response_model=dict)
+@limiter.limit("600/minute")  # belt-and-suspenders; endpoint is X-Ingest-Key gated
 async def repo_ingested_event(
     request: Request,
     db: AsyncSession = Depends(get_db),
@@ -569,6 +578,7 @@ async def repo_ingested_event(
 # ---------------------------------------------------------------------------
 
 @events_router.post("/repo-added", response_model=dict)
+@limiter.limit("600/minute")  # belt-and-suspenders; endpoint is X-Ingest-Key gated
 async def repo_added_event(
     request: Request,
     db: AsyncSession = Depends(get_db),

@@ -7,6 +7,9 @@ on:
     - cron: '*/10 0-2 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   ping:
     runs-on: ubuntu-latest
