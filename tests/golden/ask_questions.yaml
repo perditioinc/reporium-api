@@ -1,0 +1,537 @@
+# ---------------------------------------------------------------------------
+# Reporium Ask — Golden Question Set (Sprint 0 baseline)
+# ---------------------------------------------------------------------------
+# version: 0.1.0
+# schema:
+#   id                   string   stable opaque identifier ("Q001" .. "Q050")
+#   question             string   the user-facing natural-language question
+#   category             enum     count | lookup | compare | recommend |
+#                                 taxonomy | trend | graph | health | synthesis
+#   expected_route       enum     router bucket we EXPECT Sprint 1 to pick.
+#                                 NOT asserted in Sprint 0 (router does not
+#                                 exist yet). Left in place so later sprints
+#                                 can enable route-accuracy checks without
+#                                 re-editing this file.
+#   must_mention         list     lowercased substrings that should appear
+#                                 somewhere in answer.lower(). Empty list is
+#                                 allowed but discouraged — every question
+#                                 should have at least one grounding anchor
+#                                 where possible.
+#   must_not_mention     list     lowercased substrings that must NOT appear
+#                                 (hallucination guardrails, wrong-tool names,
+#                                 off-topic drift).
+#   expected_source_ids  list     optional repo slugs ("owner/name") we expect
+#                                 to see in the sources array. Not yet asserted
+#                                 in Sprint 0 — collected for later precision
+#                                 measurement.
+#   source               enum     synthetic | user_drafted. ALL entries in
+#                                 this initial set are synthetic; real traffic
+#                                 logs should replace them incrementally once
+#                                 query_log has consented samples.
+#   notes                string   rationale / origin — where the question came
+#                                 from (which frontend page or endpoint).
+#
+# Distribution target (roughly balanced):
+#   count=4  lookup=8  compare=5  recommend=6  taxonomy=6
+#   trend=5  graph=6   health=5   synthesis=5
+# ---------------------------------------------------------------------------
+
+- id: Q001
+  question: "How many RAG tools do you track?"
+  category: count
+  expected_route: count
+  must_mention: ["rag"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Numeric aggregate; maps to a taxonomy-filtered count, not LLM synthesis."
+
+- id: Q002
+  question: "How many repositories are in the Reporium catalog?"
+  category: count
+  expected_route: count
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Global corpus size — /analytics or /platform/metrics derives this."
+
+- id: Q003
+  question: "How many agent frameworks do you have?"
+  category: count
+  expected_route: count
+  must_mention: ["agent"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Category-scoped count; agent-frameworks is a known taxonomy value."
+
+- id: Q004
+  question: "How many tools are tagged with LangChain?"
+  category: count
+  expected_route: count
+  must_mention: ["langchain"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Integration-tag count; /mentions and /nl_filter touch this shape."
+
+- id: Q005
+  question: "Tell me about LangChain."
+  category: lookup
+  expected_route: lookup
+  must_mention: ["langchain"]
+  must_not_mention: []
+  expected_source_ids: ["langchain-ai/langchain"]
+  source: synthetic
+  notes: "Canonical single-repo lookup — /repos/{slug} underlies this."
+
+- id: Q006
+  question: "What is LlamaIndex used for?"
+  category: lookup
+  expected_route: lookup
+  must_mention: ["llamaindex"]
+  must_not_mention: []
+  expected_source_ids: ["run-llama/llama_index"]
+  source: synthetic
+  notes: "Purpose/description lookup against a known repo."
+
+- id: Q007
+  question: "What does CrewAI do?"
+  category: lookup
+  expected_route: lookup
+  must_mention: ["crewai"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Agent framework lookup — verifies enrichment surfaces the summary."
+
+- id: Q008
+  question: "Explain what Haystack is."
+  category: lookup
+  expected_route: lookup
+  must_mention: ["haystack"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Lookup with a verb-phrased user intent; same target as Q007 pattern."
+
+- id: Q009
+  question: "Describe the AutoGen project."
+  category: lookup
+  expected_route: lookup
+  must_mention: ["autogen"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Microsoft AutoGen; validates cased-name handling."
+
+- id: Q010
+  question: "What is DSPy?"
+  category: lookup
+  expected_route: lookup
+  must_mention: ["dspy"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Short acronym lookup — exercises query normalization."
+
+- id: Q011
+  question: "Give me a summary of Semantic Kernel."
+  category: lookup
+  expected_route: lookup
+  must_mention: ["semantic kernel"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Multi-word name; also in Microsoft orbit."
+
+- id: Q012
+  question: "What can you tell me about vLLM?"
+  category: lookup
+  expected_route: lookup
+  must_mention: ["vllm"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Inference engine lookup; checks non-agent category coverage."
+
+- id: Q013
+  question: "LangChain vs LlamaIndex — which should I use?"
+  category: compare
+  expected_route: compare
+  must_mention: ["langchain", "llamaindex"]
+  must_not_mention: []
+  expected_source_ids: ["langchain-ai/langchain", "run-llama/llama_index"]
+  source: synthetic
+  notes: "Classic head-to-head; /compare endpoint exists for this."
+
+- id: Q014
+  question: "Compare CrewAI and AutoGen for multi-agent orchestration."
+  category: compare
+  expected_route: compare
+  must_mention: ["crewai", "autogen"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Two-tool compare with a use-case qualifier."
+
+- id: Q015
+  question: "How does Haystack differ from LangChain?"
+  category: compare
+  expected_route: compare
+  must_mention: ["haystack", "langchain"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Natural-language phrasing of a compare; router must detect it."
+
+- id: Q016
+  question: "vLLM vs TGI for production inference."
+  category: compare
+  expected_route: compare
+  must_mention: ["vllm"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Inference server comparison; must_mention only one to keep gate loose."
+
+- id: Q017
+  question: "Pinecone vs Weaviate vs Qdrant — pros and cons?"
+  category: compare
+  expected_route: compare
+  must_mention: ["pinecone", "weaviate", "qdrant"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Three-way vector DB compare; stresses multi-entity routing."
+
+- id: Q018
+  question: "What's the best RAG framework for a small team?"
+  category: recommend
+  expected_route: recommend
+  must_mention: ["rag"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Opinionated recommendation with audience qualifier."
+
+- id: Q019
+  question: "Recommend a good tool for building chatbots with memory."
+  category: recommend
+  expected_route: recommend
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Capability-driven recommend; feature keyword 'memory'."
+
+- id: Q020
+  question: "Which agent framework should I pick if I care about observability?"
+  category: recommend
+  expected_route: recommend
+  must_mention: ["agent"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Quality-attribute recommend; exercises secondary-signal weighting."
+
+- id: Q021
+  question: "What's a lightweight alternative to LangChain?"
+  category: recommend
+  expected_route: recommend
+  must_mention: ["langchain"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Alternative-to phrasing; router should NOT treat as lookup."
+
+- id: Q022
+  question: "Best vector database for a serverless stack?"
+  category: recommend
+  expected_route: recommend
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Architecture-constrained recommend; verifies deployment filters."
+
+- id: Q023
+  question: "What should I use to evaluate my LLM app?"
+  category: recommend
+  expected_route: recommend
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Eval-tooling recommend; new-ish category, good regression canary."
+
+- id: Q024
+  question: "What categories exist in Reporium?"
+  category: taxonomy
+  expected_route: taxonomy
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Direct /taxonomy enumeration; should NOT invoke LLM synthesis."
+
+- id: Q025
+  question: "Show me all industries covered in the catalog."
+  category: taxonomy
+  expected_route: taxonomy
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Taxonomy dimension: industries; mirrors a /taxonomy facet."
+
+- id: Q026
+  question: "List the AI development skills you track."
+  category: taxonomy
+  expected_route: taxonomy
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "ai_dev_skills facet; frontend taxonomy page surfaces this."
+
+- id: Q027
+  question: "What tags are used for inference tools?"
+  category: taxonomy
+  expected_route: taxonomy
+  must_mention: ["infer"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Scoped taxonomy query; combines facet + category."
+
+- id: Q028
+  question: "How many categories does Reporium define?"
+  category: taxonomy
+  expected_route: taxonomy
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Count-shaped but over taxonomy metadata, not repos — router edge case."
+
+- id: Q029
+  question: "What programming languages are represented in the catalog?"
+  category: taxonomy
+  expected_route: taxonomy
+  must_mention: ["python"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Language facet; python is guaranteed to appear in any real catalog."
+
+- id: Q030
+  question: "What's trending this week in AI agents?"
+  category: trend
+  expected_route: trend
+  must_mention: ["agent"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "/trends endpoint, 7d window, category-scoped."
+
+- id: Q031
+  question: "Which repos are growing fastest right now?"
+  category: trend
+  expected_route: trend
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Growth-rate trend; no explicit window (router picks default)."
+
+- id: Q032
+  question: "Show me the top trending RAG tools this month."
+  category: trend
+  expected_route: trend
+  must_mention: ["rag"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "30d window + category + ranking; composite intent."
+
+- id: Q033
+  question: "What's newly added in the last 30 days?"
+  category: trend
+  expected_route: trend
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Freshness query; /trends or /repos?sort=new."
+
+- id: Q034
+  question: "Which vector databases are gaining traction?"
+  category: trend
+  expected_route: trend
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Momentum phrasing; routes to trend despite no explicit time word."
+
+- id: Q035
+  question: "What's similar to LangChain?"
+  category: graph
+  expected_route: graph
+  must_mention: ["langchain"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Similarity edge traversal; /graph/similar."
+
+- id: Q036
+  question: "What depends on LangChain?"
+  category: graph
+  expected_route: graph
+  must_mention: ["langchain"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Reverse-dependency edge; DEPENDS_ON edge type (see KG roadmap)."
+
+- id: Q037
+  question: "Show me tools that integrate with Pinecone."
+  category: graph
+  expected_route: graph
+  must_mention: ["pinecone"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "INTEGRATES_WITH edge; taxonomy + graph hybrid."
+
+- id: Q038
+  question: "What are alternatives to Haystack?"
+  category: graph
+  expected_route: graph
+  must_mention: ["haystack"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "ALTERNATIVE_TO edge; distinct from recommend (fact, not opinion)."
+
+- id: Q039
+  question: "Which repos are related to vLLM?"
+  category: graph
+  expected_route: graph
+  must_mention: ["vllm"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Generic related-to — router must pick graph over lookup."
+
+- id: Q040
+  question: "What tools does CrewAI build on top of?"
+  category: graph
+  expected_route: graph
+  must_mention: ["crewai"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Forward dependency edge; inverse of Q036."
+
+- id: Q041
+  question: "Is LangChain still actively maintained?"
+  category: health
+  expected_route: health
+  must_mention: ["langchain"]
+  must_not_mention: []
+  expected_source_ids: ["langchain-ai/langchain"]
+  source: synthetic
+  notes: "Health signal; derived from commits_last_30_days + activity_score."
+
+- id: Q042
+  question: "What's the maintenance status of Haystack?"
+  category: health
+  expected_route: health
+  must_mention: ["haystack"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Synonym of Q041; router should route to same handler."
+
+- id: Q043
+  question: "Is AutoGen abandoned?"
+  category: health
+  expected_route: health
+  must_mention: ["autogen"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Negative-framed health question; answer must not hedge into irrelevance."
+
+- id: Q044
+  question: "How healthy is the vLLM project?"
+  category: health
+  expected_route: health
+  must_mention: ["vllm"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Community-signal health; pulls stars, issues, commit cadence."
+
+- id: Q045
+  question: "Which popular repos haven't shipped a commit in 90 days?"
+  category: health
+  expected_route: health
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Catalog-wide stale-repo filter; exercises health facet aggregation."
+
+- id: Q046
+  question: "Explain the evolution of RAG frameworks over the last two years."
+  category: synthesis
+  expected_route: synthesis
+  must_mention: ["rag"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Open-ended narrative; unavoidably LLM-synthesis (expensive route)."
+
+- id: Q047
+  question: "Give me an overview of the agent framework landscape in 2026."
+  category: synthesis
+  expected_route: synthesis
+  must_mention: ["agent"]
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Survey-shaped ask; forces multi-repo synthesis."
+
+- id: Q048
+  question: "How has the vector database ecosystem changed recently?"
+  category: synthesis
+  expected_route: synthesis
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Trend + synthesis hybrid; router should prefer synthesis for narrative."
+
+- id: Q049
+  question: "What are the main trade-offs between open-source and hosted LLM stacks?"
+  category: synthesis
+  expected_route: synthesis
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Conceptual synthesis; no single-repo anchor."
+
+- id: Q050
+  question: "Summarize how AI coding assistants have evolved in the catalog."
+  category: synthesis
+  expected_route: synthesis
+  must_mention: []
+  must_not_mention: []
+  expected_source_ids: []
+  source: synthetic
+  notes: "Category-scoped synthesis; good regression test for freshness + recall."
