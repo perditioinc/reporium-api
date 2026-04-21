@@ -29,27 +29,6 @@ jobs:
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@77e7a554d41e2ee56fc945c52dfd3f27b12cd0b5 # v2.1.4
 
-      - name: Apply database migrations (via Cloud Run Job)
-        # The Cloud SQL instance `reporium-db` is private-IP only (no public IPv4),
-        # so neither direct TCP nor the Cloud SQL Auth Proxy can reach it from a
-        # GitHub-hosted runner — the proxy still needs network path to the
-        # instance endpoint, and the private VPC is unreachable from GitHub's
-        # network. Instead we execute the pre-provisioned `reporium-alembic`
-        # Cloud Run Job, which runs inside the VPC and has direct access.
-        #
-        # `--wait` makes this synchronous and propagates a non-zero exit on
-        # migration failure, so the deploy step below is properly gated.
-        # This replaces the previous `continue-on-error: true` bypass that
-        # silently let schema-dependent code deploy unmigrated.
-        run: |
-          set -euo pipefail
-          echo "Executing reporium-alembic Cloud Run Job (alembic upgrade head)..."
-          gcloud run jobs execute reporium-alembic \
-            --project perditio-platform \
-            --region us-central1 \
-            --wait
-          echo "Migrations completed successfully."
-
       - uses: google-github-actions/deploy-cloudrun@251330ba9a8a34bfbc1622895f42e1d53fd14522 # v2.7.6
         id: deploy
         with:
@@ -75,6 +54,75 @@ jobs:
             --network=default
             --subnet=default
             --vpc-egress=private-ranges-only
+
+      - name: Resolve deployed image URI
+        id: image
+        # deploy-cloudrun with `source: .` uses Cloud Build to produce a commit-tagged
+        # image (typically gcr.io/perditio-platform/reporium-api:<sha>). Rather than
+        # guess the URI pattern, read it back from the live service spec we just
+        # deployed — this is bulletproof across any Cloud Build naming changes.
+        run: |
+          set -euo pipefail
+          IMAGE_URI="$(gcloud run services describe reporium-api \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --format='value(spec.template.spec.containers[0].image)')"
+          if [ -z "${IMAGE_URI}" ]; then
+            echo "Failed to resolve deployed image URI for reporium-api" >&2
+            exit 1
+          fi
+          echo "Resolved deployed image: ${IMAGE_URI}"
+          echo "uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Point alembic job at current commit image
+        # Codex audit on PR #392: `gcloud run jobs execute reporium-alembic` runs the
+        # image currently configured on the job, NOT the commit being deployed. New
+        # Alembic revisions in this PR would not exist in the stale job image at
+        # execute time, producing a "nothing to do" false success and deploying an
+        # API that expects a schema the DB doesn't have.
+        #
+        # Update the job to the just-deployed API image (which contains this commit's
+        # migrations/ directory and alembic CLI) before executing it. `--command` /
+        # `--args` are set explicitly so behaviour does not depend on the job's
+        # previously-provisioned entrypoint.
+        run: |
+          set -euo pipefail
+          echo "Pointing reporium-alembic job at ${{ steps.image.outputs.uri }}"
+          gcloud run jobs update reporium-alembic \
+            --image="${{ steps.image.outputs.uri }}" \
+            --command=alembic \
+            --args=upgrade,head \
+            --project=perditio-platform \
+            --region=us-central1
+
+      - name: Apply database migrations (via Cloud Run Job)
+        # The Cloud SQL instance `reporium-db` is private-IP only (no public IPv4),
+        # so neither direct TCP nor the Cloud SQL Auth Proxy can reach it from a
+        # GitHub-hosted runner. Instead we execute the pre-provisioned
+        # `reporium-alembic` Cloud Run Job, which runs inside the VPC and has direct
+        # access. The job was pointed at this commit's image in the step above, so
+        # any new revisions under migrations/ are present at execute time.
+        #
+        # `--wait` makes this synchronous and propagates a non-zero exit on
+        # migration failure — NO `continue-on-error: true`. This preserves the
+        # strict failure semantics introduced in PR #392.
+        #
+        # Tradeoff (Option A ordering): migrations run AFTER the service is updated
+        # to new code, so there is a brief window where the new revision serves
+        # traffic against the old schema. This is acceptable for additive
+        # migrations. For breaking/destructive migrations, gate the deploy behind a
+        # manual migration run (execute this job via `gcloud run jobs execute`
+        # before merging) or switch to Option B (pre-build the image with
+        # `gcloud builds submit`, run migrations, then `deploy-cloudrun` with
+        # `image:` instead of `source:`) as a follow-up.
+        run: |
+          set -euo pipefail
+          echo "Executing reporium-alembic Cloud Run Job (alembic upgrade head)..."
+          gcloud run jobs execute reporium-alembic \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --wait
+          echo "Migrations completed successfully."
 
       - name: Prune old container images (keep latest 5)
         if: success()
