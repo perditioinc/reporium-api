@@ -41,6 +41,12 @@ def map_repo(raw: dict) -> dict:
         "owner": owner,
         "description": raw.get("description"),
         "is_fork": bool(raw.get("isFork", False)),
+        # is_private REQUIRED by RepoIngestItem after #414 — no Pydantic
+        # default. We already filter private repos out of the batch above
+        # (line ~152), so every mapped repo is public, but the field must
+        # still be passed explicitly or the endpoint returns 422. The raw
+        # source still carries `isPrivate` for defense in depth.
+        "is_private": bool(raw.get("isPrivate", False)),
         "forked_from": raw.get("parentRepo"),
         "primary_language": raw.get("primaryLanguage"),
         "github_url": f"https://github.com/{name_with_owner}",
