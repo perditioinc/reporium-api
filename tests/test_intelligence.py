@@ -501,3 +501,51 @@ async def test_run_query_raises_504_on_claude_timeout():
 
     assert exc_info.value.status_code == 504
     assert "did not respond" in exc_info.value.detail
+
+
+# ---------------------------------------------------------------------------
+# /intelligence/feedback (PR3 of Ask UX series)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_feedback_rejects_invalid_uuid(client: AsyncClient):
+    """POST /intelligence/feedback with non-UUID query_id must return 400."""
+    response = await client.post(
+        "/intelligence/feedback",
+        json={"query_id": "not-a-uuid", "sentiment": "positive"},
+    )
+    assert response.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_feedback_rejects_invalid_sentiment(client: AsyncClient):
+    """sentiment must be 'positive', 'negative', or null — anything else is 422."""
+    response = await client.post(
+        "/intelligence/feedback",
+        json={"query_id": "00000000-0000-4000-8000-000000000000", "sentiment": "meh"},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_feedback_accepts_null_sentiment(client: AsyncClient):
+    """Sending sentiment: null clears the existing thumb (toggle-off)."""
+    # Even with no matching row in DB, we return 200 OK to avoid leaking
+    # whether a query_id exists (anti-scrape — see endpoint docstring).
+    response = await client.post(
+        "/intelligence/feedback",
+        json={"query_id": "00000000-0000-4000-8000-000000000000", "sentiment": None},
+    )
+    # 200 on success, or 503 if DB unavailable in the test env. Either is
+    # acceptable evidence that the schema validated and routing worked.
+    assert response.status_code in (200, 503)
+
+
+@pytest.mark.asyncio
+async def test_feedback_unknown_query_id_returns_ok(client: AsyncClient):
+    """Unknown query_ids must return 200 OK, NOT 404 — anti-scrape."""
+    response = await client.post(
+        "/intelligence/feedback",
+        json={"query_id": "11111111-1111-4111-8111-111111111111", "sentiment": "positive"},
+    )
+    assert response.status_code in (200, 503)

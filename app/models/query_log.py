@@ -57,5 +57,9 @@ class QueryLog(Base):
     action_taken: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Computed spend in cents (input_tokens + output_tokens × model rate)
     cost_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # "positive" | "negative" | "neutral" — optional, written by Workato
+    # "positive" | "negative" | "neutral" — written by Workato OR by the
+    # POST /intelligence/feedback endpoint (PR3 of Ask UX series).
     sentiment: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # UUID4 minted at request start, emitted in the streamed `done` event,
+    # and used as the lookup key for thumbs up/down feedback.
+    query_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
