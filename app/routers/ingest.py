@@ -326,6 +326,10 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
         db.add(repo)
     else:
         for key, val in repo_fields.items():
+            if key == "is_private" and repo.is_private and val is False:
+                # Privacy is sticky: a stale or buggy bulk ingest must not
+                # accidentally republish a repo that has already been hidden.
+                continue
             # readme_summary and quality_signals are written by the AI enricher —
             # never overwrite them with NULL during a bulk ingest upsert.
             if key in {"readme_summary", "quality_signals", "problem_solved",
