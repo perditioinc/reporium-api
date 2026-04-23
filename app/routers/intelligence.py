@@ -19,6 +19,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Literal
+import uuid
 from uuid import UUID
 
 import anthropic
@@ -1446,6 +1447,7 @@ async def _log_query(
     model: str,
     question_embedding: np.ndarray | None = None,
     cache_hit: bool = False,
+    query_id: str | None = None,
 ) -> None:
     """Fire-and-forget: write one row to query_log. Never raises."""
     # Redact PII from the persisted copy; the original text was already sent
@@ -1467,7 +1469,8 @@ async def _log_query(
                         latency_ms,
                         model,
                         cache_hit,
-                        question_embedding_vec
+                        question_embedding_vec,
+                        query_id
                     ) VALUES (
                         :question,
                         :answer_truncated,
@@ -1480,7 +1483,8 @@ async def _log_query(
                         :latency_ms,
                         :model,
                         :cache_hit,
-                        CAST(:question_embedding_vec AS vector)
+                        CAST(:question_embedding_vec AS vector),
+                        CAST(:query_id AS uuid)
                     )
                 """),
                 {
@@ -1496,6 +1500,7 @@ async def _log_query(
                     "model": model,
                     "cache_hit": cache_hit,
                     "question_embedding_vec": vec_to_pg(question_embedding) if question_embedding is not None else None,
+                    "query_id": query_id,
                 },
             )
             await session.commit()
@@ -1732,12 +1737,14 @@ class StreamEvent(BaseModel):
     - ``sources``: initial event carrying the retrieved ``sources`` list
     - ``token``: incremental answer chunk in ``text``
     - ``done``: terminal success event carrying ``tokens`` usage, ``model``,
-      ``latency_ms`` (wall time from request start), and optionally ``route``
-      / ``cache_hit`` / ``cache_source`` when a smart-router or cache path
-      answered the query.
+      ``latency_ms`` (wall time from request start), ``query_id`` (UUID4
+      handle for posting thumbs feedback to /intelligence/feedback), and
+      optionally ``route`` / ``cache_hit`` / ``cache_source`` when a
+      smart-router or cache path answered the query.
     - ``error``: terminal failure event carrying ``message``
     """
     type: Literal["sources", "token", "done", "error"]
+    query_id: str | None = None
     sources: list[dict] | None = None
     text: str | None = None
     message: str | None = None
@@ -2889,6 +2896,10 @@ async def intelligence_ask_stream(
 
     async def event_generator():
         _started_at = time.monotonic()
+        # PR3 (Ask UX): mint a stable handle for this query so the client can
+        # post thumbs feedback later. Sent in every `done` event below; written
+        # to query_log.query_id by _log_query for the eventual UPDATE.
+        _query_id = str(uuid.uuid4())
 
         try:
             # --- Off-topic domain boundary filter (pre-Claude, $0) ---
@@ -2896,7 +2907,7 @@ async def intelligence_ask_stream(
                 logger.info("off-topic query rejected (stream): %s", req.question[:80])
                 yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
                 yield f"data: {json.dumps({'type': 'token', 'text': _OFF_TOPIC_RESPONSE})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'model': 'off-topic', 'latency_ms': int((time.monotonic() - _started_at) * 1000)})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'model': 'off-topic', 'latency_ms': int((time.monotonic() - _started_at) * 1000), 'query_id': _query_id})}\n\n"
                 return
 
             qctx = await _prepare_query(
@@ -2934,6 +2945,7 @@ async def intelligence_ask_stream(
                     'type': 'done',
                     'tokens': cached.get("tokens_used", {'input': 0, 'output': 0, 'total': 0}),
                     'latency_ms': int((time.monotonic() - _started_at) * 1000),
+                    'query_id': _query_id,
                 }
                 if cached.get("cache_hit"):
                     done_event['cache_hit'] = True
@@ -2955,6 +2967,7 @@ async def intelligence_ask_stream(
                     model=qctx.model,
                     question_embedding=np.array(qctx.query_embedding) if qctx.query_embedding else None,
                     cache_hit=cached.get("cache_hit", False),
+                    query_id=_query_id,
                 )).add_done_callback(_task_done_callback)
                 total_ms = int((time.monotonic() - _started_at) * 1000)
                 logger.info(
@@ -2980,7 +2993,7 @@ async def intelligence_ask_stream(
                     chunk = word + (" " if i < len(words) - 1 else "")
                     yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
                     await asyncio.sleep(0)
-                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'model': 'early-exit', 'latency_ms': int((time.monotonic() - _started_at) * 1000)})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'model': 'early-exit', 'latency_ms': int((time.monotonic() - _started_at) * 1000), 'query_id': _query_id})}\n\n"
                 if qctx.redis_cache_key:
                     asyncio.create_task(cache.set(qctx.redis_cache_key, {
                         "answer": _EARLY_EXIT_ANSWER,
@@ -3000,6 +3013,7 @@ async def intelligence_ask_stream(
                     model="early-exit",
                     question_embedding=None,
                     cache_hit=False,
+                    query_id=_query_id,
                 )).add_done_callback(_task_done_callback)
                 return
 
@@ -3126,7 +3140,7 @@ async def intelligence_ask_stream(
                     output_tokens = payload.usage.output_tokens
                     tokens_info = {'input': input_tokens, 'output': output_tokens, 'total': input_tokens + output_tokens}
                     _latency_ms = int((time.monotonic() - _started_at) * 1000)
-                    yield f"data: {json.dumps({'type': 'done', 'tokens': tokens_info, 'model': qctx.model, 'latency_ms': _latency_ms})}\n\n"
+                    yield f"data: {json.dumps({'type': 'done', 'tokens': tokens_info, 'model': qctx.model, 'latency_ms': _latency_ms, 'query_id': _query_id})}\n\n"
                     # Record actual token-based cost
                     _stream_est_cost = _estimate_cost(input_tokens, output_tokens, qctx.model)
                     await record_cost(_stream_est_cost, model=qctx.model)
@@ -3167,6 +3181,7 @@ async def intelligence_ask_stream(
                         latency_ms=int((time.monotonic() - _started_at) * 1000),
                         model=qctx.model,
                         question_embedding=_stream_log_embedding,
+                        query_id=_query_id,
                     )).add_done_callback(_task_done_callback)
                     # Save turn to session for multi-turn continuity (KAN-158).
                     # Skip negative answers so follow-ups don't start from "I don't know".
@@ -3212,6 +3227,70 @@ async def intelligence_ask_stream(
             "X-Accel-Buffering": "no",  # disable Nginx buffering
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# PR3 (Ask UX): thumbs up/down feedback
+#
+# The streamed `done` event includes a `query_id` (UUID4) that the frontend
+# stores. When the user clicks 👍 / 👎, the frontend POSTs here. Sending
+# `sentiment: null` clears the existing value (toggle-off behavior — clicking
+# the already-active thumb deselects it).
+#
+# This endpoint deliberately does NOT require X-App-Token: feedback is
+# anonymous and additive, gated only by rate-limit. We MUST NOT leak whether
+# a query_id exists in the database (that would allow scraping recent ask
+# activity), so unknown query_ids return 200 OK with no-op semantics — same
+# response shape as a successful update. The rate-limit caps the cost of
+# scraping attempts.
+# ---------------------------------------------------------------------------
+
+
+class FeedbackRequest(BaseModel):
+    query_id: str  # UUID4 from the streamed done event
+    # Allow null to clear an existing thumb selection (toggle-off).
+    # "neutral" is reserved for future use (auto-classified) and is rejected
+    # here so the API surface stays small.
+    sentiment: Literal["positive", "negative"] | None = None
+
+
+class FeedbackResponse(BaseModel):
+    ok: bool
+
+
+@router.post("/feedback", response_model=FeedbackResponse)
+@_limiter.limit("30/minute")
+async def ask_feedback(
+    request: Request,
+    body: FeedbackRequest,
+    db: AsyncSession = Depends(get_db),
+):
+    """Set or clear the sentiment on a previously-answered query."""
+    # Reject malformed UUIDs early — keeps the SQL parameter clean and avoids
+    # noisy DB-level cast errors in logs.
+    try:
+        UUID(body.query_id)
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid query_id format")
+
+    try:
+        async with async_session_factory() as session:
+            await session.execute(
+                text("""
+                    UPDATE query_log
+                    SET sentiment = :sentiment
+                    WHERE query_id = CAST(:query_id AS uuid)
+                """),
+                {"sentiment": body.sentiment, "query_id": body.query_id},
+            )
+            await session.commit()
+    except Exception:
+        log_nonfatal("ask_feedback update")
+        # Don't surface the failure — the user already got their answer; a
+        # silently-dropped feedback click is annoying but not blocking. The
+        # ok=true response keeps the UI optimistic.
+
+    return FeedbackResponse(ok=True)
 
 
 @router.get("/suggestions")
