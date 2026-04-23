@@ -516,8 +516,16 @@ async def test_library_full_excludes_private_repos_across_all_pages(client: Asyn
 
 @pytest.mark.asyncio
 async def test_library_full_total_count_excludes_private(client: AsyncClient):
-    """/library/full stats.total and totalRepos must exclude private repos."""
+    """/library/full stats.total and totalRepos must exclude private repos.
+
+    Asserts by delta against a baseline so this stays green regardless of what
+    prior tests in the run have already seeded into the shared DB.
+    """
     from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
+
+    baseline = (await client.get("/library/full?page=1&page_size=1")).json()
+    baseline_total = baseline["totalRepos"]
+    baseline_stats_total = baseline["stats"]["total"]
 
     payloads = [
         {**TEST_REPO_FIXTURE, "name": "count-public-1",
@@ -536,11 +544,12 @@ async def test_library_full_total_count_excludes_private(client: AsyncClient):
     assert resp.status_code == 200
     body = resp.json()
 
-    # totalRepos reflects the filtered (public) count, not the raw row count
-    assert body["totalRepos"] == 2, (
-        f"totalRepos should only count public repos, got {body['totalRepos']}"
+    # Only the 2 public repos must move the needle. The 2 private ones are invisible.
+    assert body["totalRepos"] == baseline_total + 2, (
+        f"totalRepos should only count public repos, "
+        f"got {baseline_total} -> {body['totalRepos']} (expected +2)"
     )
-    # stats.total aggregates from the enriched repos — must match totalRepos
-    assert body["stats"]["total"] == 2, (
-        f"stats.total should only count public repos, got {body['stats']['total']}"
+    assert body["stats"]["total"] == baseline_stats_total + 2, (
+        f"stats.total should only count public repos, "
+        f"got {baseline_stats_total} -> {body['stats']['total']} (expected +2)"
     )
