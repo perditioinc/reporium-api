@@ -1397,6 +1397,112 @@ def _task_done_callback(task: asyncio.Task) -> None:
         logger.warning("Background task %s failed: %s", task.get_name(), exc, exc_info=False)
 
 
+# PR4 (Ask UX): cap how long we wait on the follow-up generator before giving
+# up and emitting the done event without suggestions. The Haiku call is launched
+# in parallel with the main answer stream, so by the time the answer finishes
+# (typically 2-5s) the suggestion task is usually already complete. This ceiling
+# is a safety net so a slow Haiku call can't hold the SSE connection open.
+_FOLLOWUPS_TIMEOUT_S = 1.5
+_FOLLOWUPS_COUNT = 3
+_FOLLOWUPS_MAX_LEN = 90  # per-string character cap (UI chip readability)
+_FOLLOWUPS_MAX_TOKENS = 200
+
+
+def _parse_followups(raw: str) -> list[str]:
+    """Best-effort extraction of a JSON array of strings from the model output.
+
+    The prompt asks Haiku for ``["q1", "q2", "q3"]`` but models occasionally
+    pad with prose. We grab the first ``[...]`` block and json-parse it.
+    Returns ``[]`` on any failure so the caller can silently omit suggestions.
+    """
+    if not raw:
+        return []
+    start = raw.find("[")
+    end = raw.rfind("]")
+    if start < 0 or end < 0 or end <= start:
+        return []
+    try:
+        parsed = json.loads(raw[start : end + 1])
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    cleaned: list[str] = []
+    for item in parsed:
+        if not isinstance(item, str):
+            continue
+        s = item.strip()
+        if not s:
+            continue
+        if len(s) > _FOLLOWUPS_MAX_LEN:
+            s = s[: _FOLLOWUPS_MAX_LEN - 1].rstrip() + "…"
+        cleaned.append(s)
+        if len(cleaned) >= _FOLLOWUPS_COUNT:
+            break
+    return cleaned
+
+
+async def _generate_followups(question: str, sources: list[dict]) -> list[str]:
+    """Ask Haiku for 3 short follow-up questions a user might click next.
+
+    Designed to be launched in parallel with the main answer stream:
+    uses only the question + a compact view of the retrieved sources, so it
+    can start the moment ``_prepare_query`` returns (no need to wait on the
+    full answer). Returns ``[]`` on any failure (timeout, circuit breaker
+    open, parse error) — callers should treat suggestions as best-effort and
+    omit them silently when this returns empty.
+    """
+    if not question or not sources:
+        return []
+    # Compact source view — owner/name + category, not the full prompt block.
+    # Avoids burning tokens on README excerpts the suggester doesn't need.
+    topic_lines: list[str] = []
+    for repo in sources[:8]:
+        name = repo.get("name") or ""
+        owner = repo.get("owner") or ""
+        forked_from = repo.get("forked_from")
+        full = forked_from if forked_from else (f"{owner}/{name}" if owner else name)
+        cat = repo.get("primary_category") or ""
+        topic_lines.append(f"- {full}" + (f" ({cat})" if cat else ""))
+    topics = "\n".join(topic_lines)
+
+    prompt = (
+        "A user just asked a question about AI dev tools and we showed them "
+        "the topics below. Suggest 3 short follow-up questions they might "
+        "naturally click next. Each must be a question, end with '?', be "
+        "under 80 characters, and probe a different angle (comparison, "
+        "use-case fit, integration, trade-offs, alternatives).\n\n"
+        f"Question: {question}\n\n"
+        f"Topics:\n{topics}\n\n"
+        "Output ONLY a JSON array of 3 strings, no prose, no markdown."
+    )
+
+    def _call_haiku() -> str:
+        client = _get_client()
+        with anthropic_breaker:
+            msg = client.messages.create(
+                model=_MODEL_HAIKU,
+                max_tokens=_FOLLOWUPS_MAX_TOKENS,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        if not msg.content:
+            return ""
+        first = msg.content[0]
+        return getattr(first, "text", "") or ""
+
+    try:
+        loop = asyncio.get_event_loop()
+        raw = await asyncio.wait_for(
+            loop.run_in_executor(None, _call_haiku),
+            timeout=_FOLLOWUPS_TIMEOUT_S + 2.0,  # outer ceiling; the await in the
+                                                  # caller is the real budget
+        )
+    except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+        logger.info("followups: generation failed: %s", exc)
+        return []
+    return _parse_followups(raw)
+
+
 router = APIRouter(prefix="/intelligence", tags=["Intelligence"])
 
 # Timeout (seconds) for the synchronous Anthropic API call.
@@ -1748,9 +1854,11 @@ class StreamEvent(BaseModel):
     - ``token``: incremental answer chunk in ``text``
     - ``done``: terminal success event carrying ``tokens`` usage, ``model``,
       ``latency_ms`` (wall time from request start), ``query_id`` (UUID4
-      handle for posting thumbs feedback to /intelligence/feedback), and
-      optionally ``route`` / ``cache_hit`` / ``cache_source`` when a
-      smart-router or cache path answered the query.
+      handle for posting thumbs feedback to /intelligence/feedback),
+      ``suggestions`` (PR4 — up to 3 follow-up question strings, or omitted
+      if the suggestion task did not complete in time), and optionally
+      ``route`` / ``cache_hit`` / ``cache_source`` when a smart-router or
+      cache path answered the query.
     - ``error``: terminal failure event carrying ``message``
     """
     type: Literal["sources", "token", "done", "error"]
@@ -1764,6 +1872,7 @@ class StreamEvent(BaseModel):
     route: str | None = None
     cache_hit: bool | None = None
     cache_source: str | None = None
+    suggestions: list[str] | None = None
 
 
 class TaxonomyGapSignal(BaseModel):
@@ -3040,8 +3149,20 @@ async def intelligence_ask_stream(
             ]
             yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in source_list], 'cache_hit': False})}\n\n"
 
+            # PR4 (Ask UX): kick off follow-up suggestion generation IN PARALLEL
+            # with the main answer stream. Haiku typically returns 3 short
+            # questions in ~400-700ms; main answer takes 2-5s. By the time we
+            # emit `done` the suggestions task is usually already complete.
+            # If it isn't, we wait at most _FOLLOWUPS_TIMEOUT_S more seconds
+            # before giving up and omitting suggestions from the done event.
+            _followups_task: asyncio.Task[list[str]] = asyncio.create_task(
+                _generate_followups(req.question, qctx.sources)
+            )
+            _followups_task.add_done_callback(_task_done_callback)
+
             # Daily cost cap check — reject before calling Claude if budget exhausted
             if not await check_budget():
+                _followups_task.cancel()
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Service temporarily unavailable — daily usage limit reached. Try again tomorrow.'})}\n\n"
                 return
 
@@ -3150,7 +3271,27 @@ async def intelligence_ask_stream(
                     output_tokens = payload.usage.output_tokens
                     tokens_info = {'input': input_tokens, 'output': output_tokens, 'total': input_tokens + output_tokens}
                     _latency_ms = int((time.monotonic() - _started_at) * 1000)
-                    yield f"data: {json.dumps({'type': 'done', 'tokens': tokens_info, 'model': qctx.model, 'latency_ms': _latency_ms, 'query_id': _query_id})}\n\n"
+
+                    # PR4: collect parallel-launched suggestions if ready in time
+                    _suggestions: list[str] = []
+                    try:
+                        _suggestions = await asyncio.wait_for(
+                            _followups_task, timeout=_FOLLOWUPS_TIMEOUT_S
+                        )
+                    except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+                        logger.info("followups: not ready by done event: %s", exc)
+                        _followups_task.cancel()
+
+                    _done_payload: dict = {
+                        'type': 'done',
+                        'tokens': tokens_info,
+                        'model': qctx.model,
+                        'latency_ms': _latency_ms,
+                        'query_id': _query_id,
+                    }
+                    if _suggestions:
+                        _done_payload['suggestions'] = _suggestions
+                    yield f"data: {json.dumps(_done_payload)}\n\n"
                     # Record actual token-based cost
                     _stream_est_cost = _estimate_cost(input_tokens, output_tokens, qctx.model)
                     await record_cost(_stream_est_cost, model=qctx.model)
@@ -3224,9 +3365,17 @@ async def intelligence_ask_stream(
             except NameError:
                 # Disconnect happened before the stream was set up.
                 pass
+            try:
+                _followups_task.cancel()
+            except NameError:
+                pass
             raise
         except Exception as e:
             logger.error("Streaming ask error: %s", str(e), exc_info=True)
+            try:
+                _followups_task.cancel()
+            except NameError:
+                pass
             yield f"data: {json.dumps({'type': 'error', 'message': 'Internal server error. Please try again.'})}\n\n"
 
     return StreamingResponse(
