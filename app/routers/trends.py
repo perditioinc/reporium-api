@@ -201,15 +201,18 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
     if cached:
         return StatsResponse(**cached)
 
-    total = (await db.execute(select(func.count(Repo.id)))).scalar_one()
+    public_repos = Repo.is_private == False  # noqa: E712
+
+    total = (await db.execute(select(func.count(Repo.id)).where(public_repos))).scalar_one()
     total_forks = (
-        await db.execute(select(func.count(Repo.id)).where(Repo.is_fork == True))  # noqa: E712
+        await db.execute(select(func.count(Repo.id)).where(Repo.is_fork == True, public_repos))  # noqa: E712
     ).scalar_one()
 
     lang_rows = (
         await db.execute(
             select(Repo.primary_language, func.count().label("cnt"))
             .where(Repo.primary_language.is_not(None))
+            .where(public_repos)
             .group_by(Repo.primary_language)
             .order_by(func.count().desc())
         )
@@ -219,6 +222,8 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
     cat_rows = (
         await db.execute(
             select(RepoCategory.category_name, func.count().label("cnt"))
+            .join(Repo, Repo.id == RepoCategory.repo_id)
+            .where(public_repos)
             .group_by(RepoCategory.category_name)
             .order_by(func.count().desc())
         )
@@ -229,6 +234,7 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
         await db.execute(
             select(Repo.fork_sync_state, func.count().label("cnt"))
             .where(Repo.fork_sync_state.is_not(None))
+            .where(public_repos)
             .group_by(Repo.fork_sync_state)
         )
     ).all()
@@ -251,7 +257,9 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
     tag_rows = (
         await db.execute(
             select(RepoTag.tag, func.count().label("cnt"))
+            .join(Repo, Repo.id == RepoTag.repo_id)
             .where(RepoTag.tag.not_in(system_tags))
+            .where(public_repos)
             .group_by(RepoTag.tag)
             .order_by(func.count().desc())
             .limit(20)
@@ -263,17 +271,20 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
         await db.execute(
             text(
                 "SELECT dimension, COUNT(DISTINCT raw_value) AS cnt "
-                "FROM repo_taxonomy GROUP BY dimension"
+                "FROM repo_taxonomy rt "
+                "JOIN repos r ON r.id = rt.repo_id "
+                "WHERE r.is_private = false "
+                "GROUP BY dimension"
             )
         )
     ).fetchall()
     taxonomy_dimension_counts = {row.dimension: row.cnt for row in tax_dim_rows}
 
     has_tests_count = (
-        await db.execute(select(func.count(Repo.id)).where(Repo.has_tests == True))  # noqa: E712
+        await db.execute(select(func.count(Repo.id)).where(Repo.has_tests == True, public_repos))  # noqa: E712
     ).scalar_one()
     has_ci_count = (
-        await db.execute(select(func.count(Repo.id)).where(Repo.has_ci == True))  # noqa: E712
+        await db.execute(select(func.count(Repo.id)).where(Repo.has_ci == True, public_repos))  # noqa: E712
     ).scalar_one()
 
     quality_score_avg_row = (
@@ -281,14 +292,15 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
             text(
                 "SELECT AVG((quality_signals->>'overall_score')::float) "
                 "FROM repos WHERE quality_signals IS NOT NULL "
-                "AND quality_signals->>'overall_score' IS NOT NULL"
+                "AND quality_signals->>'overall_score' IS NOT NULL "
+                "AND is_private = false"
             )
         )
     ).scalar_one()
     quality_score_avg = round(float(quality_score_avg_row), 2) if quality_score_avg_row is not None else None
 
     enriched_repo_count = (
-        await db.execute(select(func.count(Repo.id)).where(Repo.readme_summary.is_not(None)))
+        await db.execute(select(func.count(Repo.id)).where(Repo.readme_summary.is_not(None), public_repos))
     ).scalar_one()
 
     response = StatsResponse(
