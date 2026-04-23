@@ -1731,7 +1731,10 @@ class StreamEvent(BaseModel):
 
     - ``sources``: initial event carrying the retrieved ``sources`` list
     - ``token``: incremental answer chunk in ``text``
-    - ``done``: terminal success event carrying ``tokens`` usage and ``model``
+    - ``done``: terminal success event carrying ``tokens`` usage, ``model``,
+      ``latency_ms`` (wall time from request start), and optionally ``route``
+      / ``cache_hit`` / ``cache_source`` when a smart-router or cache path
+      answered the query.
     - ``error``: terminal failure event carrying ``message``
     """
     type: Literal["sources", "token", "done", "error"]
@@ -1740,6 +1743,10 @@ class StreamEvent(BaseModel):
     message: str | None = None
     tokens: dict | None = None
     model: str | None = None
+    latency_ms: int | None = None
+    route: str | None = None
+    cache_hit: bool | None = None
+    cache_source: str | None = None
 
 
 class TaxonomyGapSignal(BaseModel):
@@ -2889,7 +2896,7 @@ async def intelligence_ask_stream(
                 logger.info("off-topic query rejected (stream): %s", req.question[:80])
                 yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
                 yield f"data: {json.dumps({'type': 'token', 'text': _OFF_TOPIC_RESPONSE})}\n\n"
-                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0}, 'model': 'off-topic'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'model': 'off-topic', 'latency_ms': int((time.monotonic() - _started_at) * 1000)})}\n\n"
                 return
 
             qctx = await _prepare_query(
@@ -2926,14 +2933,17 @@ async def intelligence_ask_stream(
                 done_event = {
                     'type': 'done',
                     'tokens': cached.get("tokens_used", {'input': 0, 'output': 0, 'total': 0}),
+                    'latency_ms': int((time.monotonic() - _started_at) * 1000),
                 }
                 if cached.get("cache_hit"):
                     done_event['cache_hit'] = True
                     done_event['cache_source'] = cache_source
                 if route:
                     done_event['route'] = route
-                if not route:
-                    done_event['model'] = qctx.model
+                # Always emit the model so the UI can show what answered the
+                # query — even when a smart-router path took over (in which
+                # case the "model" is really the router label).
+                done_event['model'] = route or qctx.model
                 yield f"data: {json.dumps(done_event)}\n\n"
 
                 asyncio.create_task(_log_query(
@@ -2970,7 +2980,7 @@ async def intelligence_ask_stream(
                     chunk = word + (" " if i < len(words) - 1 else "")
                     yield f"data: {json.dumps({'type': 'token', 'text': chunk})}\n\n"
                     await asyncio.sleep(0)
-                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'model': 'early-exit'})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'model': 'early-exit', 'latency_ms': int((time.monotonic() - _started_at) * 1000)})}\n\n"
                 if qctx.redis_cache_key:
                     asyncio.create_task(cache.set(qctx.redis_cache_key, {
                         "answer": _EARLY_EXIT_ANSWER,
@@ -3115,7 +3125,8 @@ async def intelligence_ask_stream(
                     input_tokens = payload.usage.input_tokens
                     output_tokens = payload.usage.output_tokens
                     tokens_info = {'input': input_tokens, 'output': output_tokens, 'total': input_tokens + output_tokens}
-                    yield f"data: {json.dumps({'type': 'done', 'tokens': tokens_info, 'model': qctx.model})}\n\n"
+                    _latency_ms = int((time.monotonic() - _started_at) * 1000)
+                    yield f"data: {json.dumps({'type': 'done', 'tokens': tokens_info, 'model': qctx.model, 'latency_ms': _latency_ms})}\n\n"
                     # Record actual token-based cost
                     _stream_est_cost = _estimate_cost(input_tokens, output_tokens, qctx.model)
                     await record_cost(_stream_est_cost, model=qctx.model)
