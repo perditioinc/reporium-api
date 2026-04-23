@@ -1322,9 +1322,15 @@ def _build_sources_block(repos: list[dict]) -> str:
       - readme_summary, problem_solved
       - language, license_spdx, activity_score
       - has_tests, has_ci, relevance_score
-      - forked_from, secondary_category lists
+      - secondary_category lists
       - embedding arrays, timestamps
       - trust_score computation internals, ingestion_id, admin-only flags
+
+    Fork canonicalization: when a repo has `forked_from` set (we mirror many
+    upstream projects under the perditioinc account for evaluation), feed
+    Claude the upstream `parent_owner/repo_name` rather than `perditioinc/repo`.
+    Keeps answer text aligned with how users know the project, matching the
+    card display in formatRepoDisplay() on the frontend.
 
     Output format:
       1. owner/repo (1.2k★, Category): Description text
@@ -1336,7 +1342,11 @@ def _build_sources_block(repos: list[dict]) -> str:
     for i, repo in enumerate(repos, 1):
         name = repo.get("name") or ""
         owner = repo.get("owner") or ""
-        full_name = f"{owner}/{name}" if owner else name
+        forked_from = repo.get("forked_from")
+        if forked_from:
+            full_name = forked_from
+        else:
+            full_name = f"{owner}/{name}" if owner else name
         category = repo.get("primary_category")
         stars = repo.get("stars")
         description = repo.get("description") or ""

@@ -8,9 +8,13 @@ Excluded for cost/noise reasons:
   - readme_summary, problem_solved
   - language, license_spdx, activity_score
   - has_tests, has_ci, relevance_score
-  - forked_from, secondary_category lists
+  - secondary_category lists
   - embedding arrays
   - created_at / updated_at / last_push_at timestamps
+
+`forked_from` is INCLUDED, but only used to canonicalize the displayed
+owner/name (perditioinc mirror → upstream). It must not leak as a separate
+field in the prompt text.
 """
 from app.routers.intelligence import _build_sources_block, _format_stars, _SOURCES_DESCRIPTION_MAX
 
@@ -94,6 +98,57 @@ def test_multiple_repos_numbered():
     assert "\n2. " in block
     assert "langchain" in block
     assert "llamaindex" in block
+
+
+def test_perditioinc_fork_uses_upstream_canonical_name():
+    """Forks of upstream projects mirrored under perditioinc should be
+    presented to Claude as `upstream_owner/repo`, not `perditioinc/repo`.
+
+    Bug: Claude's answer text said `perditioinc/whylogs` for repos that users
+    know as `whylabs/whylogs`. Cards already canonicalize via formatRepoDisplay
+    on the frontend; the prompt context must do the same so the LLM matches.
+    """
+    fork = {
+        "name": "whylogs",
+        "owner": "perditioinc",
+        "forked_from": "whylabs/whylogs",
+        "primary_category": "Observability",
+        "stars": 2400,
+        "description": "An open-source library for logging any kind of data.",
+    }
+    block = _build_sources_block([fork])
+    assert "whylabs/whylogs" in block
+    assert "perditioinc/whylogs" not in block
+    assert "perditioinc" not in block  # owner field must not leak elsewhere
+
+
+def test_non_fork_keeps_owner_slash_name():
+    """A first-party perditioinc repo (not a fork) keeps its real owner."""
+    original = {
+        "name": "reporium",
+        "owner": "perditioinc",
+        "forked_from": None,
+        "primary_category": "Tooling",
+        "stars": 12,
+        "description": "Trust-first GitHub registry.",
+    }
+    block = _build_sources_block([original])
+    assert "perditioinc/reporium" in block
+
+
+def test_fork_field_is_not_emitted_as_text():
+    """forked_from is consumed for canonicalization but never echoed verbatim
+    as a 'forked_from: ...' line in the prompt body."""
+    fork = {
+        "name": "whylogs",
+        "owner": "perditioinc",
+        "forked_from": "whylabs/whylogs",
+        "primary_category": "Observability",
+        "stars": 2400,
+        "description": "Logging data.",
+    }
+    block = _build_sources_block([fork])
+    assert "forked_from" not in block.lower()
 
 
 def test_missing_optional_fields_are_omitted():
