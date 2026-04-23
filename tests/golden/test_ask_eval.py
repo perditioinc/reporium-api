@@ -172,10 +172,13 @@ def test_ask_golden_eval_baseline():
     once we have a baseline number to choose it from.
     """
     questions = _load_questions()
-    assert len(questions) == 50, f"Expected 50 questions, got {len(questions)}"
+    # Sprint 0 shipped 50 entries; Sprint 1 expanded to 120. Assert a floor
+    # rather than an exact count so adding legitimate new cases doesn't break
+    # the eval — drift downward (accidental deletions) still fails loudly.
+    assert len(questions) >= 120, f"Expected >=120 questions, got {len(questions)}"
 
     # Apply the optional cap BEFORE iterating so summary counts match what we
-    # actually sent. The full 50-question YAML is still validated above.
+    # actually sent. The full YAML is still validated above.
     if _MAX_INT is not None:
         questions = questions[:_MAX_INT]
 
