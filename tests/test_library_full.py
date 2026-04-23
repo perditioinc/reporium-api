@@ -429,3 +429,127 @@ class TestBuildEnrichedRepoStars:
         )
         enriched = _build_enriched_repo(repo, [], [], [], [], [])
         assert enriched["openIssuesCount"] == 17
+
+
+# ---------------------------------------------------------------------------
+# /library/full privacy integration — 2026-04-23 leak regression guard
+# ---------------------------------------------------------------------------
+#
+# On 2026-04-23 at 05:03:48 UTC, 44 private perditioinc/* repos surfaced in
+# public/data/library.json and were served on reporium.com for ~40 minutes.
+# The /library/full SQL already had `WHERE is_private = false`, but the DB
+# column was stale for the 44 repos (ingestion defaults is_private=False when
+# the field is missing, and sync_is_private.py had not run).
+#
+# These tests guard the full end-to-end contract:
+#   1. No private repo ever appears in any paginated /library/full page.
+#   2. /library/full response objects never contain an `isPrivate` field
+#      (the field is stripped so a client filtering on it cannot rely on it,
+#      AND so an accidental leak is structurally impossible via that field).
+#   3. Ingesting with is_private=true keeps the repo out of the public feed
+#      across all pages (covers the pagination-edge case — the incident
+#      surfaced on page 10 of the live response).
+
+import pytest
+from httpx import AsyncClient
+
+
+@pytest.mark.asyncio
+async def test_library_full_excludes_private_repos_across_all_pages(client: AsyncClient):
+    """Regression test for the 2026-04-23 private-repo leak.
+
+    Ingests a mix of public + private repos and verifies every page of
+    /library/full omits the private ones AND strips the isPrivate field.
+    """
+    from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
+
+    public_payload = {
+        **TEST_REPO_FIXTURE,
+        "name": "library-public-probe",
+        "github_url": "https://github.com/testuser/library-public-probe",
+        "is_private": False,
+    }
+    private_payload = {
+        **TEST_REPO_FIXTURE,
+        "name": "library-private-probe",
+        "github_url": "https://github.com/testuser/library-private-probe",
+        "is_private": True,
+    }
+
+    r = await client.post(
+        "/ingest/repos",
+        json=[public_payload, private_payload],
+        headers=AUTH_HEADERS,
+    )
+    assert r.status_code == 200
+
+    # Walk every page at the smallest possible page size to exercise pagination.
+    page = 1
+    seen_names: set[str] = set()
+    while True:
+        resp = await client.get(f"/library/full?page={page}&page_size=1")
+        assert resp.status_code == 200, f"page {page} returned {resp.status_code}"
+        body = resp.json()
+        repos = body.get("repos", [])
+
+        for repo in repos:
+            # Guard 2: isPrivate field must be absent from every response object
+            assert "isPrivate" not in repo, (
+                f"isPrivate leaked on page {page} for repo {repo.get('name')}"
+            )
+            seen_names.add(repo.get("name"))
+
+        total_pages = body.get("totalPages", 1)
+        if page >= total_pages or not repos:
+            break
+        page += 1
+
+    # Guard 1: the private repo must never appear in any paginated page
+    assert "library-public-probe" in seen_names, (
+        "public probe repo should be in /library/full"
+    )
+    assert "library-private-probe" not in seen_names, (
+        "PRIVACY LEAK: private-probe repo appeared in /library/full — "
+        "this reproduces the 2026-04-23 incident"
+    )
+
+
+@pytest.mark.asyncio
+async def test_library_full_total_count_excludes_private(client: AsyncClient):
+    """/library/full stats.total and totalRepos must exclude private repos.
+
+    Asserts by delta against a baseline so this stays green regardless of what
+    prior tests in the run have already seeded into the shared DB.
+    """
+    from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
+
+    baseline = (await client.get("/library/full?page=1&page_size=1")).json()
+    baseline_total = baseline["totalRepos"]
+    baseline_stats_total = baseline["stats"]["total"]
+
+    payloads = [
+        {**TEST_REPO_FIXTURE, "name": "count-public-1",
+         "github_url": "https://github.com/testuser/count-public-1", "is_private": False},
+        {**TEST_REPO_FIXTURE, "name": "count-public-2",
+         "github_url": "https://github.com/testuser/count-public-2", "is_private": False},
+        {**TEST_REPO_FIXTURE, "name": "count-private-1",
+         "github_url": "https://github.com/testuser/count-private-1", "is_private": True},
+        {**TEST_REPO_FIXTURE, "name": "count-private-2",
+         "github_url": "https://github.com/testuser/count-private-2", "is_private": True},
+    ]
+    r = await client.post("/ingest/repos", json=payloads, headers=AUTH_HEADERS)
+    assert r.status_code == 200
+
+    resp = await client.get("/library/full?page=1&page_size=500")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # Only the 2 public repos must move the needle. The 2 private ones are invisible.
+    assert body["totalRepos"] == baseline_total + 2, (
+        f"totalRepos should only count public repos, "
+        f"got {baseline_total} -> {body['totalRepos']} (expected +2)"
+    )
+    assert body["stats"]["total"] == baseline_stats_total + 2, (
+        f"stats.total should only count public repos, "
+        f"got {baseline_stats_total} -> {body['stats']['total']} (expected +2)"
+    )

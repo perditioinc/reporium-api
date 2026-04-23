@@ -152,6 +152,10 @@ TEST_REPO_FIXTURE = {
     "owner": "testuser",
     "description": "A test repository",
     "is_fork": True,
+    # is_private is REQUIRED by the ingest schema (no Pydantic default) as a
+    # structural guard against the 2026-04-23 private-repo leak. Tests that
+    # want to ingest a private repo override this to True.
+    "is_private": False,
     "forked_from": "upstream/test-repo",
     "primary_language": "Python",
     "github_url": "https://github.com/testuser/test-repo",

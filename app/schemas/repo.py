@@ -146,7 +146,12 @@ class RepoIngestItem(BaseModel):
     owner: str
     description: str | None = None
     is_fork: bool = False
-    is_private: bool = False
+    # is_private is REQUIRED — no default. The 2026-04-23 private-repo leak
+    # traced to ingestion calls that omitted the field, letting the Pydantic
+    # default silently assert `False` for repos whose real visibility was
+    # `True`. Forcing every caller to pass the field means a forgotten value
+    # is a 422 at the API boundary, not a silent privacy regression downstream.
+    is_private: bool
     forked_from: str | None = None
     primary_language: str | None = None
     github_url: str

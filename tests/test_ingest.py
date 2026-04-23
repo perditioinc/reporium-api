@@ -81,6 +81,67 @@ async def test_ingest_empty_arrays_preserve_existing_junction_data(client: Async
 
 
 @pytest.mark.asyncio
+async def test_ingest_cannot_republish_private_repo(client: AsyncClient):
+    private_payload = {
+        **TEST_REPO_FIXTURE,
+        "name": "private-repo",
+        "github_url": "https://github.com/testuser/private-repo",
+        "is_private": True,
+    }
+    first = await client.post("/ingest/repos", json=[private_payload], headers=AUTH_HEADERS)
+    assert first.status_code == 200
+    assert (await client.get("/repos/private-repo")).status_code == 404
+
+    stale_public_payload = {**private_payload, "is_private": False}
+    second = await client.post("/ingest/repos", json=[stale_public_payload], headers=AUTH_HEADERS)
+    assert second.status_code == 200
+
+    assert (await client.get("/repos/private-repo")).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_stats_excludes_private_repos(client: AsyncClient):
+    # Baseline the shared test DB before inserting our fixtures — earlier
+    # tests in the run may have ingested public repos that bump the counts,
+    # so we compare by delta instead of asserting absolute totals.
+    baseline = (await client.get("/stats")).json()
+    baseline_total = baseline["total_repos"]
+    baseline_forks = baseline["total_forks"]
+
+    public_payload = {
+        **TEST_REPO_FIXTURE,
+        "name": "stats-public-repo",
+        "github_url": "https://github.com/testuser/stats-public-repo",
+        "is_private": False,
+    }
+    private_payload = {
+        **TEST_REPO_FIXTURE,
+        "name": "stats-private-repo",
+        "github_url": "https://github.com/testuser/stats-private-repo",
+        "is_private": True,
+        "primary_language": "SecretLang",
+        "tags": ["secret-tag"],
+        "categories": [{"category_id": "secret", "category_name": "Secret", "is_primary": True}],
+    }
+
+    response = await client.post("/ingest/repos", json=[public_payload, private_payload], headers=AUTH_HEADERS)
+    assert response.status_code == 200
+
+    stats = (await client.get("/stats")).json()
+    # Only the public insert must move the needle — the private one is invisible.
+    assert stats["total_repos"] == baseline_total + 1, (
+        f"expected +1 public repo, got {baseline_total} -> {stats['total_repos']}"
+    )
+    assert stats["total_forks"] == baseline_forks + 1, (
+        f"expected +1 public fork, got {baseline_forks} -> {stats['total_forks']}"
+    )
+    # Private-row metadata must never surface in any aggregate dimension
+    assert "SecretLang" not in stats["languages"]
+    assert "Secret" not in stats["categories"]
+    assert "secret-tag" not in stats["top_tags"]
+
+
+@pytest.mark.asyncio
 async def test_ingest_batch_limit(client: AsyncClient):
     items = [
         {**TEST_REPO_FIXTURE, "name": f"batch-repo-{i}", "github_url": f"https://github.com/u/r{i}"}
