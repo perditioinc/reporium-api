@@ -342,6 +342,7 @@ if __name__ == "__main__":
 @limiter.limit("60/minute")
 async def health(request: Request):
     from sqlalchemy import text
+    from app.database import engine
 
     db_error: str | None = None
     try:
@@ -351,6 +352,16 @@ async def health(request: Request):
         db_error = str(e)
         logger.warning(f"DB health check failed: {e}")
 
+    # #354: surface pool stats so Cloud Monitoring alerts can probe saturation
+    # without hitting Cloud SQL directly. `.size()` returns the configured
+    # pool_size; `.checkedout()` is the number of currently-held connections.
+    pool = engine.pool
+    pool_stats = {
+        "size": pool.size(),
+        "checked_out": pool.checkedout(),
+        "overflow": pool.overflow(),
+    }
+
     if db_error:
         return JSONResponse(
             status_code=503,
@@ -358,10 +369,12 @@ async def health(request: Request):
                 "status": "degraded",
                 "db": "error",
                 "detail": "database check failed",
+                "pool": pool_stats,
             },
         )
 
     return {
         "status": "ok",
         "db": "ok",
+        "pool": pool_stats,
     }
