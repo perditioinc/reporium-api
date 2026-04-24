@@ -110,16 +110,40 @@ async def get_library(
     result = await db.execute(stmt)
     repos = result.scalars().all()
 
-    total_stmt = select(func.count(Repo.id)).where(Repo.is_private == False)  # noqa: E712
+    public_repos = Repo.is_private == False  # noqa: E712
+
+    total_stmt = select(func.count(Repo.id)).where(public_repos)
     total_result = await db.execute(total_stmt)
     total = total_result.scalar_one()
 
-    # Build per-page stats (language distribution uses the current page only)
-    lang_counts: dict[str, int] = {}
+    # #344: total_forks / total_non_forks / languages are named "total_*" and
+    # must reflect the full public corpus, not just the current page. Previously
+    # these were computed with `sum(1 for r in repos if r.is_fork)` over the
+    # paginated page, which made `total_forks` track `limit` instead of reality
+    # (e.g. `?limit=1` returned total_forks=1).
+    total_forks = (
+        await db.execute(
+            select(func.count(Repo.id)).where(Repo.is_fork == True, public_repos)  # noqa: E712
+        )
+    ).scalar_one()
+    total_non_forks = total - total_forks
+
+    lang_rows = (
+        await db.execute(
+            select(Repo.primary_language, func.count().label("cnt"))
+            .where(Repo.primary_language.is_not(None))
+            .where(public_repos)
+            .group_by(Repo.primary_language)
+            .order_by(func.count().desc())
+        )
+    ).all()
+    lang_counts: dict[str, int] = {row.primary_language: row.cnt for row in lang_rows}
+
+    # tag_metrics stays page-scoped (count + commit_velocity are derived from
+    # the current page's repos). The field is not named "total_*" so the
+    # page-scoped semantics are consistent with its name.
     page_tag_commit_map: dict[str, dict] = {}
     for repo in repos:
-        if repo.primary_language:
-            lang_counts[repo.primary_language] = lang_counts.get(repo.primary_language, 0) + 1
         for t in repo.tags:
             if t.tag not in page_tag_commit_map:
                 page_tag_commit_map[t.tag] = {"count": 0, "commits": 0}
@@ -160,8 +184,8 @@ async def get_library(
 
     stats = LibraryStats(
         total_repos=total,
-        total_forks=sum(1 for r in repos if r.is_fork),
-        total_non_forks=sum(1 for r in repos if not r.is_fork),
+        total_forks=total_forks,
+        total_non_forks=total_non_forks,
         languages=lang_counts,
         top_tags=global_top_tags,
     )
