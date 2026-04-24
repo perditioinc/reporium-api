@@ -24,6 +24,10 @@ How it works
      - Total tokens across the suite is ``<= 1.2x`` the sum of per-entry
        ``max_tokens_soft_budget`` values.
      - Every ``expect_status`` edge case returns the expected HTTP code.
+     - No entry's ``forbidden_repos`` list appears in ``sources``. This is a
+       hard fail — used to catch retrieval bugs where a negated token (e.g.
+       "alternatives to pinecone") still returns the negated product as a
+       top source. See issue #365 / #367.
 
 Scoring weights (per entry) — ``quality_score`` in ``[0, 1]``:
     0.5 * fraction of ``expected_themes`` substrings present (case-insensitive)
@@ -225,6 +229,10 @@ async def test_ask_golden_set_numeric_gate(client_no_db: AsyncClient):
 
     scored_results: list[dict[str, Any]] = []
     status_results: list[dict[str, Any]] = []
+    # #367: `forbidden_repos` assertions. Any source slug in `forbidden_repos`
+    # appearing in the response fails the whole gate — this is the primitive
+    # for catching #365-style "alternatives to X returns X" retrieval bugs.
+    forbidden_violations: list[dict[str, Any]] = []
     total_tokens = 0
     total_budget = 0
 
@@ -276,6 +284,18 @@ async def test_ask_golden_set_numeric_gate(client_no_db: AsyncClient):
         sources = data.get("sources") or []
         tokens = data.get("tokens_used") or {}
         used = int(tokens.get("total") or 0)
+
+        forbidden = entry.get("forbidden_repos") or []
+        if forbidden:
+            source_slugs = {
+                f"{(s.get('owner') or '').lower()}/{(s.get('name') or '').lower()}"
+                for s in sources
+            }
+            leaked = [f for f in forbidden if str(f).lower() in source_slugs]
+            if leaked:
+                forbidden_violations.append(
+                    {"idx": idx, "question": question[:60], "leaked": leaked}
+                )
 
         score = _score_entry(entry, answer, sources)
         total_tokens += used
@@ -344,6 +364,18 @@ async def test_ask_golden_set_numeric_gate(client_no_db: AsyncClient):
     # Edge-case statuses must all match.
     bad_statuses = [r for r in status_results if not r["pass"]]
     assert not bad_statuses, f"Edge-case status mismatches: {bad_statuses}"
+
+    # #367: forbidden_repos violations are hard failures. Unlike the aggregate
+    # quality_score (which can absorb a few misses), a repo explicitly
+    # forbidden appearing in sources means a retrieval bug — e.g. the queried
+    # product itself returned as an "alternative" (#365).
+    assert not forbidden_violations, (
+        "forbidden_repos leaked into sources: "
+        + "; ".join(
+            f"#{v['idx']} ({v['question']!r}) leaked {v['leaked']}"
+            for v in forbidden_violations
+        )
+    )
 
     assert scored_results, "No scored entries — golden set produced zero quality samples"
 
