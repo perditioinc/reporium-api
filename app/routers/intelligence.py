@@ -845,8 +845,8 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         order_map = {
             "active": "activity_score DESC NULLS LAST",
             "recent": "COALESCE(your_last_push_at, upstream_last_push_at, github_updated_at, updated_at) DESC NULLS LAST",
-            "newest": "created_at DESC NULLS LAST",
-            "oldest": "created_at ASC NULLS LAST",
+            "newest": "COALESCE(github_created_at, upstream_created_at) DESC NULLS LAST",
+            "oldest": "COALESCE(github_created_at, upstream_created_at) ASC NULLS LAST",
             "forked": "COALESCE(forks_count, 0) DESC",
             "starred": "COALESCE(parent_stars, stargazers_count, 0) DESC",
             "popular": "COALESCE(parent_stars, stargazers_count, 0) DESC",
