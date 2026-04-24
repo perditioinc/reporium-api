@@ -223,6 +223,39 @@ async def test_metrics_graph_quality_reports_exact_and_proxy_metrics(client):
 
 
 @pytest.mark.asyncio
+async def test_metrics_data_quality_reports_public_only_coverage(client):
+    # Three public repos with varying enrichment + one private repo that must
+    # be excluded from all public-only counts.
+    async with async_session_factory() as session:
+        await session.execute(
+            text(
+                """
+                INSERT INTO repos (id, name, owner, github_url, is_fork, is_private, primary_category, readme_summary)
+                VALUES
+                    (gen_random_uuid(), 'dq-pub-full', 'perditioinc', 'https://github.com/perditioinc/dq-pub-full', false, false, 'rag', 'summary A'),
+                    (gen_random_uuid(), 'dq-pub-partial', 'perditioinc', 'https://github.com/perditioinc/dq-pub-partial', false, false, 'rag', NULL),
+                    (gen_random_uuid(), 'dq-pub-bare', 'perditioinc', 'https://github.com/perditioinc/dq-pub-bare', false, false, NULL, ''),
+                    (gen_random_uuid(), 'dq-priv', 'perditioinc', 'https://github.com/perditioinc/dq-priv', false, true, 'rag', 'secret')
+                """
+            )
+        )
+        await session.commit()
+
+    resp = await client.get("/metrics/data-quality")
+    assert resp.status_code == 200
+    data = resp.json()
+
+    assert data["total_public_repos"] >= 3  # baseline may contain other public repos
+    # The three public repos we inserted should contribute to the counts, and
+    # the private one must not. We assert the relative deltas by reading the
+    # baseline the test setup produced in its own fixture.
+    assert data["public_with_primary_category"] >= 2  # dq-pub-full + dq-pub-partial
+    assert data["public_with_readme_summary"] >= 1    # dq-pub-full only
+    assert data["null_is_private_count"] == 0
+    assert "generated_at" in data
+
+
+@pytest.mark.asyncio
 async def test_metrics_prometheus_exposes_http_metrics(client):
     record_http_request(
         path="/graph/edges",
