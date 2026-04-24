@@ -338,6 +338,26 @@ if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
 
 
+def _pool_stats(pool) -> dict:
+    # #354 follow-up: NullPool (used in CI/tests) does not implement size()/
+    # checkedout()/overflow(). Probe each counter defensively so /health stays
+    # 200 in any pool configuration; AsyncAdaptedQueuePool returns real ints.
+    def _safe(name):
+        method = getattr(pool, name, None)
+        if not callable(method):
+            return None
+        try:
+            return method()
+        except Exception:
+            return None
+
+    return {
+        "size": _safe("size"),
+        "checked_out": _safe("checkedout"),
+        "overflow": _safe("overflow"),
+    }
+
+
 @app.get("/health")
 @limiter.limit("60/minute")
 async def health(request: Request):
@@ -352,15 +372,7 @@ async def health(request: Request):
         db_error = str(e)
         logger.warning(f"DB health check failed: {e}")
 
-    # #354: surface pool stats so Cloud Monitoring alerts can probe saturation
-    # without hitting Cloud SQL directly. `.size()` returns the configured
-    # pool_size; `.checkedout()` is the number of currently-held connections.
-    pool = engine.pool
-    pool_stats = {
-        "size": pool.size(),
-        "checked_out": pool.checkedout(),
-        "overflow": pool.overflow(),
-    }
+    pool_stats = _pool_stats(engine.pool)
 
     if db_error:
         return JSONResponse(
