@@ -41,7 +41,11 @@ THRESHOLDS = {
 
 
 def _fetch_json(url: str, headers: dict[str, str] | None = None, timeout: int = 20) -> dict:
-    req = urllib.request.Request(url, headers={"Accept": "application/json", **(headers or {})})
+    merged = {"Accept": "application/json", **(headers or {})}
+    admin_key = os.getenv("ADMIN_API_KEY", "").strip()
+    if admin_key and "X-Admin-Key" not in merged:
+        merged["X-Admin-Key"] = admin_key
+    req = urllib.request.Request(url, headers=merged)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
