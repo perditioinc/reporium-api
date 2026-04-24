@@ -126,19 +126,34 @@ async def _setup_db():
             text("ALTER TABLE query_log ADD COLUMN IF NOT EXISTS question_embedding_vec vector(384)")
         )
     yield
-    await db_module.engine.dispose()
-    db_module.engine = create_async_engine(
-        TEST_DB_URL,
-        echo=False,
-        poolclass=NullPool,
-        connect_args={"command_timeout": 30},
-    )
-    async with db_module.engine.begin() as conn:
-        # Drop repo_edges first — it has FK constraints to repos and is not
-        # tracked by the ORM, so drop_all() would fail with DependentObjects.
-        await conn.execute(text("DROP TABLE IF EXISTS repo_edges CASCADE"))
-        await conn.run_sync(Base.metadata.drop_all)
-    await db_module.engine.dispose()
+    # Teardown is best-effort: the test database is ephemeral in CI (a fresh
+    # service container per workflow run) and trashed at the end of local dev
+    # sessions. If asyncpg times out mid-drop (the per-table drops + CASCADEs
+    # accumulate seconds and have repeatedly tripped the 30s `command_timeout`
+    # in CI — see issues #428/#426/#424/#421/#417/...), don't let that flake
+    # turn the whole pytest session into a failure. The next run will drop
+    # the leftover tables anyway via `IF NOT EXISTS` semantics in setup.
+    try:
+        await db_module.engine.dispose()
+        db_module.engine = create_async_engine(
+            TEST_DB_URL,
+            echo=False,
+            poolclass=NullPool,
+            # Bump teardown timeout: drop_all() walks ~25 tables sequentially
+            # and has been hitting the previous 30s ceiling on slow runners.
+            connect_args={"command_timeout": 120},
+        )
+        async with db_module.engine.begin() as conn:
+            # Drop repo_edges first — it has FK constraints to repos and is not
+            # tracked by the ORM, so drop_all() would fail with DependentObjects.
+            await conn.execute(text("DROP TABLE IF EXISTS repo_edges CASCADE"))
+            await conn.run_sync(Base.metadata.drop_all)
+        await db_module.engine.dispose()
+    except Exception as e:  # noqa: BLE001 — teardown should never fail the run
+        # Print rather than raise: pytest captures stdout per-test, but a
+        # session-fixture exception during teardown surfaces as a session-level
+        # ERROR that flips the whole run to red even if every test passed.
+        print(f"[conftest] non-fatal teardown error (test DB is ephemeral): {e!r}")
 
 
 @pytest_asyncio.fixture
