@@ -178,32 +178,64 @@ jobs:
             --region=us-central1
           echo "Traffic shifted to candidate revision."
 
-      - name: Remove stale traffic tags from non-serving revisions
+      - name: Remove stale candidate-* traffic tags from non-serving revisions
         # Cloud Run leaves `candidate-<sha>` traffic tags on previous revisions after
         # promotion. Because `reporium-api` has `allUsers` invoker, those tagged URLs
-        # remain publicly reachable and can serve pre-hotfix code against the current
-        # database — e.g. leaking stale aggregate counts from before a private-repo
-        # filter fix. Strip tags from every revision that is not currently serving
-        # traffic so only the active revision has a tagged URL.
+        # (e.g. `https://candidate-ca63b22---reporium-api-....run.app`) remain
+        # publicly reachable and serve pre-hotfix code against the current database —
+        # e.g. leaking stale aggregate counts from before a private-repo filter fix.
+        #
+        # Strip only `candidate-*` tags from revisions that are not currently serving
+        # traffic. The just-promoted revision has percent=100 so its tag is preserved.
+        # Operator-set tags (e.g. `stable`, `rollback`) do not match the prefix and
+        # are left intact. Uses JSON + jq (preinstalled on ubuntu-latest) instead of
+        # gcloud's projection filter syntax for robustness across gcloud versions.
         if: success()
         continue-on-error: true
         run: |
           set -euo pipefail
-          STALE_TAGS=$(gcloud run services describe reporium-api \
+          STALE_TAGS="$(gcloud run services describe reporium-api \
             --project=perditio-platform \
             --region=us-central1 \
-            --format="value(status.traffic.filter('percent=0').extract(tag).flatten())" \
-            | tr ';' '\n' | grep -v '^$' || true)
+            --format=json \
+            | jq -r '.status.traffic[]
+                     | select(.percent == 0 and .tag != null and (.tag | startswith("candidate-")))
+                     | .tag' \
+            | sort -u)"
           if [ -z "${STALE_TAGS}" ]; then
-            echo "No stale traffic tags to remove."
+            echo "No stale candidate-* traffic tags to remove."
             exit 0
           fi
-          REMOVE_LIST=$(echo "${STALE_TAGS}" | paste -sd',' -)
-          echo "Removing stale traffic tags: ${REMOVE_LIST}"
+          REMOVE_LIST="$(echo "${STALE_TAGS}" | paste -sd',' -)"
+          echo "Removing stale candidate traffic tags: ${REMOVE_LIST}"
           gcloud run services update-traffic reporium-api \
             --remove-tags="${REMOVE_LIST}" \
             --project=perditio-platform \
             --region=us-central1
+
+      - name: Verify no public candidate-* bypass URLs remain
+        # Regression guard. After the cleanup step above, no non-serving revision
+        # should carry a `candidate-*` tag. If any remain, the public bypass URL
+        # is still live — surface a workflow warning so the operator notices. Does
+        # not fail the deploy (promotion already succeeded) but is visible in the
+        # Actions UI and greppable in logs.
+        if: success()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          LINGERING="$(gcloud run services describe reporium-api \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --format=json \
+            | jq -r '.status.traffic[]
+                     | select(.percent == 0 and .tag != null and (.tag | startswith("candidate-")))
+                     | .tag')"
+          if [ -n "${LINGERING}" ]; then
+            echo "::warning::Stale candidate traffic tags still present after cleanup — public bypass URLs may remain reachable:"
+            echo "${LINGERING}"
+          else
+            echo "No stale candidate-* tags on non-serving revisions — bypass paths closed."
+          fi
 
       - name: Prune old container images (keep latest 5)
         if: success()
