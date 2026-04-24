@@ -126,19 +126,33 @@ async def _setup_db():
             text("ALTER TABLE query_log ADD COLUMN IF NOT EXISTS question_embedding_vec vector(384)")
         )
     yield
-    await db_module.engine.dispose()
-    db_module.engine = create_async_engine(
-        TEST_DB_URL,
-        echo=False,
-        poolclass=NullPool,
-        connect_args={"command_timeout": 30},
-    )
-    async with db_module.engine.begin() as conn:
-        # Drop repo_edges first — it has FK constraints to repos and is not
-        # tracked by the ORM, so drop_all() would fail with DependentObjects.
-        await conn.execute(text("DROP TABLE IF EXISTS repo_edges CASCADE"))
-        await conn.run_sync(Base.metadata.drop_all)
-    await db_module.engine.dispose()
+    # Teardown: the test database is ephemeral (fresh service container per CI
+    # run; trashed locally), so we just need to leave it in a state where the
+    # next setup() can re-run cleanly.
+    #
+    # The previous approach — engine.dispose() + new engine + DROP repo_edges
+    # CASCADE + Base.metadata.drop_all() — was N+2 sequential SQL round-trips
+    # over ~25 ORM tables. On slow GitHub Actions runners this routinely
+    # exceeded both asyncpg's 30s `command_timeout` AND pytest-timeout's 60s
+    # per-test ceiling, surfacing as a session-level ERROR and turning every
+    # affected merge red (see auto-issues #428/#426/#424/#421/#417/...).
+    #
+    # Replace with a single `DROP SCHEMA public CASCADE; CREATE SCHEMA public`
+    # round-trip — atomic, fast, and sweeps repo_edges + every ORM table at
+    # once with no need to dispose-and-recreate the engine. The pgvector
+    # extension is dropped along with the schema; setup re-creates it via
+    # `CREATE EXTENSION IF NOT EXISTS vector`.
+    #
+    # Wrapped in try/except as a final safety net — if cleanup somehow fails,
+    # the next run still lands cleanly because setup uses IF NOT EXISTS
+    # semantics for tables and the vector extension.
+    try:
+        async with db_module.engine.begin() as conn:
+            await conn.execute(text("DROP SCHEMA IF EXISTS public CASCADE"))
+            await conn.execute(text("CREATE SCHEMA public"))
+        await db_module.engine.dispose()
+    except Exception as e:  # noqa: BLE001 — teardown must never fail the run
+        print(f"[conftest] non-fatal teardown error (test DB is ephemeral): {e!r}")
 
 
 @pytest_asyncio.fixture
