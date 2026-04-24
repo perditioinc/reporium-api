@@ -168,9 +168,6 @@ jobs:
         # identified by its traffic tag. `--to-tags=candidate-<sha>=100` is precise:
         # it does not rely on "latest" semantics and is unambiguous about which
         # revision is being promoted.
-        #
-        # After this succeeds, the tag remains on the revision (harmless) so you can
-        # still curl the tagged URL for post-promotion comparison if needed.
         run: |
           set -euo pipefail
           TAG="candidate-${{ steps.meta.outputs.short_sha }}"
@@ -180,6 +177,33 @@ jobs:
             --project=perditio-platform \
             --region=us-central1
           echo "Traffic shifted to candidate revision."
+
+      - name: Remove stale traffic tags from non-serving revisions
+        # Cloud Run leaves `candidate-<sha>` traffic tags on previous revisions after
+        # promotion. Because `reporium-api` has `allUsers` invoker, those tagged URLs
+        # remain publicly reachable and can serve pre-hotfix code against the current
+        # database — e.g. leaking stale aggregate counts from before a private-repo
+        # filter fix. Strip tags from every revision that is not currently serving
+        # traffic so only the active revision has a tagged URL.
+        if: success()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          STALE_TAGS=$(gcloud run services describe reporium-api \
+            --project=perditio-platform \
+            --region=us-central1 \
+            --format="value(status.traffic.filter('percent=0').extract(tag).flatten())" \
+            | tr ';' '\n' | grep -v '^$' || true)
+          if [ -z "${STALE_TAGS}" ]; then
+            echo "No stale traffic tags to remove."
+            exit 0
+          fi
+          REMOVE_LIST=$(echo "${STALE_TAGS}" | paste -sd',' -)
+          echo "Removing stale traffic tags: ${REMOVE_LIST}"
+          gcloud run services update-traffic reporium-api \
+            --remove-tags="${REMOVE_LIST}" \
+            --project=perditio-platform \
+            --region=us-central1
 
       - name: Prune old container images (keep latest 5)
         if: success()
