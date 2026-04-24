@@ -213,7 +213,12 @@ def build_graph_payload_from_snapshot(
     # Apply per-type cap before final limit so ALTERNATIVE_TO (46k edges @ weight=1.0)
     # cannot crowd out DEPENDS_ON (~111 edges) and COMPATIBLE_WITH.
     # Each typed type gets up to 40% of limit; SIMILAR_TO fills the rest.
-    typed_cap = max(200, limit // 5)
+    # Fix: max(200, limit//5) gave typed_cap==limit at limit≤200 (e.g. typed_cap=200
+    # for a 200-edge request), allocating all slots to typed edges and leaving none for
+    # SIMILAR_TO.  New formula: 40% of limit, hard-capped at 200 and floored at 50.
+    # At small limits (limit<50) typed_cap may exceed limit; that is fine —
+    # the final balanced[:limit] slice still enforces the overall ceiling.
+    typed_cap = max(50, min(200, limit * 2 // 5))
     all_edges_sorted = sorted(
         edges_by_pair.values(),
         key=lambda edge: (float(edge["weight"]), edge["edgeType"] != "SIMILAR_TO"),

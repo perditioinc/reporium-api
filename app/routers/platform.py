@@ -509,6 +509,16 @@ async def metrics_latest(
     snapshot_generated_at = (
         _snapshot_cache.get("generated_at") if _snapshot_cache else None
     )
+    # Total typed+similarity edges from the snapshot stats block (if available).
+    _snap_stats = (_snapshot_cache or {}).get("stats", {})
+    total_edges = (
+        int(_snap_stats.get("total_similarity_edges") or 0)
+        + int(_snap_stats.get("total_typed_edges") or 0)
+    ) or None
+
+    enriched_pct = (
+        round(repos_with_categories / total * 100, 1) if total > 0 else None
+    )
 
     return {
         "repos_tracked": total,
@@ -522,6 +532,11 @@ async def metrics_latest(
         "total_public_repos": total_public,
         "repos_with_embeddings": with_embeddings,
         "snapshot_generated_at": snapshot_generated_at,
+        # Workato connector aliases (additive — KAN-162 fix)
+        "total_repos": total,
+        "total_edges": total_edges,
+        "enriched_pct": enriched_pct,
+        "graph_source": "snapshot" if _snapshot_cache else None,
     }
 
 
