@@ -129,18 +129,86 @@ which is public.
                   --limit 1 --json databaseId -q '.[0].databaseId')
    ```
 
+## Proof the patch works (lane-8 dry-run, 2026-04-24 07:40 UTC)
+
+Executed the patched script against prod with the real `ADMIN_API_KEY`
+fetched from GCP Secret Manager (`reporium-admin-api-key`):
+
+```
+ADMIN_API_KEY="$(gcloud secrets versions access latest \
+                  --secret=reporium-admin-api-key \
+                  --project=perditio-platform)" \
+REPORIUM_API_URL="https://reporium-api-573778300586.us-central1.run.app" \
+python scripts/quality_gates.py --report-only
+```
+
+Result:
+
+```
+[FAIL] primary_category_coverage: 1641/1856 public repos have primary_category
+[PASS] embeddings_coverage: 1855/1856 public repos have embeddings
+[PASS] null_is_private: 0 repos have NULL is_private
+[PASS] readme_summary_coverage: 1645/1856 public repos have readme_summary
+[PASS] no_private_repos_in_api: API returned 100 repos, 0 potentially private
+```
+
+- **No `HTTP Error 403`** — auth gate cleared.
+- **No `DB connection failed`** — no psycopg2 path.
+- 4 of 5 gates green on live data.
+- The 1 remaining failure is a **real data-coverage regression**, not a
+  plumbing bug (see next section).
+
+Raw `/metrics/data-quality` payload at the same moment:
+
+```json
+{"total_public_repos":1856,"public_with_primary_category":1641,
+ "public_with_readme_summary":1645,"public_with_embeddings":1855,
+ "null_is_private_count":0,
+ "generated_at":"2026-04-24T07:40:01.761467+00:00"}
+```
+
+## CI status on PR #440
+
+All checks green at 2026-04-24 ~07:45 UTC:
+
+- `test` (unit) — pass (3m10s)
+- `test` (other) — pass (4m27s)
+- `migration-smoke` — pass (1m59s)
+- `ask-quality-gate` — pass (30s)
+- `notify-on-failure` — skipped (intentional — only runs on job failure)
+
+## Out-of-lane follow-up: primary_category coverage gap
+
+The one remaining `[FAIL]` is **out of scope** for this lane. Pinning
+it here so it doesn't get lost:
+
+- **What:** 215 of 1856 public repos lack `primary_category` → 88.4%
+  coverage vs 95% threshold.
+- **Why it's out of lane:** owned scope is the workflow + gate script.
+  Fixing the data requires either running the nightly enrichment job
+  (`reporium-ingestion`) against the uncategorised set, or a one-shot
+  backfill — neither of which touches this lane's files.
+- **Similar prior issues (now closed):**
+  [#131](https://github.com/perditioinc/reporium-api/issues/131) KAN-41
+  re-run enrichment; [#165](https://github.com/perditioinc/reporium-api/issues/165)
+  readme_summary backfill — suggests the pattern is "enrichment did not
+  keep up with new ingestions."
+- **Suggested next lane:** dispatch to `reporium-ingestion` to run
+  targeted enrichment on rows where `primary_category IS NULL` AND
+  `is_private = false`. Until that runs, the scheduled Data Quality
+  Check will continue to exit 1 daily — **correctly** signalling a real
+  data regression, not a plumbing bug.
+
 ## What could still fail the next run
 
-After this patch lands, a remaining failure would reflect real data
-quality regressions, not plumbing:
+With the plumbing fix live, a remaining failure reflects real data
+regressions, not plumbing:
 
-- `primary_category_coverage` < 95%
-- `embeddings_coverage` < 95%
-- `readme_summary_coverage` < 80%
-- `null_is_private_count` > 0
-- `no_private_repos_in_api` tripped (`/library/full` heuristic)
-
-None of these are plumbing bugs.
+- `primary_category_coverage` < 95% — **ACTIVE, see follow-up above**
+- `embeddings_coverage` < 95% — currently 99.95%, comfortable
+- `readme_summary_coverage` < 80% — currently 88.6%, comfortable
+- `null_is_private_count` > 0 — currently 0, comfortable
+- `no_private_repos_in_api` tripped (`/library/full` heuristic) — green
 
 ## Process compliance
 
