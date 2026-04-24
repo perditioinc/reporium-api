@@ -246,6 +246,26 @@ _ROUTE_COUNT_TAGS = re.compile(
     r"^how many\s+(?:repos?|repositories|tools?|projects?)\s+(?:are\s+)?(?:tagged\s+(?:with\s+)?|have\s+(?:the\s+)?tag\s+)(?P<tag>[a-zA-Z0-9_-]+)\s*\?*$",
     re.IGNORECASE,
 )
+# KAN-162 fix: when _ROUTE_COUNT_CATEGORY captures a phrase starting with a
+# preposition ("in the library", "for research") it is NOT a real category name.
+# Used in _count_category_is_real() to avoid blocking the total-count route for
+# questions like "how many repos are in the library?".
+_CATEGORY_PREP_GUARD = re.compile(
+    r"^(in|on|at|for|from|about|by|with|within|across|among)\b",
+    re.IGNORECASE,
+)
+
+
+def _count_category_is_real(question: str) -> bool:
+    """Return True only when _ROUTE_COUNT_CATEGORY matches AND the captured
+    category group does not start with a preposition."""
+    m = _ROUTE_COUNT_CATEGORY.match(question)
+    if not m:
+        return False
+    cat = m.group("category").strip().lower()
+    return not bool(_CATEGORY_PREP_GUARD.match(cat))
+
+
 _ROUTE_LIST_BY_LANGUAGE = re.compile(
     r"^(?:what|which|list|show)\s+(?:are\s+)?(?:the\s+)?(?:repos?|repositories|tools?|projects?)\s+(?:written\s+)?(?:in|using|that use)\s+(?P<lang>[a-zA-Z0-9#+]+)\s*\?*$",
     re.IGNORECASE,
@@ -552,7 +572,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
 
     # --- Total count ---
     m = _ROUTE_COUNT.match(q)
-    if m and not _ROUTE_COUNT_CATEGORY.match(q) and not _ROUTE_COUNT_LANGUAGE.match(q) and not _ROUTE_COUNT_TAGS.match(q):
+    if m and not _count_category_is_real(q) and not _ROUTE_COUNT_LANGUAGE.match(q) and not _ROUTE_COUNT_TAGS.match(q):
         result = await db.execute(text(
             "SELECT COUNT(*) FROM repos WHERE is_private = false"
         ))
@@ -572,8 +592,8 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
     # otherwise fall through to the LLM so the user gets a real answer
     # instead of "No repos found with category 'pytorch'".
     m = _ROUTE_COUNT_CATEGORY.match(q)
-    if m and not _ROUTE_COUNT_LANGUAGE.match(q) and not _ROUTE_COUNT_TAGS.match(q):
-        cat_query = m.group("category").strip().lower()
+    if _count_category_is_real(q) and not _ROUTE_COUNT_LANGUAGE.match(q) and not _ROUTE_COUNT_TAGS.match(q):
+        cat_query = m.group("category").strip().lower()  # m is non-None: _count_category_is_real guarantees a match
         # Require an actual row match before claiming this route — if the
         # captured phrase doesn't exist as a primary_category substring, let
         # downstream routes or the LLM handle the question.
