@@ -19,13 +19,8 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.9
-        with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-
       - name: Install dependencies
-        run: pip install httpx psycopg2-binary google-cloud-secret-manager
+        run: pip install httpx
 
       - name: Run data quality check
         env:
@@ -34,8 +29,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: python scripts/check_data_quality.py
 
+      # Gates now read aggregate counts from /metrics/data-quality over HTTPS
+      # (see 2026-04-23 scope doc).  Previous version connected psycopg2 to
+      # private-IP Cloud SQL, which cannot succeed from a GitHub-hosted runner.
       - name: Run quality gates
         env:
           REPORIUM_API_URL: ${{ secrets.REPORIUM_API_URL }}
-          GCP_PROJECT: perditio-platform
         run: python scripts/quality_gates.py

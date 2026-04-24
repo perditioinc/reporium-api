@@ -646,6 +646,57 @@ async def metrics_graph_quality(
     return await _graph_quality_snapshot(db)
 
 
+@router.get("/metrics/data-quality", response_model=dict)
+@_limiter.limit("30/minute")
+async def metrics_data_quality(
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+    _gate: None = Depends(require_metrics_access),
+) -> dict:
+    """Aggregate counts the scheduled data-quality gate workflow reads over HTTPS.
+
+    Replaces the workflow's previous direct psycopg2 connection to private-IP
+    Cloud SQL, which cannot succeed from a GitHub-hosted runner.  All fields
+    are public-filterable counts — no per-repo data is returned.
+    """
+    _ = request
+    row = (
+        await db.execute(
+            text(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM repos WHERE is_private = false) AS total_public,
+                    (SELECT COUNT(*) FROM repos
+                       WHERE is_private = false AND primary_category IS NOT NULL)
+                      AS public_with_primary_category,
+                    (SELECT COUNT(*) FROM repos
+                       WHERE is_private = false
+                         AND readme_summary IS NOT NULL
+                         AND readme_summary <> '')
+                      AS public_with_readme_summary,
+                    (SELECT COUNT(DISTINCT re.repo_id)
+                       FROM repo_embeddings re
+                       JOIN repos r ON r.id = re.repo_id
+                      WHERE r.is_private = false
+                        AND re.embedding_vec IS NOT NULL)
+                      AS public_with_embeddings,
+                    (SELECT COUNT(*) FROM repos WHERE is_private IS NULL)
+                      AS null_is_private_count
+                """
+            )
+        )
+    ).fetchone()
+    total_public = int(row.total_public or 0) if row else 0
+    return {
+        "total_public_repos": total_public,
+        "public_with_primary_category": int(row.public_with_primary_category or 0) if row else 0,
+        "public_with_readme_summary": int(row.public_with_readme_summary or 0) if row else 0,
+        "public_with_embeddings": int(row.public_with_embeddings or 0) if row else 0,
+        "null_is_private_count": int(row.null_is_private_count or 0) if row else 0,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 @router.get("/metrics/prometheus", include_in_schema=False)
 async def metrics_prometheus(
     _gate: None = Depends(require_metrics_access),
