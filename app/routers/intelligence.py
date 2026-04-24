@@ -208,7 +208,9 @@ _ROUTE_COUNT_CATEGORY = re.compile(
     re.IGNORECASE,
 )
 _ROUTE_LIST_CATEGORIES = re.compile(
-    r"^(what|list|show|which)\s+(are\s+)?(the\s+)?(categories|topics|groups)(\s+available)?\?*$",
+    # Match both "what are the categories?" and "what categories are available?"
+    # The (?:are\s+)? inside the trailing group handles the post-noun "are" position.
+    r"^(what|list|show|which)\s+(are\s+)?(the\s+)?(categories|topics|groups)(\s+(?:are\s+)?available)?\?*$",
     re.IGNORECASE,
 )
 _ROUTE_TOP_STARRED = re.compile(
@@ -1491,6 +1493,90 @@ def _parse_followups(raw: str) -> list[str]:
     return cleaned
 
 
+# Pre-baked follow-up suggestions for each smart-route type.
+# Smart-route answers have no LLM and no retrieved sources, so _generate_followups
+# can't run — these static chips give users a clear next step without any extra cost.
+_SMART_ROUTE_SUGGESTION_MAP: dict[str, list[str]] = {
+    "count_total": [
+        "What categories are available?",
+        "Which repos have the most stars?",
+        "What AI trends are covered?",
+    ],
+    "list_categories": [
+        "How many repos are in agents?",
+        "Show me repos in rag-retrieval",
+        "Which repos have the most stars?",
+    ],
+    "count_category": [
+        "What are the top starred repos in this category?",
+        "What are all the available categories?",
+        "Which repos have the most stars overall?",
+    ],
+    "top_starred": [
+        "What categories are these repos in?",
+        "What are the newest repos?",
+        "What AI trends are covered?",
+    ],
+    "top_starred_topic": [
+        "Find repos similar to these",
+        "What categories are these repos in?",
+        "What other topics have popular repos?",
+    ],
+    "count_language": [
+        "List repos using this language",
+        "What other languages are popular?",
+        "Which repos have the most stars?",
+    ],
+    "list_languages": [
+        "How many repos use Python?",
+        "List repos using JavaScript",
+        "What are the most popular AI frameworks?",
+    ],
+    "count_tag": [
+        "Show me repos with this tag",
+        "What other tags are popular?",
+        "What categories cover this topic?",
+    ],
+    "list_by_language": [
+        "Which of these have the most stars?",
+        "What are the available categories?",
+        "What AI trends are covered?",
+    ],
+    "most_adjective": [
+        "What categories are these repos in?",
+        "Which repos have the most stars?",
+        "What AI trends are covered?",
+    ],
+    "repo_info": [
+        "Find repos similar to this",
+        "What other repos are in this category?",
+        "Which repos have the most stars?",
+    ],
+    "stats": [
+        "What categories are available?",
+        "Which repos have the most stars?",
+        "What AI trends are covered?",
+    ],
+}
+
+
+def _smart_route_suggestions(route: str | None) -> list[str]:
+    """Return pre-baked follow-up chip suggestions for a smart-route answer.
+
+    Zero cost — no LLM call, no retrieval.  Falls back to a generic set when
+    the route label isn't in the map (e.g. future route additions).
+    """
+    if not route:
+        return []
+    # Strip the "smart-route:" prefix if present (model label format)
+    key = route.removeprefix("smart-route:")
+    return list(_SMART_ROUTE_SUGGESTION_MAP.get(key, [
+        "What categories are available?",
+        "Which repos have the most stars?",
+        "What AI trends are covered?",
+    ]))
+
+
 async def _generate_followups(question: str, sources: list[dict]) -> list[str]:
     """Ask Haiku for 3 short follow-up questions a user might click next.
 
@@ -2707,6 +2793,7 @@ async def _run_query(
         except Exception:
             log_nonfatal("token_observer.record_cache_hit")
         sources = _coerce_cached_sources(cached["sources"])
+        _cached_route = cached.get("route")
         response = QueryResponse(
             answer=cached["answer"],
             sources=sources,
@@ -2717,6 +2804,9 @@ async def _run_query(
             cache_hit=cached.get("cache_hit", False),
             cache_source=cached.get("cache_source"),
             tokens_used=cached.get("tokens_used", {"input": 0, "output": 0, "total": 0}),
+            # Smart-route answers have no LLM / no sources, so _generate_followups
+            # can't run — inject pre-baked contextual suggestions instead.
+            suggestions=_smart_route_suggestions(_cached_route) if _cached_route else None,
         )
         asyncio.create_task(_log_query(
             question=req.question,
@@ -3166,6 +3256,11 @@ async def intelligence_ask_stream(
                 # query — even when a smart-router path took over (in which
                 # case the "model" is really the router label).
                 done_event['model'] = route or qctx.model
+                # Smart-route answers: inject pre-baked contextual suggestions.
+                # Redis/semantic cache hits retain whatever the original answer had.
+                _sr_suggestions = _smart_route_suggestions(route)
+                if _sr_suggestions:
+                    done_event['suggestions'] = _sr_suggestions
                 yield f"data: {json.dumps(done_event)}\n\n"
 
                 asyncio.create_task(_log_query(
