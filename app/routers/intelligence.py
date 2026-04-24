@@ -386,38 +386,87 @@ def _has_encoded_payload(question: str) -> bool:
     return False
 
 
-def _is_off_topic(question: str) -> bool:
-    """Return True if the question is clearly unrelated to Reporium's domain.
+# KAN-366: minimum number of retrieval sources at or above
+# `_MIN_RETRIEVAL_SIMILARITY` that suffices to override the off-topic regex.
+# Embedding evidence is a stronger on-topicness signal than a static keyword
+# allow-list, so when 3 distinct repos vector-match a query (e.g. "rust async
+# runtime" → tokio / smol / async-std) we trust retrieval over the pattern
+# filter. Tuned alongside `_MIN_RETRIEVAL_SIMILARITY = 0.40`; raise this
+# threshold if you raise that one.
+_OFF_TOPIC_BYPASS_MIN_SOURCES = 3
 
-    Short questions (<10 chars) are let through to avoid false positives.
-    Any mention of repo/AI/ML/tool keywords overrides the off-topic match
-    to avoid rejecting legitimate questions like "solve RAG latency issues".
+# Repo-signal keyword allow-list shared by both legacy `_is_off_topic` (which
+# still gates the front of the request) and `_matches_off_topic_pattern`
+# (the post-retrieval check). Compiled once.
+_REPO_SIGNAL_PATTERN = re.compile(
+    r"\b(repo|repositor|github|tool|framework|library|model|llm|ai|ml|"
+    r"agent|rag|vector|embedding|transformer|gpu|inference|deploy|hugging|"
+    r"langchain|pytorch|tensorflow|anthropic|openai|reporium|category|tag|star|"
+    r"fork|issue|pull\s+request|commit|contributor|license|readme)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_security_block(question: str) -> bool:
+    """Pre-retrieval security gate. Hard-rejects prompt-injection attempts and
+    encoded payloads regardless of retrieval evidence — these are an attack
+    surface, not a topical filter, so retrieval can never override them.
+
+    Short questions (<10 chars) are let through; the prompt-injection regex
+    needs at least a phrase to fire.
 
     Unicode is NFKD-normalized before matching to defeat homoglyph attacks
     (e.g. fullwidth chars like \uff57\uff52\uff49\uff54\uff45 -> "write").
     """
-    # NFKD normalize to collapse fullwidth / homoglyph chars
     q = unicodedata.normalize("NFKD", question).strip().lower()
     if len(q) < 10:
         return False
-    # Prompt-injection / jailbreak patterns are checked FIRST and cannot be
-    # overridden by repo-signal keywords (prevents "ignore instructions ... AI").
     if _PROMPT_INJECTION_PATTERNS.search(q):
         return True
-    # Check for encoded payloads (base64, hex, rot13)
     if _has_encoded_payload(q):
         return True
-    # If the question mentions anything repo/AI-related, it's on-topic
-    repo_signals = re.search(
-        r"\b(repo|repositor|github|tool|framework|library|model|llm|ai|ml|"
-        r"agent|rag|vector|embedding|transformer|gpu|inference|deploy|hugging|"
-        r"langchain|pytorch|tensorflow|anthropic|openai|reporium|category|tag|star|"
-        r"fork|issue|pull\s+request|commit|contributor|license|readme)\b",
-        q,
-    )
-    if repo_signals:
+    return False
+
+
+def _matches_off_topic_pattern(question: str) -> bool:
+    """Return True when the question hits an off-topic regex AND lacks repo-
+    signal keywords. Pure pattern check — does NOT consider retrieval evidence;
+    callers should combine this with `_has_strong_retrieval_evidence` so a
+    query that the embedding store knows about can override a pattern false
+    positive (KAN-366: e.g. "tell me a joke about kubernetes" should answer
+    when retrieval surfaces real k8s repos)."""
+    q = unicodedata.normalize("NFKD", question).strip().lower()
+    if len(q) < 10:
+        return False
+    if _REPO_SIGNAL_PATTERN.search(q):
         return False
     return bool(_OFF_TOPIC_PATTERNS.search(q))
+
+
+def _has_strong_retrieval_evidence(sources: list[dict]) -> bool:
+    """Return True when retrieval brought back at least
+    `_OFF_TOPIC_BYPASS_MIN_SOURCES` sources whose similarity is at or above
+    `_MIN_RETRIEVAL_SIMILARITY`. Used to bypass an off-topic regex match
+    when the embedding store clearly knows about the topic."""
+    if not sources:
+        return False
+    strong = sum(
+        1 for s in sources
+        if s.get("similarity", 0.0) >= _MIN_RETRIEVAL_SIMILARITY
+    )
+    return strong >= _OFF_TOPIC_BYPASS_MIN_SOURCES
+
+
+def _is_off_topic(question: str) -> bool:
+    """Legacy combined check — security gate + off-topic regex, no retrieval
+    bypass. Kept for backward compatibility with callers that don't have a
+    retrieval result handy (and for the existing test suite). New code in the
+    /ask request path should use `_is_security_block` up-front, then check
+    `_matches_off_topic_pattern` against `_has_strong_retrieval_evidence`
+    *after* retrieval (KAN-366)."""
+    if _is_security_block(question):
+        return True
+    return _matches_off_topic_pattern(question)
 
 
 _QUERY_SYNONYMS = {
@@ -2601,15 +2650,18 @@ async def _run_query(
     _started_at = time.monotonic()
     effective_session_id = session_id or req.session_id
 
-    # --- Off-topic domain boundary filter (pre-Claude, $0) ---
+    # --- Security gate (pre-retrieval, $0) ---
+    # Prompt-injection / encoded-payload checks ALWAYS reject before retrieval.
+    # Topical off-topic check is deferred to after retrieval (see below) so
+    # embedding evidence can override pattern false positives (KAN-366).
     try:
-        is_off_topic = _is_off_topic(req.question)
+        is_security_block = _is_security_block(req.question)
     except Exception as exc:
         logger.warning("injection-defense error: %s", exc)
-        is_off_topic = True  # Treat unparseable input as off-topic for safety
+        is_security_block = True  # Treat unparseable input as off-topic for safety
 
-    if is_off_topic:
-        logger.info("off-topic query rejected: %s", req.question[:80])
+    if is_security_block:
+        logger.info("off-topic query rejected (security): %s", req.question[:80])
         return QueryResponse(
             answer=_OFF_TOPIC_RESPONSE,
             sources=[],
@@ -2623,6 +2675,27 @@ async def _run_query(
     qctx = await _prepare_query(
         req.question, effective_session_id, req.top_k, db, token_hash=token_hash
     )
+
+    # --- Off-topic regex check (post-retrieval) ---
+    # Only fires when the embedding store has NO strong evidence for the topic.
+    # If retrieval returned >=3 sources at/above _MIN_RETRIEVAL_SIMILARITY we
+    # trust that signal over the static pattern allow-list. Skipped on cache
+    # hits because a cached answer already cleared this gate originally.
+    if (
+        qctx.cache_result is None
+        and _matches_off_topic_pattern(req.question)
+        and not _has_strong_retrieval_evidence(qctx.sources)
+    ):
+        logger.info("off-topic query rejected (pattern, no retrieval): %s", req.question[:80])
+        return QueryResponse(
+            answer=_OFF_TOPIC_RESPONSE,
+            sources=[],
+            question=req.question,
+            model="off-topic",
+            answered_at=datetime.now(timezone.utc).isoformat(),
+            embedding_candidates=qctx.embedding_candidates,
+            tokens_used={"input_tokens": 0, "output_tokens": 0},
+        )
 
     # Handle cache hits (smart route, Redis, or semantic)
     if qctx.cache_result is not None:
@@ -3021,9 +3094,12 @@ async def intelligence_ask_stream(
         _query_id = str(uuid.uuid4())
 
         try:
-            # --- Off-topic domain boundary filter (pre-Claude, $0) ---
-            if _is_off_topic(req.question):
-                logger.info("off-topic query rejected (stream): %s", req.question[:80])
+            # --- Security gate (pre-retrieval, $0) ---
+            # Hard-rejects prompt injection / encoded payloads. Topical
+            # off-topic check is deferred to after retrieval below so the
+            # embedding store can override pattern false positives (KAN-366).
+            if _is_security_block(req.question):
+                logger.info("off-topic query rejected (security, stream): %s", req.question[:80])
                 yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
                 yield f"data: {json.dumps({'type': 'token', 'text': _OFF_TOPIC_RESPONSE})}\n\n"
                 yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'model': 'off-topic', 'latency_ms': int((time.monotonic() - _started_at) * 1000), 'query_id': _query_id})}\n\n"
@@ -3032,6 +3108,21 @@ async def intelligence_ask_stream(
             qctx = await _prepare_query(
                 req.question, req.session_id, req.top_k, db, token_hash=token_hash
             )
+
+            # --- Off-topic regex check (post-retrieval) ---
+            # Only fires when retrieval returned <3 sources at/above
+            # _MIN_RETRIEVAL_SIMILARITY. Skipped on cache hits — a cached
+            # entry already cleared the gate when it was first synthesized.
+            if (
+                qctx.cache_result is None
+                and _matches_off_topic_pattern(req.question)
+                and not _has_strong_retrieval_evidence(qctx.sources)
+            ):
+                logger.info("off-topic query rejected (pattern, stream): %s", req.question[:80])
+                yield f"data: {json.dumps({'type': 'sources', 'sources': []})}\n\n"
+                yield f"data: {json.dumps({'type': 'token', 'text': _OFF_TOPIC_RESPONSE})}\n\n"
+                yield f"data: {json.dumps({'type': 'done', 'tokens': {'input': 0, 'output': 0, 'total': 0}, 'model': 'off-topic', 'latency_ms': int((time.monotonic() - _started_at) * 1000), 'query_id': _query_id})}\n\n"
+                return
 
             # Handle cache hits (smart route, Redis, or semantic)
             if qctx.cache_result is not None:
