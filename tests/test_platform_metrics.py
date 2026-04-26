@@ -254,6 +254,16 @@ async def test_metrics_data_quality_reports_public_only_coverage(client):
     assert data["null_is_private_count"] == 0
     assert "generated_at" in data
 
+    # Operator-actionable sample of public repos still missing primary_category.
+    # `dq-pub-bare` (NULL primary_category, public) was inserted above and must
+    # appear so the data-quality gate workflow can name it on failure.
+    assert "missing_primary_category_sample" in data
+    sample_names = {entry["name"] for entry in data["missing_primary_category_sample"]}
+    assert "perditioinc/dq-pub-bare" in sample_names
+    assert len(data["missing_primary_category_sample"]) <= 10
+    # Private repos must never leak into the sample.
+    assert "perditioinc/dq-priv" not in sample_names
+
 
 @pytest.mark.asyncio
 async def test_metrics_prometheus_exposes_http_metrics(client):

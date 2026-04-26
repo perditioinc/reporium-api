@@ -54,6 +54,14 @@ def _pct(numerator: int, denominator: int) -> float:
     return (numerator / denominator * 100) if denominator > 0 else 0.0
 
 
+def _shortfall(numerator: int, denominator: int, threshold_pct: float) -> int:
+    """Count of additional rows needed for `numerator/denominator` to clear `threshold_pct`."""
+    if denominator <= 0:
+        return 0
+    needed = -(-int(threshold_pct * denominator) // 100)  # ceil(threshold * denom / 100)
+    return max(0, needed - numerator)
+
+
 def run_counts_checks(api_url: str) -> list[dict]:
     """Gates 1/2/4/5: read aggregate counts from /metrics/data-quality."""
     try:
@@ -66,6 +74,7 @@ def run_counts_checks(api_url: str) -> list[dict]:
             "unit": None,
             "pass": False,
             "detail": f"GET {api_url}/metrics/data-quality failed: {e}",
+            "extra": [],
         }]
 
     total_public = int(data.get("total_public_repos") or 0)
@@ -73,10 +82,31 @@ def run_counts_checks(api_url: str) -> list[dict]:
     with_readme = int(data.get("public_with_readme_summary") or 0)
     with_embeddings = int(data.get("public_with_embeddings") or 0)
     null_is_private = int(data.get("null_is_private_count") or 0)
+    missing_primary_sample = data.get("missing_primary_category_sample") or []
 
     category_pct = _pct(with_category, total_public)
     readme_pct = _pct(with_readme, total_public)
     emb_pct = _pct(with_embeddings, total_public)
+
+    category_gap = _shortfall(with_category, total_public, THRESHOLDS["primary_category_coverage_pct"])
+    primary_extra: list[str] = []
+    if category_gap > 0:
+        primary_extra.append(
+            f"need {category_gap} more enriched repos to reach "
+            f"{THRESHOLDS['primary_category_coverage_pct']:.0f}% threshold"
+        )
+        if missing_primary_sample:
+            primary_extra.append(
+                "most-recent public repos missing primary_category (top "
+                f"{len(missing_primary_sample)}):"
+            )
+            for entry in missing_primary_sample:
+                ingested = entry.get("ingested_at") or "unknown"
+                primary_extra.append(f"  - {entry.get('name', '?')}  (ingested_at={ingested})")
+        primary_extra.append(
+            "fix in: reporium-ingestion enrichment Cloud Run Job — re-run the nightly "
+            "enrichment workflow against the missing repo IDs."
+        )
 
     return [
         {
@@ -86,6 +116,7 @@ def run_counts_checks(api_url: str) -> list[dict]:
             "unit": "%",
             "pass": category_pct >= THRESHOLDS["primary_category_coverage_pct"],
             "detail": f"{with_category}/{total_public} public repos have primary_category",
+            "extra": primary_extra,
         },
         {
             "gate": "embeddings_coverage",
@@ -94,6 +125,7 @@ def run_counts_checks(api_url: str) -> list[dict]:
             "unit": "%",
             "pass": emb_pct >= THRESHOLDS["embeddings_coverage_pct"],
             "detail": f"{with_embeddings}/{total_public} public repos have embeddings",
+            "extra": [],
         },
         {
             "gate": "null_is_private",
@@ -102,6 +134,7 @@ def run_counts_checks(api_url: str) -> list[dict]:
             "unit": "rows",
             "pass": null_is_private <= THRESHOLDS["null_is_private_count"],
             "detail": f"{null_is_private} repos have NULL is_private",
+            "extra": [],
         },
         {
             "gate": "readme_summary_coverage",
@@ -110,6 +143,7 @@ def run_counts_checks(api_url: str) -> list[dict]:
             "unit": "%",
             "pass": readme_pct >= THRESHOLDS["readme_summary_coverage_pct"],
             "detail": f"{with_readme}/{total_public} public repos have readme_summary",
+            "extra": [],
         },
     ]
 
@@ -131,6 +165,7 @@ def run_library_full_check(api_url: str) -> list[dict]:
             "unit": "repos",
             "pass": len(private_exposed) == 0,
             "detail": f"API returned {len(repos)} repos, {len(private_exposed)} potentially private",
+            "extra": [],
         }]
     except Exception as e:  # noqa: BLE001 — surface full failure reason
         return [{
@@ -140,6 +175,7 @@ def run_library_full_check(api_url: str) -> list[dict]:
             "unit": "repos",
             "pass": False,
             "detail": f"API check failed: {e}",
+            "extra": [],
         }]
 
 
@@ -166,6 +202,8 @@ def main() -> None:
         print(f"[{status}] {r['gate']}: {r['detail']}")
         if not r["pass"]:
             failures.append(r["gate"])
+            for line in r.get("extra") or []:
+                print(f"        {line}")
 
     print()
     if failures:
