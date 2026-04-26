@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from app.cache import CACHE_TTL_REPO_DETAIL, cache
 from app.database import get_db
+from app.models.mention import RepoMention
 from app.models.repo import (
     Repo,
     RepoAIDevSkill,
@@ -376,6 +377,13 @@ async def repo_evaluation(
     if repo.pros_cons is None:
         raise HTTPException(status_code=404, detail="No evaluation available for this repository")
 
+    hn_count_stmt = (
+        select(func.count())
+        .select_from(RepoMention)
+        .where(RepoMention.repo_id == repo.id, RepoMention.source == "hackernews")
+    )
+    hn_mentions_count = (await db.execute(hn_count_stmt)).scalar() or 0
+
     return {
         "repo": repo.name,
         "owner": repo.owner,
@@ -387,6 +395,7 @@ async def repo_evaluation(
         "issue_close_rate": repo.issue_close_rate,
         "pr_merge_rate": repo.pr_merge_rate,
         "community_health_pct": repo.community_health_pct,
+        "hn_mentions_count": hn_mentions_count,
     }
 
 

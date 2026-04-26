@@ -365,3 +365,5 @@ async def test_evaluation_endpoint_surfaces_community_health_fields(client: Asyn
     assert body["issue_close_rate"] == 85.0
     assert body["pr_merge_rate"] == 72.5
     assert body["community_health_pct"] == 90
+    # #369: HN mentions count defaults to 0 when the repo has no mentions.
+    assert body["hn_mentions_count"] == 0
