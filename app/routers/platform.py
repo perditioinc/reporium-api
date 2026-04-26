@@ -687,12 +687,42 @@ async def metrics_data_quality(
         )
     ).fetchone()
     total_public = int(row.total_public or 0) if row else 0
+
+    # Surface the most recently-ingested public repos that are still missing a
+    # primary_category. The data-quality gate is fed by the
+    # reporium-ingestion enrichment job; when this gate fails the operator
+    # needs to know *which* repos to chase, not just the percentage. Cap at
+    # 10 names so the response stays compact.
+    missing_sample_rows = (
+        await db.execute(
+            text(
+                """
+                SELECT owner || '/' || name AS full_name,
+                       ingested_at
+                FROM repos
+                WHERE is_private = false
+                  AND primary_category IS NULL
+                ORDER BY ingested_at DESC NULLS LAST
+                LIMIT 10
+                """
+            )
+        )
+    ).fetchall()
+    missing_primary_category_sample = [
+        {
+            "name": r.full_name,
+            "ingested_at": r.ingested_at.isoformat() if r.ingested_at else None,
+        }
+        for r in missing_sample_rows
+    ]
+
     return {
         "total_public_repos": total_public,
         "public_with_primary_category": int(row.public_with_primary_category or 0) if row else 0,
         "public_with_readme_summary": int(row.public_with_readme_summary or 0) if row else 0,
         "public_with_embeddings": int(row.public_with_embeddings or 0) if row else 0,
         "null_is_private_count": int(row.null_is_private_count or 0) if row else 0,
+        "missing_primary_category_sample": missing_primary_category_sample,
         "generated_at": datetime.now(timezone.utc).isoformat(),
     }
 
