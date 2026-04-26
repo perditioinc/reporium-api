@@ -1097,6 +1097,44 @@
       pr_merge_rate: 0.67
 
 # ---------------------------------------------------------------------------
+# Regression guard: "alternatives to X" negation queries.
+# Issue #365 — /ask returned `pinecone-python-client` as the top-1 source for
+# "vector database alternatives to pinecone" (the queried product itself, not
+# an alternative). The `forbidden_repos` field is a hard assertion that a
+# given "owner/name" MUST NOT appear in `sources`. This is the only gate we
+# have for negated-token retrieval bugs, so treat it as a must-pass.
+# ---------------------------------------------------------------------------
+
+- question: "vector database alternatives to pinecone"
+  expected_themes: ["vector", "alternative"]
+  expected_repos: ["weaviate/weaviate"]
+  forbidden_repos: ["pinecone-io/pinecone-python-client"]
+  difficulty: medium
+  max_tokens_soft_budget: 3500
+  fixture_repos:
+    - owner: weaviate
+      name: weaviate
+      description: "Open-source vector database"
+      problem_solved: "Store, search and manage vectors at scale with hybrid filtering"
+      similarity: 0.88
+      stars: 12000
+      integration_tags: [vector-db, hybrid-search, open-source]
+    - owner: qdrant
+      name: qdrant
+      description: "High-performance vector similarity search engine"
+      problem_solved: "Rust-based vector DB with payload filtering and sharding"
+      similarity: 0.86
+      stars: 20000
+      integration_tags: [vector-db, rust, embedded]
+    - owner: chroma-core
+      name: chroma
+      description: "AI-native embedding database"
+      problem_solved: "Lightweight local vector store for prototyping RAG apps"
+      similarity: 0.84
+      stars: 17000
+      integration_tags: [vector-db, embeddings, rag]
+
+# ---------------------------------------------------------------------------
 # Edge cases — these assert HTTP behavior rather than quality scores.
 # ---------------------------------------------------------------------------
 
