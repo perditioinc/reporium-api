@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-26
 **Branch:** `claude/feature/KAN-DRAFT-dq-primary-category-sync`
-**PR:** _to be filled in after `gh pr create`_
+**PR:** https://github.com/perditioinc/reporium-api/pull/444
 
 ## Exact root cause
 
