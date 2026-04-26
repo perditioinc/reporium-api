@@ -26,7 +26,7 @@ This repo's contribution to the failure is **insufficient diagnostics** — the 
 ## Repo-local fix (this lane)
 
 Branch: `claude/feature/KAN-DRAFT-data-quality-recovery`
-PR: see PR link captured in this lane handoff at the end of the file.
+PR: https://github.com/perditioinc/reporium-api/pull/442
 
 Two small changes:
 
@@ -74,4 +74,4 @@ The integration test against the real `/metrics/data-quality` endpoint requires 
 
 ## PR
 
-PR link: <to be filled in by the push step below>
+PR link: https://github.com/perditioinc/reporium-api/pull/442
