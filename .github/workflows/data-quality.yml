@@ -32,7 +32,10 @@ jobs:
       # Gates now read aggregate counts from /metrics/data-quality over HTTPS
       # (see 2026-04-23 scope doc).  Previous version connected psycopg2 to
       # private-IP Cloud SQL, which cannot succeed from a GitHub-hosted runner.
+      # ADMIN_API_KEY is required because PR #393 enabled METRICS_REQUIRE_AUTH=1
+      # in production, gating /metrics/* behind the X-Admin-Key header.
       - name: Run quality gates
         env:
           REPORIUM_API_URL: ${{ secrets.REPORIUM_API_URL }}
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
         run: python scripts/quality_gates.py
