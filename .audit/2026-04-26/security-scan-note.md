@@ -65,6 +65,7 @@ is also out of lane scope.
 
 Branch: `claude/feature/KAN-DRAFT-security-scan-fix`
 Base: `origin/main` @ `502af14` (post PR #440 merge).
+PR: https://github.com/perditioinc/reporium-api/pull/443
 
 Changes:
 
