@@ -338,10 +338,31 @@ if __name__ == "__main__":
     uvicorn.run("app.main:app", host="0.0.0.0", port=port)
 
 
+def _pool_stats(pool) -> dict:
+    # #354 follow-up: NullPool (used in CI/tests) does not implement size()/
+    # checkedout()/overflow(). Probe each counter defensively so /health stays
+    # 200 in any pool configuration; AsyncAdaptedQueuePool returns real ints.
+    def _safe(name):
+        method = getattr(pool, name, None)
+        if not callable(method):
+            return None
+        try:
+            return method()
+        except Exception:
+            return None
+
+    return {
+        "size": _safe("size"),
+        "checked_out": _safe("checkedout"),
+        "overflow": _safe("overflow"),
+    }
+
+
 @app.get("/health")
 @limiter.limit("60/minute")
 async def health(request: Request):
     from sqlalchemy import text
+    from app.database import engine
 
     db_error: str | None = None
     try:
@@ -351,6 +372,8 @@ async def health(request: Request):
         db_error = str(e)
         logger.warning(f"DB health check failed: {e}")
 
+    pool_stats = _pool_stats(engine.pool)
+
     if db_error:
         return JSONResponse(
             status_code=503,
@@ -358,10 +381,12 @@ async def health(request: Request):
                 "status": "degraded",
                 "db": "error",
                 "detail": "database check failed",
+                "pool": pool_stats,
             },
         )
 
     return {
         "status": "ok",
         "db": "ok",
+        "pool": pool_stats,
     }

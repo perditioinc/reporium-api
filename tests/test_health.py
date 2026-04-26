@@ -1,7 +1,7 @@
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from app.main import app
+from app.main import _pool_stats, app
 import app.main as main_module
 
 
@@ -32,6 +32,9 @@ class _Factory:
         return self._session
 
 
+_POOL_KEYS = {"size", "checked_out", "overflow"}
+
+
 @pytest.mark.asyncio
 async def test_health_returns_ok_when_database_query_succeeds(monkeypatch):
     monkeypatch.setattr(main_module, "async_session_factory", _Factory(_SuccessfulSession()))
@@ -40,7 +43,10 @@ async def test_health_returns_ok_when_database_query_succeeds(monkeypatch):
         response = await client.get("/health")
 
     assert response.status_code == 200
-    assert response.json() == {"status": "ok", "db": "ok"}
+    body = response.json()
+    assert body["status"] == "ok"
+    assert body["db"] == "ok"
+    assert set(body["pool"].keys()) == _POOL_KEYS
 
 
 @pytest.mark.asyncio
@@ -51,5 +57,49 @@ async def test_health_returns_503_when_database_query_fails(monkeypatch):
         response = await client.get("/health")
 
     assert response.status_code == 503
-    assert response.json()["status"] == "degraded"
-    assert response.json()["db"] == "error"
+    body = response.json()
+    assert body["status"] == "degraded"
+    assert body["db"] == "error"
+    assert set(body["pool"].keys()) == _POOL_KEYS
+
+
+def test_pool_stats_returns_none_for_nullpool_without_counter_attrs():
+    # NullPool stand-in: no size/checkedout/overflow attrs.
+    class _NullPoolLike:
+        pass
+
+    stats = _pool_stats(_NullPoolLike())
+
+    assert stats == {"size": None, "checked_out": None, "overflow": None}
+
+
+def test_pool_stats_returns_none_when_counter_methods_raise():
+    class _BrokenPool:
+        def size(self):
+            raise RuntimeError("pool not initialized")
+
+        def checkedout(self):
+            raise RuntimeError("pool not initialized")
+
+        def overflow(self):
+            raise RuntimeError("pool not initialized")
+
+    stats = _pool_stats(_BrokenPool())
+
+    assert stats == {"size": None, "checked_out": None, "overflow": None}
+
+
+def test_pool_stats_reports_counters_from_queue_pool_like():
+    class _QueuePoolLike:
+        def size(self):
+            return 5
+
+        def checkedout(self):
+            return 2
+
+        def overflow(self):
+            return 1
+
+    stats = _pool_stats(_QueuePoolLike())
+
+    assert stats == {"size": 5, "checked_out": 2, "overflow": 1}
