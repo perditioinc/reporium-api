@@ -2,11 +2,14 @@ import asyncio
 import json
 import logging
 import os
+import time
+import uuid
 from dataclasses import dataclass, field as dc_field
 from datetime import date, datetime
 from typing import Optional
 
 import httpx
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from slowapi import Limiter
@@ -19,6 +22,10 @@ from app.models.query_log import QueryLog
 from app.cache import cache
 from app.database import get_db
 from app.models.repo import IngestRun, Repo, RepoCategory, RepoEmbedding, RepoTag
+from app.prometheus_metrics import (
+    ADMIN_BACKFILL_DURATION_SECONDS,
+    ADMIN_BACKFILL_RUNS_TOTAL,
+)
 from app.rate_limit import rate_limit_storage
 from app.routers.library_full import invalidate_library_cache
 
@@ -1114,7 +1121,38 @@ async def backfill_primary_category_column(
     Returns before/after coverage stats and the row count updated.
 
     Pass `?dry_run=true` to compute counts without writing.
+
+    Observability (KAN-API-OBS-BACKFILL): emits structured `backfill.start`
+    and `backfill.end` log lines tagged with a correlation ID (taken from the
+    `X-Correlation-ID` header if present, else a freshly generated UUID4).
+    Increments the `admin_backfill_runs_total{outcome=...}` Prometheus
+    counter and observes the `admin_backfill_duration_seconds` histogram on
+    each terminal outcome. The correlation ID is also set as a Sentry tag so
+    transactions can be cross-linked to log lines.
     """
+    correlation_id = (
+        request.headers.get("X-Correlation-ID")
+        or request.headers.get("x-correlation-id")
+        or str(uuid.uuid4())
+    )
+    sentry_sdk.set_tag("correlation_id", correlation_id)
+    sentry_sdk.set_tag("admin_endpoint", "backfill_primary_category_column")
+
+    user_agent = request.headers.get("user-agent")
+
+    logger.info(
+        "backfill.start correlation_id=%s dry_run=%s user_agent=%s",
+        correlation_id,
+        dry_run,
+        user_agent,
+        extra={
+            "event": "backfill.start",
+            "correlation_id": correlation_id,
+            "dry_run": dry_run,
+            "request_user_agent": user_agent,
+        },
+    )
+
     coverage_sql = """
         SELECT
           COUNT(*) FILTER (WHERE is_private = false) AS public_total,
@@ -1126,62 +1164,112 @@ async def backfill_primary_category_column(
               AND r2.primary_category IS NULL) AS drift_to_heal
         FROM repos
     """
-    before = (await db.execute(text(coverage_sql))).one()
 
-    updated = 0
-    if not dry_run:
-        # RETURNING r.name lets us know exactly which repos had their
-        # primary_category rewritten so we can targeted-invalidate the
-        # per-repo detail cache (key shape: `repos:detail:{name}`). Without
-        # this, /repos/{name} could keep serving the stale (NULL or old)
-        # primary_category for up to CACHE_TTL_REPO_DETAIL after a backfill
-        # run. See KAN-API-CACHE-INVALIDATE / mem 4931.
-        result = await db.execute(text("""
-            UPDATE repos r
-               SET primary_category = sub.category_name
-              FROM (
-                SELECT DISTINCT ON (repo_id) repo_id, category_name
-                  FROM repo_categories
-                 WHERE is_primary = true
-                 ORDER BY repo_id, category_name
-              ) sub
-             WHERE sub.repo_id = r.id
-               AND r.primary_category IS NULL
-            RETURNING r.name
-        """))
-        updated_names = [row[0] for row in result.fetchall()]
-        updated = len(updated_names)
-        await db.commit()
-        await cache.invalidate("library:full*")
-        await cache.invalidate("repos:list:*")
-        # Per-row invalidation: bust each healed repo's detail cache so the
-        # next /repos/{name} read hits the DB and sees the new primary_category
-        # immediately, instead of waiting up to TTL for natural expiration.
-        for name in updated_names:
-            await cache.invalidate(f"repos:detail:{name}")
-        invalidate_library_cache()
+    started = time.perf_counter()
+    rows_scanned = 0
+    rows_updated = 0
+    outcome = "error"
+    try:
+        before = (await db.execute(text(coverage_sql))).one()
+        rows_scanned = int(before.public_total or 0)
 
-    after = (await db.execute(text(coverage_sql))).one()
+        if not dry_run:
+            # RETURNING r.name lets us know exactly which repos had their
+            # primary_category rewritten so we can targeted-invalidate the
+            # per-repo detail cache (key shape: `repos:detail:{name}`). Without
+            # this, /repos/{name} could keep serving the stale (NULL or old)
+            # primary_category for up to CACHE_TTL_REPO_DETAIL after a backfill
+            # run. See KAN-API-CACHE-INVALIDATE / mem 4931.
+            result = await db.execute(text("""
+                UPDATE repos r
+                   SET primary_category = sub.category_name
+                  FROM (
+                    SELECT DISTINCT ON (repo_id) repo_id, category_name
+                      FROM repo_categories
+                     WHERE is_primary = true
+                     ORDER BY repo_id, category_name
+                  ) sub
+                 WHERE sub.repo_id = r.id
+                   AND r.primary_category IS NULL
+                RETURNING r.name
+            """))
+            updated_names = [row[0] for row in result.fetchall()]
+            rows_updated = len(updated_names)
+            await db.commit()
+            await cache.invalidate("library:full*")
+            await cache.invalidate("repos:list:*")
+            # Per-row invalidation: bust each healed repo's detail cache so the
+            # next /repos/{name} read hits the DB and sees the new primary_category
+            # immediately, instead of waiting up to TTL for natural expiration.
+            for name in updated_names:
+                await cache.invalidate(f"repos:detail:{name}")
+            invalidate_library_cache()
 
-    def _coverage_pct(with_col: int, total: int) -> float:
-        return round((with_col / total) * 100, 4) if total else 0.0
+        after = (await db.execute(text(coverage_sql))).one()
 
-    return {
-        "dry_run": dry_run,
-        "updated": updated,
-        "before": {
-            "public_total": int(before.public_total),
-            "public_with_primary_category": int(before.public_with_col),
-            "drift_rows": int(before.drift_to_heal),
-            "coverage_pct": _coverage_pct(before.public_with_col, before.public_total),
-        },
-        "after": {
-            "public_total": int(after.public_total),
-            "public_with_primary_category": int(after.public_with_col),
-            "drift_rows": int(after.drift_to_heal),
-            "coverage_pct": _coverage_pct(after.public_with_col, after.public_total),
-        },
-    }
+        def _coverage_pct(with_col: int, total: int) -> float:
+            return round((with_col / total) * 100, 4) if total else 0.0
+
+        outcome = "success"
+        duration_ms = round((time.perf_counter() - started) * 1000, 3)
+        logger.info(
+            "backfill.end correlation_id=%s outcome=%s rows_scanned=%d rows_updated=%d duration_ms=%.3f",
+            correlation_id,
+            outcome,
+            rows_scanned,
+            rows_updated,
+            duration_ms,
+            extra={
+                "event": "backfill.end",
+                "correlation_id": correlation_id,
+                "outcome": outcome,
+                "rows_scanned": rows_scanned,
+                "rows_updated": rows_updated,
+                "duration_ms": duration_ms,
+            },
+        )
+        return {
+            "correlation_id": correlation_id,
+            "dry_run": dry_run,
+            "updated": rows_updated,
+            "duration_ms": duration_ms,
+            "before": {
+                "public_total": int(before.public_total),
+                "public_with_primary_category": int(before.public_with_col),
+                "drift_rows": int(before.drift_to_heal),
+                "coverage_pct": _coverage_pct(before.public_with_col, before.public_total),
+            },
+            "after": {
+                "public_total": int(after.public_total),
+                "public_with_primary_category": int(after.public_with_col),
+                "drift_rows": int(after.drift_to_heal),
+                "coverage_pct": _coverage_pct(after.public_with_col, after.public_total),
+            },
+        }
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - started) * 1000, 3)
+        logger.error(
+            "backfill.end correlation_id=%s outcome=error rows_scanned=%d rows_updated=%d duration_ms=%.3f error=%r",
+            correlation_id,
+            rows_scanned,
+            rows_updated,
+            duration_ms,
+            exc,
+            extra={
+                "event": "backfill.end",
+                "correlation_id": correlation_id,
+                "outcome": "error",
+                "rows_scanned": rows_scanned,
+                "rows_updated": rows_updated,
+                "duration_ms": duration_ms,
+                "error_type": type(exc).__name__,
+            },
+            exc_info=True,
+        )
+        raise
+    finally:
+        ADMIN_BACKFILL_RUNS_TOTAL.labels(outcome=outcome).inc()
+        ADMIN_BACKFILL_DURATION_SECONDS.observe(time.perf_counter() - started)
 
 
 # ── Security signal models ──────────────────────────────────────────────────
