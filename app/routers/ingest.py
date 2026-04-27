@@ -354,8 +354,17 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
             db.add(RepoTag(repo_id=repo.id, tag=tag))
     if item.categories:
         await db.execute(RepoCategory.__table__.delete().where(RepoCategory.repo_id == repo.id))
+        primary_category_name: str | None = None
         for cat in item.categories:
             db.add(RepoCategory(repo_id=repo.id, **cat.model_dump()))
+            if cat.is_primary and primary_category_name is None:
+                primary_category_name = cat.category_name
+        # Keep repos.primary_category in sync with the junction.
+        # /metrics/data-quality reads this column directly to compute the
+        # primary_category_coverage gate; without this assignment the column
+        # silently drifts out of sync because no other ingest path maintains it
+        # (the original backfill_primary_category.py was a one-off migration).
+        repo.primary_category = primary_category_name
     if item.builders:
         await db.execute(RepoBuilder.__table__.delete().where(RepoBuilder.repo_id == repo.id))
         for builder in item.builders:
