@@ -344,3 +344,85 @@ async def test_ingest_flows_tags_and_categories_into_repo_taxonomy(client: Async
     assert ("tag", "vector-db") in rows
     assert ("category", "AI Agents") in rows
     assert ("category", "Developer Tools") in rows
+
+
+@pytest.mark.asyncio
+async def test_ingest_keeps_primary_category_column_in_sync_with_junction(client: AsyncClient):
+    """Regression: repos.primary_category must stay in sync with the
+    repo_categories junction (is_primary=true row).
+
+    The /metrics/data-quality gate reads repos.primary_category IS NOT NULL.
+    Before this fix, _upsert_repo wrote the junction but never the column,
+    so repos with a correct primary in the junction silently failed the gate.
+    """
+    from sqlalchemy import text as _text
+    import app.database as db_module
+
+    # Initial ingest with a primary category
+    fixture = {
+        **TEST_REPO_FIXTURE,
+        "name": "primary-cat-sync-repo",
+        "github_url": "https://github.com/testuser/primary-cat-sync-repo",
+        "categories": [
+            {"category_id": "ai-agents", "category_name": "AI Agents", "is_primary": True},
+            {"category_id": "dev-tools", "category_name": "Developer Tools", "is_primary": False},
+        ],
+    }
+    response = await client.post("/ingest/repos", json=[fixture], headers=AUTH_HEADERS)
+    assert response.status_code == 200
+
+    async with db_module.async_session_factory() as session:
+        column = (
+            await session.execute(
+                _text("SELECT primary_category FROM repos WHERE name = :name"),
+                {"name": "primary-cat-sync-repo"},
+            )
+        ).scalar_one()
+        junction = (
+            await session.execute(
+                _text(
+                    "SELECT category_name FROM repo_categories rc "
+                    "JOIN repos r ON r.id = rc.repo_id "
+                    "WHERE r.name = :name AND rc.is_primary = true"
+                ),
+                {"name": "primary-cat-sync-repo"},
+            )
+        ).scalar_one()
+
+    assert column == "AI Agents", (
+        f"repos.primary_category column out of sync with junction: "
+        f"column={column!r}, junction={junction!r}"
+    )
+    assert column == junction
+
+    # Re-ingest with a different primary — column must follow the junction
+    updated_fixture = {
+        **fixture,
+        "categories": [
+            {"category_id": "ai-agents", "category_name": "AI Agents", "is_primary": False},
+            {"category_id": "dev-tools", "category_name": "Developer Tools", "is_primary": True},
+        ],
+    }
+    response = await client.post("/ingest/repos", json=[updated_fixture], headers=AUTH_HEADERS)
+    assert response.status_code == 200
+
+    async with db_module.async_session_factory() as session:
+        column = (
+            await session.execute(
+                _text("SELECT primary_category FROM repos WHERE name = :name"),
+                {"name": "primary-cat-sync-repo"},
+            )
+        ).scalar_one()
+        junction = (
+            await session.execute(
+                _text(
+                    "SELECT category_name FROM repo_categories rc "
+                    "JOIN repos r ON r.id = rc.repo_id "
+                    "WHERE r.name = :name AND rc.is_primary = true"
+                ),
+                {"name": "primary-cat-sync-repo"},
+            )
+        ).scalar_one()
+
+    assert column == "Developer Tools"
+    assert column == junction
