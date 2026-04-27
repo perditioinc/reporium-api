@@ -1093,6 +1093,84 @@ async def backfill_categories(
     return {"processed": processed, "assigned": assigned, "skipped": skipped}
 
 
+@router.post("/admin/backfill/primary_category_column", response_model=dict)
+@_limiter.limit("5/minute")
+async def backfill_primary_category_column(
+    request: Request,
+    dry_run: bool = Query(default=False),
+    db: AsyncSession = Depends(get_db),
+    _api_key: str = Depends(verify_api_key),
+    _admin_key: None = Depends(require_admin_key),
+):
+    """
+    Sync `repos.primary_category` from the `repo_categories` junction.
+
+    Only writes rows where `repos.primary_category IS NULL` AND a matching
+    `repo_categories` row with `is_primary = true` exists. Idempotent: rerun
+    is a no-op once drift is healed. Pairs with the forward-fix in PR #444
+    (`_upsert_repo` now keeps the column in sync going forward); this
+    endpoint heals the existing drift accumulated before that fix.
+
+    Returns before/after coverage stats and the row count updated.
+
+    Pass `?dry_run=true` to compute counts without writing.
+    """
+    coverage_sql = """
+        SELECT
+          COUNT(*) FILTER (WHERE is_private = false) AS public_total,
+          COUNT(*) FILTER (WHERE is_private = false AND primary_category IS NOT NULL) AS public_with_col,
+          (SELECT COUNT(DISTINCT r2.id) FROM repos r2
+             JOIN repo_categories rc2 ON rc2.repo_id = r2.id
+            WHERE r2.is_private = false
+              AND rc2.is_primary = true
+              AND r2.primary_category IS NULL) AS drift_to_heal
+        FROM repos
+    """
+    before = (await db.execute(text(coverage_sql))).one()
+
+    updated = 0
+    if not dry_run:
+        result = await db.execute(text("""
+            UPDATE repos r
+               SET primary_category = sub.category_name
+              FROM (
+                SELECT DISTINCT ON (repo_id) repo_id, category_name
+                  FROM repo_categories
+                 WHERE is_primary = true
+                 ORDER BY repo_id, category_name
+              ) sub
+             WHERE sub.repo_id = r.id
+               AND r.primary_category IS NULL
+        """))
+        updated = result.rowcount or 0
+        await db.commit()
+        await cache.invalidate("library:full*")
+        await cache.invalidate("repos:list:*")
+        invalidate_library_cache()
+
+    after = (await db.execute(text(coverage_sql))).one()
+
+    def _coverage_pct(with_col: int, total: int) -> float:
+        return round((with_col / total) * 100, 4) if total else 0.0
+
+    return {
+        "dry_run": dry_run,
+        "updated": updated,
+        "before": {
+            "public_total": int(before.public_total),
+            "public_with_primary_category": int(before.public_with_col),
+            "drift_rows": int(before.drift_to_heal),
+            "coverage_pct": _coverage_pct(before.public_with_col, before.public_total),
+        },
+        "after": {
+            "public_total": int(after.public_total),
+            "public_with_primary_category": int(after.public_with_col),
+            "drift_rows": int(after.drift_to_heal),
+            "coverage_pct": _coverage_pct(after.public_with_col, after.public_total),
+        },
+    }
+
+
 # ── Security signal models ──────────────────────────────────────────────────
 
 class SecuritySignalsPatch(BaseModel):
