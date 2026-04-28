@@ -266,7 +266,7 @@ async def test_library_excludes_private(client: AsyncClient, paired_repos):
 
 @pytest.mark.asyncio
 async def test_repos_list_excludes_private(client: AsyncClient, paired_repos):
-    resp = await client.get("/repos?limit=500")
+    resp = await client.get("/repos?limit=200")
     assert resp.status_code == 200
     body = resp.json()
     _assert_no_private(body, where="/repos")

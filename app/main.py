@@ -313,6 +313,7 @@ async def add_security_headers(request: Request, call_next):
 app.include_router(library.router)
 app.include_router(graph.router)
 app.include_router(mentions.router)
+app.include_router(dependencies.router)
 app.include_router(repos.router)
 app.include_router(search.router)
 app.include_router(analytics.router)
@@ -330,7 +331,6 @@ app.include_router(compare.router)
 app.include_router(admin.router)
 app.include_router(admin_visibility.router)
 app.include_router(webhooks.router)
-app.include_router(dependencies.router)
 
 
 if __name__ == "__main__":
