@@ -433,6 +433,7 @@ class TestBuildEnrichedRepoStars:
 
 # ---------------------------------------------------------------------------
 # /library/full privacy integration — 2026-04-23 leak regression guard
+# (contract updated 2026-04-28 to coordinate with Lane 2 / Lane 4).
 # ---------------------------------------------------------------------------
 #
 # On 2026-04-23 at 05:03:48 UTC, 44 private perditioinc/* repos surfaced in
@@ -441,11 +442,19 @@ class TestBuildEnrichedRepoStars:
 # column was stale for the 44 repos (ingestion defaults is_private=False when
 # the field is missing, and sync_is_private.py had not run).
 #
-# These tests guard the full end-to-end contract:
+# Then on 2026-04-27, perditioinc/hippo-harvest-assignment leaked again
+# because no privacy field was emitted on the wire — downstream gates
+# (frontend `validate:privacy`, reporium-audit `check_contract`) had
+# nothing to assert against, so they silently passed for ~22 hours.
+#
+# Updated contract enforced by these tests:
 #   1. No private repo ever appears in any paginated /library/full page.
-#   2. /library/full response objects never contain an `isPrivate` field
-#      (the field is stripped so a client filtering on it cannot rely on it,
-#      AND so an accidental leak is structurally impossible via that field).
+#   2. Every repo response object MUST carry `isPrivate` (camelCase) AND
+#      it MUST be `False`. This is the inverse of the prior (#414) shape —
+#      the field is now PRESENT-AND-FALSE so downstream gates have a
+#      structural signal to validate. A missing field is a build-blocking
+#      failure for Lane 2's `validate-privacy.ts` and Lane 4's
+#      `check_contract` audit.
 #   3. Ingesting with is_private=true keeps the repo out of the public feed
 #      across all pages (covers the pagination-edge case — the incident
 #      surfaced on page 10 of the live response).
@@ -456,10 +465,14 @@ from httpx import AsyncClient
 
 @pytest.mark.asyncio
 async def test_library_full_excludes_private_repos_across_all_pages(client: AsyncClient):
-    """Regression test for the 2026-04-23 private-repo leak.
+    """Regression test for the 2026-04-23 + 2026-04-27 private-repo leaks.
 
     Ingests a mix of public + private repos and verifies every page of
-    /library/full omits the private ones AND strips the isPrivate field.
+    /library/full:
+      - omits private repos entirely (Guard 1),
+      - emits ``isPrivate: False`` on every surviving repo (Guard 2 — the
+        post-2026-04-28 contract that gives Lane 2's validate-privacy and
+        Lane 4's audit a structural signal to assert against).
     """
     from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
 
@@ -493,9 +506,17 @@ async def test_library_full_excludes_private_repos_across_all_pages(client: Asyn
         repos = body.get("repos", [])
 
         for repo in repos:
-            # Guard 2: isPrivate field must be absent from every response object
-            assert "isPrivate" not in repo, (
-                f"isPrivate leaked on page {page} for repo {repo.get('name')}"
+            # Guard 2: isPrivate must be PRESENT and FALSE on every surviving
+            # repo. Missing field would block Lane 2's prebuild validator and
+            # FAIL Lane 4's nightly audit.
+            assert "isPrivate" in repo, (
+                f"missing isPrivate on page {page} for {repo.get('name')!r} — "
+                "Lane 2 validate-privacy and Lane 4 audit need this field"
+            )
+            assert repo["isPrivate"] is False, (
+                f"PRIVACY LEAK: isPrivate={repo['isPrivate']!r} on page "
+                f"{page} for {repo.get('name')!r} — only public repos "
+                "should reach the wire"
             )
             seen_names.add(repo.get("name"))
 

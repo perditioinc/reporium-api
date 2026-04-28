@@ -47,7 +47,54 @@ from app.models.session import AskSession
 from app.rate_limit import rate_limit_storage
 from app.slo_observer import token_observer
 from app.privacy import redact_pii
+from app.source_canonical import canonical_owner_name
 from app.utils import log_nonfatal, vec_to_pg
+
+
+def _build_smart_route_source(
+    *,
+    name: str,
+    owner: str,
+    forked_from: str | None,
+    stars: int | None,
+    description: str | None,
+    relevance_score: float = 1.0,
+    problem_solved: str | None = None,
+    integration_tags: list | None = None,
+) -> dict:
+    """Construct a smart-route source dict with fork canonicalization applied.
+
+    The Reporium org `perditioinc` mirrors many upstream repos (e.g.
+    microsoft/markitdown -> perditioinc/markitdown). When ASK cites those
+    rows, we want the answer to point users at the upstream project, not the
+    internal mirror. The DB column `forked_from` always holds the canonical
+    upstream `<owner>/<name>` for fork rows.
+
+    This helper:
+      - Replaces `name`/`owner` with the upstream parent when `forked_from`
+        is a well-formed `<owner>/<name>` string.
+      - Preserves the original `forked_from` field in the response so
+        clients can render "(forked from upstream/repo)" badges.
+      - Falls back to the row's own owner/name when `forked_from` is
+        null/empty/malformed — never invents data.
+
+    See app/source_canonical.py for the splitting logic and rationale.
+    """
+    canon_owner, canon_name = canonical_owner_name(
+        forked_from=forked_from,
+        own_owner=owner,
+        own_name=name,
+    )
+    return {
+        "name": canon_name,
+        "owner": canon_owner,
+        "stars": stars,
+        "relevance_score": relevance_score,
+        "description": description,
+        "forked_from": forked_from,
+        "problem_solved": problem_solved,
+        "integration_tags": integration_tags or [],
+    }
 # Rate limiter for the public /ask endpoint (no auth, IP-based)
 _limiter = Limiter(key_func=get_remote_address, storage_uri=rate_limit_storage)
 
@@ -664,7 +711,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         if topic:
             sql = text("""
                 SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
-                       primary_category, description
+                       primary_category, description, forked_from
                 FROM repos
                 WHERE is_private = false
                   AND LOWER(primary_category) LIKE :topic
@@ -675,7 +722,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         else:
             sql = text("""
                 SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
-                       primary_category, description
+                       primary_category, description, forked_from
                 FROM repos
                 WHERE is_private = false
                 ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
@@ -695,14 +742,16 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         for row in rows:
             stars_str = f"{row.stars:,}" if row.stars else "0"
             cat_str = f" ({row.primary_category})" if row.primary_category else ""
-            parts.append(f"- **{row.owner}/{row.name}**{cat_str} — {stars_str} stars")
-            sources.append({
-                "name": row.name, "owner": row.owner,
-                "stars": row.stars, "relevance_score": 1.0,
-                "description": row.description,
-                "forked_from": None, "problem_solved": None,
-                "integration_tags": [],
-            })
+            # Display canonical name in answer text — same canonicalization the
+            # source dict gets so what users read matches what they cite.
+            display_owner, display_name = canonical_owner_name(
+                forked_from=row.forked_from, own_owner=row.owner, own_name=row.name,
+            )
+            parts.append(f"- **{display_owner}/{display_name}**{cat_str} — {stars_str} stars")
+            sources.append(_build_smart_route_source(
+                name=row.name, owner=row.owner, forked_from=row.forked_from,
+                stars=row.stars, description=row.description,
+            ))
         header = (
             f"Top {len(rows)} most-starred repos in \"{topic}\":"
             if topic
@@ -733,7 +782,11 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             """), {"name": name, "like_name": f"%{name}%"})
             row = result.first()
             if row:
-                parts = [f"**{row.owner}/{row.name}**"]
+                # Use canonical upstream owner/name when this is a fork mirror.
+                display_owner, display_name = canonical_owner_name(
+                    forked_from=row.forked_from, own_owner=row.owner, own_name=row.name,
+                )
+                parts = [f"**{display_owner}/{display_name}**"]
                 if row.primary_category:
                     parts.append(f"Category: {row.primary_category}")
                 if row.language:
@@ -749,12 +802,11 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
                     parts.append(f"\n**Summary:** {row.readme_summary[:300]}")
                 return {
                     "answer": "\n".join(parts),
-                    "sources": [{
-                        "name": row.name, "owner": row.owner,
-                        "stars": row.stars, "relevance_score": 1.0,
-                        "description": row.description, "forked_from": row.forked_from,
-                        "problem_solved": row.problem_solved, "integration_tags": [],
-                    }],
+                    "sources": [_build_smart_route_source(
+                        name=row.name, owner=row.owner, forked_from=row.forked_from,
+                        stars=row.stars, description=row.description,
+                        problem_solved=row.problem_solved,
+                    )],
                     "route": "repo_info",
                 }
         # Fall through to LLM if no match
@@ -818,7 +870,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         lang = m.group("lang").strip()
         result = await db.execute(text("""
             SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
-                   primary_category, description
+                   primary_category, description, forked_from
             FROM repos
             WHERE is_private = false AND LOWER(primary_language) = LOWER(:lang)
             ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
@@ -826,10 +878,20 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """), {"lang": lang})
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(
+                    f"- **{d_owner}/{d_name}** — {r.stars:,} stars"
+                    + (f" ({r.primary_category})" if r.primary_category else "")
+                )
             return {
                 "answer": f"Top {lang} repos in Reporium ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                ) for r in rows],
                 "route": "list_by_language",
             }
         return {
@@ -858,17 +920,24 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         order_clause = order_map[adj]
         result = await db.execute(text(f"""
             SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
-                   primary_category, activity_score
+                   primary_category, activity_score, forked_from
             FROM repos
             WHERE is_private = false
             ORDER BY {order_clause}
             LIMIT 10
         """))
         rows = result.fetchall()
-        parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars, activity: {r.activity_score or 0}" for r in rows]
+        parts = []
+        for r in rows:
+            d_owner, d_name = canonical_owner_name(
+                forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+            parts.append(f"- **{d_owner}/{d_name}** — {r.stars:,} stars, activity: {r.activity_score or 0}")
         return {
             "answer": f"Most {adj} repos in Reporium:\n\n" + "\n".join(parts),
-            "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": None, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+            "sources": [_build_smart_route_source(
+                name=r.name, owner=r.owner, forked_from=r.forked_from,
+                stars=r.stars, description=None,
+            ) for r in rows],
             "route": f"most_{adj}",
         }
 
@@ -878,7 +947,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         cat = m.group("cat").strip().lower()
         result = await db.execute(text("""
             SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
-                   primary_category, description
+                   primary_category, description, forked_from
             FROM repos
             WHERE is_private = false AND LOWER(primary_category) LIKE :cat
             ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
@@ -886,10 +955,17 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """), {"cat": f"%{cat}%"})
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(f"- **{d_owner}/{d_name}** — {r.stars:,} stars")
             return {
                 "answer": f"Top repos in \"{cat}\" ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                ) for r in rows],
                 "route": "category_repos",
             }
 
@@ -929,7 +1005,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             SELECT name, owner, description, readme_summary, problem_solved,
                    primary_category, primary_language AS language,
                    COALESCE(parent_stars, stargazers_count, 0) as stars,
-                   license_spdx, activity_score, has_tests, has_ci
+                   license_spdx, activity_score, has_tests, has_ci, forked_from
             FROM repos
             WHERE is_private = false AND LOWER(name) LIKE LOWER(:name)
             ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
@@ -939,7 +1015,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             SELECT name, owner, description, readme_summary, problem_solved,
                    primary_category, primary_language AS language,
                    COALESCE(parent_stars, stargazers_count, 0) as stars,
-                   license_spdx, activity_score, has_tests, has_ci
+                   license_spdx, activity_score, has_tests, has_ci, forked_from
             FROM repos
             WHERE is_private = false AND LOWER(name) LIKE LOWER(:name)
             ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
@@ -949,7 +1025,9 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         row_b = result_b.first()
         if row_a and row_b:
             def _fmt_compare(r):
-                lines = [f"**{r.owner}/{r.name}**"]
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                lines = [f"**{d_owner}/{d_name}**"]
                 if r.description:
                     lines.append(f"  Description: {r.description[:200]}")
                 if r.primary_category:
@@ -969,10 +1047,22 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
                     lines.append(f"  Problem solved: {r.problem_solved[:200]}")
                 return "\n".join(lines)
 
-            answer = f"**Comparison: {row_a.name} vs {row_b.name}**\n\n{_fmt_compare(row_a)}\n\n---\n\n{_fmt_compare(row_b)}"
+            d_owner_a, d_name_a = canonical_owner_name(
+                forked_from=row_a.forked_from, own_owner=row_a.owner, own_name=row_a.name)
+            d_owner_b, d_name_b = canonical_owner_name(
+                forked_from=row_b.forked_from, own_owner=row_b.owner, own_name=row_b.name)
+            answer = f"**Comparison: {d_name_a} vs {d_name_b}**\n\n{_fmt_compare(row_a)}\n\n---\n\n{_fmt_compare(row_b)}"
             sources = [
-                {"name": row_a.name, "owner": row_a.owner, "stars": row_a.stars, "relevance_score": 1.0, "description": row_a.description, "forked_from": None, "problem_solved": row_a.problem_solved, "integration_tags": []},
-                {"name": row_b.name, "owner": row_b.owner, "stars": row_b.stars, "relevance_score": 1.0, "description": row_b.description, "forked_from": None, "problem_solved": row_b.problem_solved, "integration_tags": []},
+                _build_smart_route_source(
+                    name=row_a.name, owner=row_a.owner, forked_from=row_a.forked_from,
+                    stars=row_a.stars, description=row_a.description,
+                    problem_solved=row_a.problem_solved,
+                ),
+                _build_smart_route_source(
+                    name=row_b.name, owner=row_b.owner, forked_from=row_b.forked_from,
+                    stars=row_b.stars, description=row_b.description,
+                    problem_solved=row_b.problem_solved,
+                ),
             ]
             result = {"answer": answer, "sources": sources, "route": "comparison"}
             return result
@@ -983,7 +1073,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         tag = m.group(1).strip().lower()
         result = await db.execute(text("""
             SELECT r.name, r.owner, COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
-                   r.primary_category, r.description, rt.tag
+                   r.primary_category, r.description, rt.tag, r.forked_from
             FROM repo_tags rt
             JOIN repos r ON r.id = rt.repo_id
             WHERE r.is_private = false AND LOWER(rt.tag) LIKE :tag
@@ -992,10 +1082,20 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """), {"tag": f"%{tag}%"})
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(
+                    f"- **{d_owner}/{d_name}** — {r.stars:,} stars"
+                    + (f" ({r.primary_category})" if r.primary_category else "")
+                )
             result = {
                 "answer": f"Repos tagged with \"{tag}\" ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                ) for r in rows],
                 "route": "tag_search",
             }
             return result
@@ -1006,7 +1106,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         license_q = m.group(1).strip()
         result = await db.execute(text("""
             SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
-                   primary_category, description, license_spdx
+                   primary_category, description, license_spdx, forked_from
             FROM repos
             WHERE is_private = false AND LOWER(license_spdx) ILIKE :lic
             ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
@@ -1014,10 +1114,17 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """), {"lic": f"%{license_q}%"})
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** ({r.license_spdx}) — {r.stars:,} stars" for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(f"- **{d_owner}/{d_name}** ({r.license_spdx}) — {r.stars:,} stars")
             result = {
                 "answer": f"Repos with {license_q.upper()} license ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                ) for r in rows],
                 "route": "license_search",
             }
             return result
@@ -1028,7 +1135,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         builder = m.group(1).strip()
         result = await db.execute(text("""
             SELECT r.name, r.owner, COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
-                   r.primary_category, r.description
+                   r.primary_category, r.description, r.forked_from
             FROM repo_builders rb
             JOIN repos r ON r.id = rb.repo_id
             WHERE r.is_private = false AND LOWER(rb.login) ILIKE :builder
@@ -1037,10 +1144,20 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """), {"builder": f"%{builder}%"})
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(
+                    f"- **{d_owner}/{d_name}** — {r.stars:,} stars"
+                    + (f" ({r.primary_category})" if r.primary_category else "")
+                )
             result = {
                 "answer": f"Repos by \"{builder}\" ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                ) for r in rows],
                 "route": "builder_search",
             }
             return result
@@ -1050,7 +1167,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
     if m:
         result = await db.execute(text("""
             SELECT name, description, primary_category,
-                   COALESCE(parent_stars, stargazers_count, 0) as stars, owner
+                   COALESCE(parent_stars, stargazers_count, 0) as stars, owner, forked_from
             FROM repos
             WHERE is_private = false
             ORDER BY ingested_at DESC
@@ -1058,10 +1175,20 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """))
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(
+                    f"- **{d_owner}/{d_name}** — {r.stars:,} stars"
+                    + (f" ({r.primary_category})" if r.primary_category else "")
+                )
             result = {
                 "answer": f"Recently added repos ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                ) for r in rows],
                 "route": "recently_added",
             }
             return result
@@ -1082,7 +1209,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         where = " AND ".join(conditions)
         result = await db.execute(text(f"""
             SELECT name, owner, COALESCE(parent_stars, stargazers_count, 0) as stars,
-                   primary_category, description, has_tests, has_ci
+                   primary_category, description, has_tests, has_ci, forked_from
             FROM repos
             WHERE is_private = false AND {where}
             ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
@@ -1091,10 +1218,17 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         rows = result.fetchall()
         if rows:
             label = " and ".join(filter(None, ["tests" if want_tests else None, "CI" if want_ci else None]))
-            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars (tests: {r.has_tests}, CI: {r.has_ci})" for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(f"- **{d_owner}/{d_name}** — {r.stars:,} stars (tests: {r.has_tests}, CI: {r.has_ci})")
             result = {
                 "answer": f"Repos with {label} ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                ) for r in rows],
                 "route": "quality_filter",
             }
             return result
@@ -1106,7 +1240,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         result = await db.execute(text("""
             SELECT DISTINCT r.name, r.owner,
                    COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
-                   r.primary_category, r.description
+                   r.primary_category, r.description, r.forked_from
             FROM repos r
             LEFT JOIN repo_tags rt ON rt.repo_id = r.id
             WHERE r.is_private = false
@@ -1120,10 +1254,20 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """), {"term": f"%{tech}%", "exact_term": tech})
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(
+                    f"- **{d_owner}/{d_name}** — {r.stars:,} stars"
+                    + (f" ({r.primary_category})" if r.primary_category else "")
+                )
             return {
                 "answer": f"Repos using or supporting **{tech}** ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                ) for r in rows],
                 "route": "tech_search",
             }
         return {
@@ -1139,7 +1283,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         result = await db.execute(text("""
             SELECT r.name, r.owner,
                    COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
-                   r.primary_category, r.description
+                   r.primary_category, r.description, r.forked_from
             FROM repo_ai_dev_skills sk
             JOIN repos r ON r.id = sk.repo_id
             WHERE r.is_private = false
@@ -1149,10 +1293,20 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """), {"skill": f"%{skill}%"})
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(
+                    f"- **{d_owner}/{d_name}** — {r.stars:,} stars"
+                    + (f" ({r.primary_category})" if r.primary_category else "")
+                )
             return {
                 "answer": f"Repos for **{skill}** ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                ) for r in rows],
                 "route": "skill_search",
             }
         return {
@@ -1180,7 +1334,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             result = await db.execute(text("""
                 SELECT r.name, r.owner,
                        COALESCE(r.parent_stars, r.stargazers_count, 0) as stars,
-                       r.primary_category, r.description,
+                       r.primary_category, r.description, r.forked_from,
                        1 - (e.embedding_vec <=> (
                            SELECT e2.embedding_vec FROM repo_embeddings e2 WHERE e2.repo_id = CAST(:source_id AS uuid)
                        )) AS similarity
@@ -1196,10 +1350,23 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             """), {"source_id": str(source_row.id)})
             rows = result.fetchall()
             if rows:
-                parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars, similarity: {r.similarity:.2f}" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+                parts = []
+                for r in rows:
+                    d_owner, d_name = canonical_owner_name(
+                        forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                    parts.append(
+                        f"- **{d_owner}/{d_name}** — {r.stars:,} stars, similarity: {r.similarity:.2f}"
+                        + (f" ({r.primary_category})" if r.primary_category else "")
+                    )
+                # Source row gets no canonicalization (it's an internal probe row,
+                # not part of the cited sources). Use its own owner/name in the header.
                 return {
                     "answer": f"Repos similar to **{source_row.owner}/{source_row.name}** ({len(rows)} shown):\n\n" + "\n".join(parts),
-                    "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": round(float(r.similarity), 4), "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                    "sources": [_build_smart_route_source(
+                        name=r.name, owner=r.owner, forked_from=r.forked_from,
+                        stars=r.stars, description=r.description,
+                        relevance_score=round(float(r.similarity), 4),
+                    ) for r in rows],
                     "route": "similarity_redirect",
                 }
         # Fall through to LLM if repo not found
@@ -1211,7 +1378,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         result = await db.execute(text("""
             SELECT r2.name, r2.owner,
                    COALESCE(r2.parent_stars, r2.stargazers_count, 0) as stars,
-                   r2.primary_category, r2.description,
+                   r2.primary_category, r2.description, r2.forked_from,
                    1 - (e1.embedding_vec <=> e2.embedding_vec) AS similarity
             FROM repos r1
             JOIN repo_embeddings e1 ON e1.repo_id = r1.id
@@ -1231,10 +1398,18 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """), {"target_name": target_name})
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** (similar, score {r.similarity:.2f}) — {r.stars:,} stars" for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(f"- **{d_owner}/{d_name}** (similar, score {r.similarity:.2f}) — {r.stars:,} stars")
             return {
                 "answer": f"Repos related to **{target_name}** ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": round(float(r.similarity), 4), "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                    relevance_score=round(float(r.similarity), 4),
+                ) for r in rows],
                 "route": "dependency_search",
             }
 
@@ -1247,7 +1422,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         result = await db.execute(text("""
             SELECT name, owner,
                    COALESCE(parent_stars, stargazers_count, 0) as stars,
-                   primary_category, description, ingested_at
+                   primary_category, description, ingested_at, forked_from
             FROM repos
             WHERE is_private = false
               AND ingested_at > NOW() - MAKE_INTERVAL(days => :days)
@@ -1256,10 +1431,20 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
         """), {"days": days})
         rows = result.fetchall()
         if rows:
-            parts = [f"- **{r.owner}/{r.name}** — {r.stars:,} stars" + (f" ({r.primary_category})" if r.primary_category else "") for r in rows]
+            parts = []
+            for r in rows:
+                d_owner, d_name = canonical_owner_name(
+                    forked_from=r.forked_from, own_owner=r.owner, own_name=r.name)
+                parts.append(
+                    f"- **{d_owner}/{d_name}** — {r.stars:,} stars"
+                    + (f" ({r.primary_category})" if r.primary_category else "")
+                )
             return {
                 "answer": f"Repos added or updated in the last {period} ({len(rows)} shown):\n\n" + "\n".join(parts),
-                "sources": [{"name": r.name, "owner": r.owner, "stars": r.stars, "relevance_score": 1.0, "description": r.description, "forked_from": None, "problem_solved": None, "integration_tags": []} for r in rows],
+                "sources": [_build_smart_route_source(
+                    name=r.name, owner=r.owner, forked_from=r.forked_from,
+                    stars=r.stars, description=r.description,
+                ) for r in rows],
                 "route": "temporal_search",
             }
         return {
@@ -2620,6 +2805,11 @@ async def _prepare_query(
         # Query DB only for uncached repo edges (pgvector similarity)
         new_edges: dict[str, list[dict]] = {}
         if uncached_ids:
+            # SECURITY (2026-04-28): every JOIN on `repos` must enforce
+            # is_private = false, AND the lateral subquery on repo_embeddings
+            # must also exclude private rows — otherwise a private repo can
+            # surface as a "related" target and leak via the LLM "Related
+            # repos:" context block. See app/db_filters.py.
             edge_result = await db.execute(
                 text("""
                     SELECT e1.repo_id::text AS source_id,
@@ -2631,12 +2821,14 @@ async def _prepare_query(
                     CROSS JOIN LATERAL (
                         SELECT e2_inner.repo_id, e2_inner.embedding_vec
                         FROM repo_embeddings e2_inner
+                        JOIN repos r_inner ON r_inner.id = e2_inner.repo_id
+                                          AND r_inner.is_private = false
                         WHERE e2_inner.repo_id != e1.repo_id
                         ORDER BY e1.embedding_vec <=> e2_inner.embedding_vec
                         LIMIT 4
                     ) e2
-                    JOIN repos r1 ON r1.id = e1.repo_id
-                    JOIN repos r2 ON r2.id = e2.repo_id
+                    JOIN repos r1 ON r1.id = e1.repo_id AND r1.is_private = false
+                    JOIN repos r2 ON r2.id = e2.repo_id AND r2.is_private = false
                     WHERE e1.repo_id::text = ANY(:ids)
                       AND 1 - (e1.embedding_vec <=> e2.embedding_vec) >= 0.4
                 """),
@@ -2996,11 +3188,20 @@ async def _run_query(
         log_nonfatal("token_observer.record_tokens")
 
     # Build response
+    # Fork canonicalization: when a row has forked_from set, surface the
+    # upstream owner/name in the cited source. The DB row itself stays
+    # unmodified — only the response shape pivots. forked_from is preserved
+    # on the response so clients can render a "(forked from X/Y)" badge.
     sources = []
     for repo in qctx.sources:
+        canon_owner, canon_name = canonical_owner_name(
+            forked_from=repo["forked_from"],
+            own_owner=repo["owner"],
+            own_name=repo["name"],
+        )
         sources.append(SourceRepo(
-            name=repo["name"],
-            owner=repo["owner"],
+            name=canon_name,
+            owner=canon_owner,
             forked_from=repo["forked_from"],
             description=repo["description"],
             stars=repo["stars"],
@@ -3342,17 +3543,24 @@ async def intelligence_ask_stream(
                 )).add_done_callback(_task_done_callback)
                 return
 
-            # Emit sources before generation starts
-            source_list = [
-                SourceRepo(
-                    name=r["name"], owner=r["owner"], forked_from=r["forked_from"],
+            # Emit sources before generation starts.
+            # Fork canonicalization (mirrors the non-streaming path): when a
+            # row has forked_from, cite the upstream owner/name. Original
+            # forked_from is kept on the response for client display.
+            source_list = []
+            for r in qctx.sources:
+                canon_owner, canon_name = canonical_owner_name(
+                    forked_from=r["forked_from"],
+                    own_owner=r["owner"],
+                    own_name=r["name"],
+                )
+                source_list.append(SourceRepo(
+                    name=canon_name, owner=canon_owner, forked_from=r["forked_from"],
                     description=r["description"], stars=r["stars"],
                     relevance_score=round(r["similarity"], 4),
                     problem_solved=r["problem_solved"],
                     integration_tags=r.get("integration_tags") or [],
-                )
-                for r in qctx.sources
-            ]
+                ))
             yield f"data: {json.dumps({'type': 'sources', 'sources': [s.model_dump() for s in source_list], 'cache_hit': False})}\n\n"
 
             # PR4 (Ask UX): kick off follow-up suggestion generation IN PARALLEL

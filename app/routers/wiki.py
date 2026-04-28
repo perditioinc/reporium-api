@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
+from app.db_filters import public_repo_filter
 from app.models.repo import Repo, RepoAIDevSkill, RepoCategory, RepoPMSkill
 from app.routers.library import _repo_to_summary
 from app.schemas.repo import RepoSummary
@@ -33,7 +34,7 @@ async def get_skill_wiki(skill: str, db: AsyncSession = Depends(get_db)) -> Skil
     stmt = (
         select(Repo)
         .join(RepoAIDevSkill, RepoAIDevSkill.repo_id == Repo.id)
-        .where(RepoAIDevSkill.skill == skill, Repo.is_private == False)  # noqa: E712
+        .where(RepoAIDevSkill.skill == skill, public_repo_filter())
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -53,7 +54,7 @@ async def get_skill_wiki(skill: str, db: AsyncSession = Depends(get_db)) -> Skil
         stmt2 = (
             select(Repo)
             .join(RepoPMSkill, RepoPMSkill.repo_id == Repo.id)
-            .where(RepoPMSkill.skill == skill, Repo.is_private == False)  # noqa: E712
+            .where(RepoPMSkill.skill == skill, public_repo_filter())
             .options(
                 selectinload(Repo.tags),
                 selectinload(Repo.categories),
@@ -98,7 +99,7 @@ async def get_category_wiki(
     stmt = (
         select(Repo)
         .join(RepoCategory, RepoCategory.repo_id == Repo.id)
-        .where(RepoCategory.category_id == category, Repo.is_private == False)  # noqa: E712
+        .where(RepoCategory.category_id == category, public_repo_filter())
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
