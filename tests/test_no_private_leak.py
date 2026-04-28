@@ -102,12 +102,16 @@ async def _insert_repo(
             await session.execute(
                 text(
                     """
-                    INSERT INTO repo_embeddings (repo_id, embedding_vec)
-                    VALUES (CAST(:repo_id AS uuid), CAST(:vec AS vector))
+                    INSERT INTO repo_embeddings (repo_id, model, embedding_vec)
+                    VALUES (CAST(:repo_id AS uuid), :model, CAST(:vec AS vector))
                     ON CONFLICT DO NOTHING
                     """
                 ),
-                {"repo_id": repo_id, "vec": vec_str},
+                {
+                    "repo_id": repo_id,
+                    "model": "all-MiniLM-L6-v2",
+                    "vec": vec_str,
+                },
             )
         await session.commit()
     return repo_id
