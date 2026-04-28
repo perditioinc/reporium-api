@@ -8,6 +8,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
+from app.db_filters import public_repo_filter
 from app.models.dependency import RepoDependency
 from app.models.repo import Repo
 
@@ -22,10 +23,16 @@ async def get_repo_dependencies(
     ecosystem: str | None = Query(default=None, description="Filter by ecosystem (pypi, npm, etc.)"),
     db: AsyncSession = Depends(get_db),
 ):
-    """Return all dependencies for a repo, ordered by package_name."""
+    """Return all dependencies for a repo, ordered by package_name.
 
-    # Verify repo exists
-    repo = await db.get(Repo, repo_id)
+    SECURITY: returns 404 for private repos so they can't be enumerated by
+    UUID. Uses the centralized `public_repo_filter()` predicate — see
+    app/db_filters.py.
+    """
+
+    # Verify repo exists AND is public
+    stmt_repo = select(Repo).where(Repo.id == repo_id, public_repo_filter())
+    repo = (await db.execute(stmt_repo)).scalar_one_or_none()
     if repo is None:
         raise HTTPException(status_code=404, detail="Repo not found")
 
@@ -77,7 +84,10 @@ async def get_dependents(
             RepoDependency.is_direct,
         )
         .join(RepoDependency, RepoDependency.repo_id == Repo.id)
-        .where(func.lower(RepoDependency.package_name) == package.lower())
+        .where(
+            func.lower(RepoDependency.package_name) == package.lower(),
+            public_repo_filter(),  # SECURITY: never expose private repos
+        )
     )
     if ecosystem:
         stmt = stmt.where(RepoDependency.package_ecosystem == ecosystem)

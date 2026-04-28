@@ -78,6 +78,7 @@ _SIMILAR_SQL = text("""
     JOIN repo_embeddings e2 ON e2.repo_id != e1.repo_id
     JOIN repos r ON r.id = e2.repo_id
     WHERE seed_r.name = :name
+      AND seed_r.is_private = false
       AND r.is_private = false
       AND r.parent_is_archived = false
       AND e1.embedding_vec IS NOT NULL

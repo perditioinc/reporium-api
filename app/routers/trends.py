@@ -6,6 +6,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.cache import CACHE_TTL_GAPS, CACHE_TTL_STATS, CACHE_TTL_TRENDS, cache
 from app.database import get_db
+from app.db_filters import public_repo_filter
 from app.models.repo import Repo, RepoCategory, RepoTag
 from app.models.trend import GapAnalysis, IngestionLog, TrendSnapshot
 from app.schemas.trend import (
@@ -201,7 +202,7 @@ async def get_stats(db: AsyncSession = Depends(get_db)) -> StatsResponse:
     if cached:
         return StatsResponse(**cached)
 
-    public_repos = Repo.is_private == False  # noqa: E712
+    public_repos = public_repo_filter()  # SECURITY: never expose private repos
 
     total = (await db.execute(select(func.count(Repo.id)).where(public_repos))).scalar_one()
     total_forks = (

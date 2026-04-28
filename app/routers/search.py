@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 
 from app.config import settings
 from app.database import get_db
+from app.db_filters import public_repo_filter
 from app.embeddings import get_embedding_model
 from app.models.repo import Repo
 from app.routers.library import _repo_to_summary
@@ -40,7 +41,7 @@ async def search_repos(
     stmt = (
         select(Repo)
         .where(
-            Repo.is_private == False,  # noqa: E712 — SQLAlchemy requires == not `is`
+            public_repo_filter(),  # SECURITY: never expose private repos
             or_(
                 Repo.name.ilike(search),
                 Repo.description.ilike(search),
@@ -156,7 +157,7 @@ async def _full_text_fallback(
     stmt = (
         select(Repo)
         .where(
-            Repo.is_private == False,  # noqa: E712 — SECURITY: never expose private repos
+            public_repo_filter(),  # SECURITY: never expose private repos
             or_(
                 Repo.name.ilike(search),
                 Repo.description.ilike(search),

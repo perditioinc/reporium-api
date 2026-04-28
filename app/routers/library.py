@@ -8,6 +8,7 @@ from sqlalchemy.orm import selectinload
 
 from app.cache import CACHE_TTL_LIBRARY, cache
 from app.database import get_db
+from app.db_filters import public_repo_filter
 from app.models.repo import Repo, RepoCategory, RepoTag
 from app.schemas.library import CategorySummary, LibraryResponse, LibraryStats, TagMetric
 from app.schemas.repo import RepoSummary
@@ -93,7 +94,7 @@ async def get_library(
     # Load repos with all relationships
     stmt = (
         select(Repo)
-        .where(Repo.is_private == False)  # noqa: E712 — SECURITY: never expose private repos
+        .where(public_repo_filter())  # SECURITY: never expose private repos
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -110,7 +111,7 @@ async def get_library(
     result = await db.execute(stmt)
     repos = result.scalars().all()
 
-    public_repos = Repo.is_private == False  # noqa: E712
+    public_repos = public_repo_filter()
 
     total_stmt = select(func.count(Repo.id)).where(public_repos)
     total_result = await db.execute(total_stmt)

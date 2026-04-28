@@ -433,6 +433,7 @@ class TestBuildEnrichedRepoStars:
 
 # ---------------------------------------------------------------------------
 # /library/full privacy integration — 2026-04-23 leak regression guard
+# (contract updated 2026-04-28 to coordinate with Lane 2 / Lane 4).
 # ---------------------------------------------------------------------------
 #
 # On 2026-04-23 at 05:03:48 UTC, 44 private perditioinc/* repos surfaced in
@@ -441,11 +442,19 @@ class TestBuildEnrichedRepoStars:
 # column was stale for the 44 repos (ingestion defaults is_private=False when
 # the field is missing, and sync_is_private.py had not run).
 #
-# These tests guard the full end-to-end contract:
+# Then on 2026-04-27, perditioinc/hippo-harvest-assignment leaked again
+# because no privacy field was emitted on the wire — downstream gates
+# (frontend `validate:privacy`, reporium-audit `check_contract`) had
+# nothing to assert against, so they silently passed for ~22 hours.
+#
+# Updated contract enforced by these tests:
 #   1. No private repo ever appears in any paginated /library/full page.
-#   2. /library/full response objects never contain an `isPrivate` field
-#      (the field is stripped so a client filtering on it cannot rely on it,
-#      AND so an accidental leak is structurally impossible via that field).
+#   2. Every repo response object MUST carry `isPrivate` (camelCase) AND
+#      it MUST be `False`. This is the inverse of the prior (#414) shape —
+#      the field is now PRESENT-AND-FALSE so downstream gates have a
+#      structural signal to validate. A missing field is a build-blocking
+#      failure for Lane 2's `validate-privacy.ts` and Lane 4's
+#      `check_contract` audit.
 #   3. Ingesting with is_private=true keeps the repo out of the public feed
 #      across all pages (covers the pagination-edge case — the incident
 #      surfaced on page 10 of the live response).
@@ -456,10 +465,14 @@ from httpx import AsyncClient
 
 @pytest.mark.asyncio
 async def test_library_full_excludes_private_repos_across_all_pages(client: AsyncClient):
-    """Regression test for the 2026-04-23 private-repo leak.
+    """Regression test for the 2026-04-23 + 2026-04-27 private-repo leaks.
 
     Ingests a mix of public + private repos and verifies every page of
-    /library/full omits the private ones AND strips the isPrivate field.
+    /library/full:
+      - omits private repos entirely (Guard 1),
+      - emits ``isPrivate: False`` on every surviving repo (Guard 2 — the
+        post-2026-04-28 contract that gives Lane 2's validate-privacy and
+        Lane 4's audit a structural signal to assert against).
     """
     from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
 
@@ -493,9 +506,17 @@ async def test_library_full_excludes_private_repos_across_all_pages(client: Asyn
         repos = body.get("repos", [])
 
         for repo in repos:
-            # Guard 2: isPrivate field must be absent from every response object
-            assert "isPrivate" not in repo, (
-                f"isPrivate leaked on page {page} for repo {repo.get('name')}"
+            # Guard 2: isPrivate must be PRESENT and FALSE on every surviving
+            # repo. Missing field would block Lane 2's prebuild validator and
+            # FAIL Lane 4's nightly audit.
+            assert "isPrivate" in repo, (
+                f"missing isPrivate on page {page} for {repo.get('name')!r} — "
+                "Lane 2 validate-privacy and Lane 4 audit need this field"
+            )
+            assert repo["isPrivate"] is False, (
+                f"PRIVACY LEAK: isPrivate={repo['isPrivate']!r} on page "
+                f"{page} for {repo.get('name')!r} — only public repos "
+                "should reach the wire"
             )
             seen_names.add(repo.get("name"))
 
@@ -552,4 +573,111 @@ async def test_library_full_total_count_excludes_private(client: AsyncClient):
     assert body["stats"]["total"] == baseline_stats_total + 2, (
         f"stats.total should only count public repos, "
         f"got {baseline_stats_total} -> {body['stats']['total']} (expected +2)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# /library/full schema contract — `isPrivate` field guarantee
+# ---------------------------------------------------------------------------
+#
+# Lane 2 (`scripts/validate-privacy.ts`) and Lane 4 (`reporium_audit/checks/
+# contract.py::check_contract`) both require that every repo on the wire
+# carry a privacy field. Missing field is a build/audit failure on those
+# downstream gates. These tests pin the field-emission contract here so a
+# future API change that drops the field is caught on the API side
+# instead of cascading into the frontend build and the nightly audit.
+
+
+@pytest.mark.asyncio
+async def test_library_full_response_repo_carries_isprivate_field(
+    client: AsyncClient,
+):
+    """Every repo on /library/full carries ``isPrivate`` (camelCase, bool).
+
+    Camel-case matches the existing wire format (``isFork``, ``forkedFrom``,
+    etc.). Lane 2's `validate-privacy.ts` and Lane 4's contract check both
+    accept this naming.
+    """
+    from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
+
+    payload = {
+        **TEST_REPO_FIXTURE,
+        "name": "schema-public-probe",
+        "github_url": "https://github.com/testuser/schema-public-probe",
+        "is_private": False,
+    }
+    r = await client.post(
+        "/ingest/repos", json=[payload], headers=AUTH_HEADERS
+    )
+    assert r.status_code == 200
+
+    resp = await client.get("/library/full?page=1&page_size=500")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["repos"], "library/full should return at least one repo"
+
+    for repo in body["repos"]:
+        assert "isPrivate" in repo, (
+            f"missing isPrivate on {repo.get('name')!r} — Lane 2's "
+            "validate-privacy.ts will treat this as a build-blocking failure"
+        )
+        assert isinstance(repo["isPrivate"], bool), (
+            f"isPrivate must be a bool on {repo.get('name')!r}, got "
+            f"{type(repo['isPrivate']).__name__}"
+        )
+        # Public-endpoint contract: the only valid serialized value is False.
+        assert repo["isPrivate"] is False, (
+            f"PRIVACY LEAK: {repo.get('name')!r} surfaced with isPrivate=True"
+        )
+
+
+@pytest.mark.asyncio
+async def test_library_full_isprivate_field_uses_camelcase_only(
+    client: AsyncClient,
+):
+    """The wire shape uses camelCase for the privacy field.
+
+    Lane 2's filter happens to also accept ``is_private`` and ``visibility``,
+    but the API contract for /library/full is camelCase to match every
+    other field on the same wire. Avoiding both names prevents drift.
+    """
+    resp = await client.get("/library/full?page=1&page_size=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    if not body.get("repos"):
+        pytest.skip("library/full empty in this DB — nothing to assert")
+
+    sample = body["repos"][0]
+    assert "isPrivate" in sample
+    # The snake_case shape stays internal — should NOT bleed onto the wire.
+    assert "is_private" not in sample, (
+        "/library/full must not emit both isPrivate (camelCase) AND "
+        "is_private (snake_case) — pick one to avoid drift between "
+        "Lane 2 and Lane 4 gate semantics. The contract is camelCase."
+    )
+
+
+@pytest.mark.asyncio
+async def test_library_full_repo_contract_blocks_no_repo_without_isprivate(
+    client: AsyncClient,
+):
+    """Cross-validate against Lane 2 / Lane 4 contract: every repo emitted
+    by /library/full must have a privacy verdict that downstream gates
+    can read. Equivalent of running ``classifyPrivacy()`` from the
+    frontend's privacy-filter.ts on every wire repo.
+    """
+    resp = await client.get("/library/full?page=1&page_size=500")
+    assert resp.status_code == 200
+    repos = resp.json().get("repos", [])
+    if not repos:
+        pytest.skip("library/full empty in this DB — nothing to assert")
+
+    missing = [
+        r.get("name", "?")
+        for r in repos
+        if r.get("isPrivate") is None and r.get("is_private") is None
+    ]
+    assert not missing, (
+        f"{len(missing)} repos missing privacy field — would fail Lane 2's "
+        f"validate-privacy.ts and Lane 4's audit. Sample: {missing[:5]}"
     )

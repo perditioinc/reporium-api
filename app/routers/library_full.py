@@ -808,6 +808,11 @@ def _build_enriched_repo(repo: dict, languages: list, categories: list,
         "fullName": full_name,
         "description": repo.get("description"),
         "isFork": repo.get("is_fork", False),
+        # SECURITY: `isPrivate` is emitted on every repo so the frontend's
+        # `validate:privacy` gate (reporium#278) can fail the build closed if any
+        # row is missing the field or carries `true`. The DB filter above already
+        # excludes `is_private = true`, so this is defense-in-depth at the wire.
+        "isPrivate": bool(repo.get("is_private", False)),
         "forkedFrom": forked_from,
         "language": repo.get("primary_language"),
         "topics": [t["tag"] for t in tags],
@@ -1169,8 +1174,14 @@ async def _fetch_page_repos(
     offset = (page - 1) * page_size
 
     # Main repos query — paginated
+    # SECURITY: `is_private` is selected (and the WHERE clause filters it to false)
+    # so the response payload can carry the field forward. Downstream consumers
+    # (reporium frontend's `validate:privacy` gate, audit harness) require every
+    # row to expose `isPrivate` so a future regression that drops the WHERE clause
+    # is detected at the artifact boundary instead of silently leaking.
     result = await db.execute(text("""
         SELECT id, name, owner, (owner || '/' || name) AS full_name, description, is_fork, forked_from, primary_language,
+               is_private,
                github_url, fork_sync_state, behind_by, ahead_by,
                github_created_at, upstream_created_at, forked_at, your_last_push_at, upstream_last_push_at,
                parent_stars, parent_forks, parent_is_archived, stargazers_count, open_issues_count,
@@ -1405,23 +1416,42 @@ async def list_forks(
     limit: int = 100,
     offset: int = 0,
 ):
-    """Returns fork repos for internal/intelligence use. Not displayed on reporium.com."""
+    """Returns fork repos for internal/intelligence use. Not displayed on reporium.com.
+
+    SECURITY: never expose private repos. The `is_private = false` predicate is the
+    same constant published in app.db_filters.PUBLIC_REPO_SQL_PREDICATE — kept inline
+    here so the SQL grep audit ("rg 'FROM repos'") catches stragglers immediately.
+    """
+    # SECURITY: select `is_private` so the response carries the field forward
+    # for the same defense-in-depth contract as /library/full. Frontend privacy
+    # validators can now verify the invariant at the wire.
     result = await db.execute(text("""
         SELECT id, name, owner, forked_from, primary_language, parent_stars, parent_forks,
-               readme_summary, problem_solved, behind_by, ahead_by
+               readme_summary, problem_solved, behind_by, ahead_by, is_private
         FROM repos
         WHERE is_fork = true
+          AND is_private = false
         ORDER BY parent_stars DESC NULLS LAST
         LIMIT :limit OFFSET :offset;
     """), {"limit": limit, "offset": offset})
     rows = result.fetchall()
     columns = result.keys()
 
-    count_result = await db.execute(text("SELECT COUNT(*) FROM repos WHERE is_fork = true;"))
+    count_result = await db.execute(text(
+        "SELECT COUNT(*) FROM repos WHERE is_fork = true AND is_private = false;"
+    ))
     total = count_result.scalar()
 
+    # Re-emit `is_private` as `isPrivate` so the response uses the same camelCase
+    # contract as /library/full. The DB filter above guarantees every value is
+    # `False`; emitting the field is the leak-detection signal, not the filter.
+    def _shape(row_dict: dict) -> dict:
+        out = dict(row_dict)
+        out["isPrivate"] = bool(out.pop("is_private", False))
+        return out
+
     return {
-        "forks": [dict(zip(columns, row)) for row in rows],
+        "forks": [_shape(dict(zip(columns, row))) for row in rows],
         "total": total,
         "limit": limit,
         "offset": offset,
