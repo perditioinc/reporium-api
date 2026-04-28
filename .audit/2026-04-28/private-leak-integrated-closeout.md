@@ -18,6 +18,17 @@ file-copy + targeted-edit workflow into a fresh worktree based on
 
 ## Single coherent PR story
 
+0. **`/library/full` exposes `isPrivate` on every wire repo (camelCase, bool).**
+   Required by Lane 2's `validate-privacy.ts` (frontend `prebuild` gate)
+   and Lane 4's `reporium-audit` `check_contract` so downstream checks
+   have a structural signal to assert against. Field is the inverse of
+   the prior (#414) shape — present-and-`False` instead of stripped.
+   Updates in `app/routers/library_full.py` (`_build_enriched_repo`,
+   `_fetch_page_repos` SELECT, `/forks` shape) plus a refreshed
+   `tests/test_library_full.py` privacy contract that pins
+   "every repo carries `isPrivate: false`" instead of the old
+   "field is absent".
+
 1. **Public APIs do not emit private repos.** Every router that reads from
    the `repos` table now goes through `app.db_filters.public_repo_filter()`
    (replaces `Repo.is_private == False` literals scattered across 10
