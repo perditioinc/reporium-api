@@ -17,6 +17,7 @@ from sqlalchemy.orm import selectinload
 from app.auth import require_app_token
 from app.cache import cache
 from app.database import get_db
+from app.db_filters import public_repo_filter
 from app.models.mention import RepoMention
 from app.models.repo import Repo, RepoTag
 from app.rate_limit import rate_limit_storage
@@ -119,7 +120,7 @@ async def compare_repos(
         select(Repo)
         .where(
             func.lower(Repo.name).in_([n.lower() for n in repo_names]),
-            Repo.is_private == False,  # noqa: E712
+            public_repo_filter(),  # SECURITY: never expose private repos
         )
         .options(selectinload(Repo.tags))
     )

@@ -11,6 +11,7 @@ from sqlalchemy.orm import selectinload
 
 from app.cache import CACHE_TTL_REPO_DETAIL, cache
 from app.database import get_db
+from app.db_filters import public_repo_filter
 from app.models.mention import RepoMention
 from app.models.repo import (
     Repo,
@@ -83,7 +84,7 @@ async def list_repos(
 
     stmt = (
         select(Repo)
-        .where(Repo.is_private == False)  # noqa: E712 — SECURITY: never expose private repos
+        .where(public_repo_filter())  # SECURITY: never expose private repos
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -221,7 +222,7 @@ async def cross_category_repos(
 
     stmt = (
         select(Repo, match_count)
-        .where(Repo.is_private == False)  # noqa: E712
+        .where(public_repo_filter())  # SECURITY: never expose private repos
         .having(match_count >= 2)
         .group_by(Repo.id)
         .order_by(Repo.parent_stars.desc().nulls_last())
@@ -262,7 +263,7 @@ async def repo_health(
     stmt = (
         select(Repo)
         .where(func.lower(Repo.name) == func.lower(name))
-        .where(Repo.is_private == False)  # noqa: E712
+        .where(public_repo_filter())  # SECURITY: never expose private repos
     )
     result = await db.execute(stmt)
     repo = result.scalar_one_or_none()
@@ -362,11 +363,11 @@ async def repo_evaluation(
     # Try UUID lookup first, fall back to name lookup
     try:
         parsed_uuid = _uuid_mod.UUID(repo_id)
-        stmt = select(Repo).where(Repo.id == parsed_uuid, Repo.is_private == False)  # noqa: E712
+        stmt = select(Repo).where(Repo.id == parsed_uuid, public_repo_filter())
     except (ValueError, TypeError):
         stmt = select(Repo).where(
             func.lower(Repo.name) == func.lower(repo_id),
-            Repo.is_private == False,  # noqa: E712
+            public_repo_filter(),
         )
 
     result = await db.execute(stmt)
@@ -408,7 +409,7 @@ async def get_repo(name: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
 
     stmt = (
         select(Repo)
-        .where(Repo.name == name, Repo.is_private == False)  # noqa: E712
+        .where(Repo.name == name, public_repo_filter())
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
@@ -435,7 +436,7 @@ async def get_repo_by_owner(owner: str, repo: str, db: AsyncSession = Depends(ge
     """Get a single repo by owner/name."""
     stmt = (
         select(Repo)
-        .where(Repo.owner == owner, Repo.name == repo, Repo.is_private == False)  # noqa: E712
+        .where(Repo.owner == owner, Repo.name == repo, public_repo_filter())
         .options(
             selectinload(Repo.tags),
             selectinload(Repo.categories),
