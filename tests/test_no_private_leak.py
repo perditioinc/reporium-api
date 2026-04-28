@@ -95,12 +95,15 @@ async def _insert_repo(
 
         if embedding is not None:
             vec_str = "[" + ",".join(f"{v:.6f}" for v in embedding) + "]"
+            # `id` is omitted: in production it has DEFAULT gen_random_uuid()
+            # (migration 034); in CI the conftest creates only the migration-001
+            # schema where `id` does not exist at all. Letting the column
+            # default fill it makes this insert work in both environments.
             await session.execute(
                 text(
                     """
-                    INSERT INTO repo_embeddings (id, repo_id, embedding_vec)
-                    VALUES (gen_random_uuid(), CAST(:repo_id AS uuid),
-                            CAST(:vec AS vector))
+                    INSERT INTO repo_embeddings (repo_id, embedding_vec)
+                    VALUES (CAST(:repo_id AS uuid), CAST(:vec AS vector))
                     ON CONFLICT DO NOTHING
                     """
                 ),
