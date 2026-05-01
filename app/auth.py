@@ -64,9 +64,29 @@ async def verify_api_key(
 
 # ---------------------------------------------------------------------------
 # Admin key - protects admin-only endpoints (POST /admin/*, /admin/taxonomy/*)
+#
+# NOTE on scheme_name (KAN-API-AUTH-DOC, 2026-04-27):
+# Each APIKeyHeader below sets `scheme_name` explicitly. Without it, FastAPI
+# uses the class name "APIKeyHeader" for every instance, so /openapi.json
+# collapses X-Admin-Key, X-Ingest-Key, and X-App-Token into a single
+# indistinguishable scheme. Integrators reading the spec then can't tell
+# which header to send for which endpoint — the reporium-evals Sprint 0/1
+# runner spent ~3 days silently failing because of exactly this ambiguity.
+# Distinct scheme_names + a `description` field give each header a unique,
+# self-documenting entry in /openapi.json and /docs (Scalar).
 # ---------------------------------------------------------------------------
 
-_ADMIN_KEY_HEADER = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+_ADMIN_KEY_HEADER = APIKeyHeader(
+    name="X-Admin-Key",
+    auto_error=False,
+    scheme_name="AdminKey",
+    description=(
+        "Admin shared secret. Required on `/admin/*` and (when "
+        "`METRICS_REQUIRE_AUTH=1`) `/metrics/*` endpoints. Configure via the "
+        "`ADMIN_API_KEY` env var. Requests without a valid header are "
+        "rejected with HTTP 403."
+    ),
+)
 
 
 async def require_admin_key(
@@ -115,8 +135,28 @@ async def require_metrics_access(
 # Accept both X-Ingest-Key and the legacy X-Admin-Key for backward compatibility.
 # ---------------------------------------------------------------------------
 
-_INGEST_KEY_HEADER = APIKeyHeader(name="X-Ingest-Key", auto_error=False)
-_LEGACY_INGEST_KEY_HEADER = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+_INGEST_KEY_HEADER = APIKeyHeader(
+    name="X-Ingest-Key",
+    auto_error=False,
+    scheme_name="IngestKey",
+    description=(
+        "Ingest pipeline shared secret. Required on `POST /ingest/*` "
+        "endpoints. Configure via the `INGEST_API_KEY` env var. The legacy "
+        "`X-Admin-Key` header is also accepted for backward compatibility "
+        "(see AdminKey scheme). Requests without a valid header are "
+        "rejected with HTTP 403."
+    ),
+)
+_LEGACY_INGEST_KEY_HEADER = APIKeyHeader(
+    name="X-Admin-Key",
+    auto_error=False,
+    scheme_name="LegacyIngestKey",
+    description=(
+        "Legacy admin-key header accepted on `POST /ingest/*` for backward "
+        "compatibility with pre-IngestKey clients. New integrations should "
+        "use `X-Ingest-Key` (IngestKey scheme) instead."
+    ),
+)
 
 
 async def require_ingest_key(
@@ -143,7 +183,21 @@ async def require_ingest_key(
 # App token - lightweight guard on expensive LLM endpoints
 # ---------------------------------------------------------------------------
 
-_APP_TOKEN_HEADER = APIKeyHeader(name="X-App-Token", auto_error=False)
+_APP_TOKEN_HEADER = APIKeyHeader(
+    name="X-App-Token",
+    auto_error=False,
+    scheme_name="AppToken",
+    description=(
+        "App-level shared secret protecting expensive LLM endpoints "
+        "(`/intelligence/ask`, `/intelligence/ask/stream`, "
+        "`/intelligence/nl-filter`, `/intelligence/compare`). Send the "
+        "token configured under the `APP_API_TOKEN` env var (or "
+        "`ASK_EVAL_APP_TOKEN` in eval contexts). Example: "
+        "`curl -H 'X-App-Token: <token>' ...`. Requests without a valid "
+        "header are rejected with HTTP 403 and the response detail names "
+        "the missing header explicitly so integrators can self-diagnose."
+    ),
+)
 
 
 async def require_app_token(
@@ -153,6 +207,13 @@ async def require_app_token(
     Lightweight app verification for expensive endpoints.
     The token is a simple shared secret set via APP_API_TOKEN env var.
     Not full auth - just prevents random scripts from hitting LLM endpoints.
+
+    On reject, the 403 detail names the X-App-Token header explicitly so
+    integrators reading the response immediately know which header is
+    missing. KAN-API-AUTH-DOC (2026-04-27): the previous "App token
+    required" wording was the smoking gun in the reporium-evals Sprint 0/1
+    runner outage where the integrator spent ~3 days unable to figure out
+    which header to send.
     """
     expected = os.getenv("APP_API_TOKEN", "")
     if not expected:
@@ -162,7 +223,15 @@ async def require_app_token(
         return  # Dev mode
     # Issue #237: timing-safe comparison.
     if not _secrets_equal(x_app_token, expected):
-        raise HTTPException(status_code=403, detail="App token required")
+        # Distinguish missing-header from wrong-token in the message so
+        # callers can self-diagnose without reading source. Status code
+        # remains 403 (unchanged behavior); only the human-readable detail
+        # is more diagnostic.
+        if not x_app_token:
+            detail = "Missing X-App-Token header"
+        else:
+            detail = "Invalid X-App-Token header"
+        raise HTTPException(status_code=403, detail=detail)
 
 
 def hash_app_token(token: str | None) -> str | None:
