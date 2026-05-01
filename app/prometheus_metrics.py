@@ -20,6 +20,20 @@ try:
         buckets=(0.01, 0.025, 0.05, 0.1, 0.2, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0),
     )
 
+    # Observability for the operator-runbook backfill endpoint
+    # (POST /admin/backfill/primary_category_column). See KAN-API-OBS-BACKFILL.
+    ADMIN_BACKFILL_RUNS_TOTAL = Counter(
+        "admin_backfill_runs_total",
+        "Total invocations of /admin/backfill/primary_category_column by terminal outcome.",
+        ("outcome",),
+    )
+
+    ADMIN_BACKFILL_DURATION_SECONDS = Histogram(
+        "admin_backfill_duration_seconds",
+        "End-to-end duration of /admin/backfill/primary_category_column in seconds.",
+        buckets=(0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0),
+    )
+
     def _render_latest() -> bytes:
         return generate_latest()
 
@@ -45,8 +59,17 @@ except ModuleNotFoundError:
         def labels(self, **labels: str) -> _MetricHandle:
             return _MetricHandle(self.values, labels)
 
+        def inc(self, amount: float = 1.0) -> None:
+            # Unlabeled increment falls back to a single bucket keyed by ().
+            self.values[tuple()] += amount
+
+        def observe(self, amount: float) -> None:
+            self.values[tuple()] += amount
+
     HTTP_REQUESTS_TOTAL = _FallbackMetric("reporium_http_requests_total")
     HTTP_REQUEST_DURATION_SECONDS = _FallbackMetric("reporium_http_request_duration_seconds")
+    ADMIN_BACKFILL_RUNS_TOTAL = _FallbackMetric("admin_backfill_runs_total")
+    ADMIN_BACKFILL_DURATION_SECONDS = _FallbackMetric("admin_backfill_duration_seconds")
 
     def _render_lines(metric: _FallbackMetric) -> list[str]:
         lines = [
@@ -61,6 +84,8 @@ except ModuleNotFoundError:
     def _render_latest() -> bytes:
         lines = _render_lines(HTTP_REQUESTS_TOTAL)
         lines.extend(_render_lines(HTTP_REQUEST_DURATION_SECONDS))
+        lines.extend(_render_lines(ADMIN_BACKFILL_RUNS_TOTAL))
+        lines.extend(_render_lines(ADMIN_BACKFILL_DURATION_SECONDS))
         lines.append("")
         return "\n".join(lines).encode("utf-8")
 

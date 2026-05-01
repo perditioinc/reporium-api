@@ -44,6 +44,29 @@ class _UpdateReturningResult:
         return [(name,) for name in self._names]
 
 
+class _FakeHeaders(dict):
+    """Minimal Headers stand-in: case-insensitive `.get()` like Starlette's."""
+
+    def get(self, key, default=None):
+        # Starlette's Headers.get is case-insensitive.
+        for k, v in self.items():
+            if k.lower() == key.lower():
+                return v
+        return default
+
+
+class _FakeRequest:
+    """Minimal Request stand-in for direct unit calls of the handler.
+
+    The handler reads `request.headers.get("X-Correlation-ID")` and
+    `request.headers.get("user-agent")` for KAN-API-OBS-BACKFILL
+    observability. A bare object with a `headers` mapping is enough.
+    """
+
+    def __init__(self, headers: dict | None = None):
+        self.headers = _FakeHeaders(headers or {})
+
+
 async def _delete_repos(ids: list[str]) -> None:
     """Tear down inserted repos and their junction rows."""
     async with db_module.async_session_factory() as session:
@@ -228,7 +251,11 @@ async def test_backfill_invalidates_repos_detail_cache_for_each_healed_row():
     with patch("app.routers.admin.cache.invalidate", new=AsyncMock()) as invalidate, \
          patch("app.routers.admin.invalidate_library_cache") as invalidate_memory:
         result = await backfill_primary_category_column(
-            request=None,  # @_limiter.limit decorator wraps but isn't exercised in unit call
+            # @_limiter.limit decorator wraps but isn't exercised in the unit call.
+            # The handler reads `request.headers` for the correlation-id and
+            # user-agent observability fields (KAN-API-OBS-BACKFILL), so we
+            # supply a minimal Request stand-in instead of None.
+            request=_FakeRequest(),
             dry_run=False,
             db=db,
             _api_key="test",
@@ -272,7 +299,7 @@ async def test_backfill_dry_run_does_not_invalidate_cache():
     with patch("app.routers.admin.cache.invalidate", new=AsyncMock()) as invalidate, \
          patch("app.routers.admin.invalidate_library_cache") as invalidate_memory:
         result = await backfill_primary_category_column(
-            request=None,
+            request=_FakeRequest(),
             dry_run=True,
             db=db,
             _api_key="test",
