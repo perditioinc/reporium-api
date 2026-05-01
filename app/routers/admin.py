@@ -1130,6 +1130,12 @@ async def backfill_primary_category_column(
 
     updated = 0
     if not dry_run:
+        # RETURNING r.name lets us know exactly which repos had their
+        # primary_category rewritten so we can targeted-invalidate the
+        # per-repo detail cache (key shape: `repos:detail:{name}`). Without
+        # this, /repos/{name} could keep serving the stale (NULL or old)
+        # primary_category for up to CACHE_TTL_REPO_DETAIL after a backfill
+        # run. See KAN-API-CACHE-INVALIDATE / mem 4931.
         result = await db.execute(text("""
             UPDATE repos r
                SET primary_category = sub.category_name
@@ -1141,11 +1147,18 @@ async def backfill_primary_category_column(
               ) sub
              WHERE sub.repo_id = r.id
                AND r.primary_category IS NULL
+            RETURNING r.name
         """))
-        updated = result.rowcount or 0
+        updated_names = [row[0] for row in result.fetchall()]
+        updated = len(updated_names)
         await db.commit()
         await cache.invalidate("library:full*")
         await cache.invalidate("repos:list:*")
+        # Per-row invalidation: bust each healed repo's detail cache so the
+        # next /repos/{name} read hits the DB and sees the new primary_category
+        # immediately, instead of waiting up to TTL for natural expiration.
+        for name in updated_names:
+            await cache.invalidate(f"repos:detail:{name}")
         invalidate_library_cache()
 
     after = (await db.execute(text(coverage_sql))).one()
