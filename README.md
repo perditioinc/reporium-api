@@ -11,7 +11,7 @@
 
 Backend API for Reporium — the AI-native GitHub knowledge graph. Handles all data reads and writes, semantic search, 8-dimension dynamic taxonomy, portfolio intelligence, and a queryable MCP interface for Claude.
 
-Public reads. Protected writes (X-Ingest-Key). Admin operations (X-Admin-Key).
+Public reads. Protected writes (X-Ingest-Key). Admin operations (X-Admin-Key). LLM endpoints (X-App-Token).
 
 ---
 
@@ -48,6 +48,7 @@ uvicorn app.main:app --reload
 | `DATABASE_URL` | Yes | `postgresql+asyncpg://...` |
 | `ADMIN_API_KEY` | No | X-Admin-Key header for admin endpoints. Unset = open in dev. |
 | `INGEST_API_KEY` | No | X-Ingest-Key header for ingest endpoints. Unset = open in dev. |
+| `APP_API_TOKEN` | No | X-App-Token header for LLM endpoints. Unset = open in dev; logged at CRITICAL on prod startup if missing. |
 | `REDIS_URL` | No | Redis connection string — API works without it |
 | `GRAPH_SNAPSHOT_BUCKET` | No | GCS bucket for the published graph snapshot artifact |
 | `GRAPH_SNAPSHOT_OBJECT` | No | Object path for the graph snapshot artifact |
@@ -69,9 +70,45 @@ uvicorn app.main:app --reload
 | Header | Env Var | Applies To |
 |--------|---------|-----------|
 | `X-Ingest-Key` | `INGEST_API_KEY` | All `/ingest/*` routes |
-| `X-Admin-Key` | `ADMIN_API_KEY` | All `/admin/*` routes |
+| `X-Admin-Key` | `ADMIN_API_KEY` | All `/admin/*` routes (also `/metrics/*` when `METRICS_REQUIRE_AUTH=1`) |
+| `X-App-Token` | `APP_API_TOKEN` | LLM-backed endpoints: `/intelligence/ask`, `/intelligence/ask/stream`, `/intelligence/nl-filter`, `/intelligence/compare` |
 
-Both headers are optional when the env var is unset (dev-safe passthrough). In production, set both in Cloud Run environment variables or GCP Secret Manager.
+All three headers are optional when their env var is unset (dev-safe passthrough). In production, set them in Cloud Run environment variables or GCP Secret Manager.
+
+### `X-App-Token` (LLM endpoints)
+
+The `/api/intelligence/ask` family and other LLM-backed endpoints require the `X-App-Token` header — a shared secret protecting expensive Anthropic calls. Send it on every request:
+
+```bash
+curl https://api.reporium.com/intelligence/ask \
+  -H 'Content-Type: application/json' \
+  -H 'X-App-Token: <your-app-token>' \
+  -d '{"question": "What are the top RAG repos?"}'
+```
+
+**Note:** the token goes in the `X-App-Token` header — **not** `Authorization: Bearer`. Sending a Bearer token to `/intelligence/ask` will return HTTP 403.
+
+A request without the header (or with the wrong token) returns:
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{"detail": "Missing X-App-Token header"}
+```
+
+Or, if a token was sent but doesn't match the configured `APP_API_TOKEN`:
+
+```http
+HTTP/1.1 403 Forbidden
+Content-Type: application/json
+
+{"detail": "Invalid X-App-Token header"}
+```
+
+The 403 response detail names the header explicitly so integrators can self-diagnose without reading the source. To obtain an app token in production, request one via the platform admin (it's stored in GCP Secret Manager under `APP_API_TOKEN`). For local development, leave `APP_API_TOKEN` unset — the auth dependency is a no-op outside production.
+
+The same scheme is registered in `/openapi.json` as `AppToken` so it's self-documenting in the Scalar docs at `/docs`.
 
 ---
 
@@ -92,7 +129,6 @@ Both headers are optional when the env var is unset (dev-safe passthrough). In p
 | `GET /trends` | Latest trend signals |
 | `GET /gaps` | Gap analysis — underrepresented taxonomy areas |
 | `GET /stats` | Library statistics |
-| `GET /intelligence/portfolio-insights` | Proactive signals: gaps, velocity leaders, stale repos, near-duplicates |
 | `GET /docs` | Scalar API docs (dark theme) |
 
 ### Ingest (X-Ingest-Key required)
@@ -104,6 +140,15 @@ Both headers are optional when the env var is unset (dev-safe passthrough). In p
 | `POST /ingest/gaps` | Update gap analysis |
 | `POST /ingest/log` | Update ingestion run log |
 | `POST /ingest/events/repo-ingested` | GCP Pub/Sub push handler — triggers taxonomy + intelligence refresh |
+
+### LLM endpoints (X-App-Token required)
+| Endpoint | Description |
+|----------|-------------|
+| `POST /intelligence/ask` | Natural-language Q&A over the knowledge graph (Anthropic-backed) |
+| `POST /intelligence/ask/stream` | Streaming variant of `/intelligence/ask` |
+| `POST /intelligence/nl-filter` | Translate natural-language queries into structured filter params |
+| `GET /intelligence/compare` | Side-by-side compare 2-5 repos with metrics + tags + HN mentions |
+| `GET /intelligence/portfolio-insights` | Curated portfolio dashboard feed |
 
 ### Admin (X-Admin-Key required)
 | Endpoint | Description |
