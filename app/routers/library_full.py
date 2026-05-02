@@ -560,7 +560,14 @@ CACHE_TTL = 300  # 5 minutes
 
 
 def invalidate_library_cache() -> None:
-    """Bust the in-memory /library/full cache. Called by ingest router after writes."""
+    """Bust the in-memory /library/full cache and shared Redis library cache.
+
+    Called by the ingest router after writes. The Redis ``library:`` prefix
+    sweep covers BOTH /library/full's keys (``library:page:...``) and
+    /library/preview's keys (``library:preview:...``) — keep it broad so any
+    future ``library:*`` cache surface is invalidated automatically. This
+    satisfies feedback_backfill_must_invalidate_cache.md for /library/preview.
+    """
     _cache.clear()
     try:
         loop = asyncio.get_event_loop()
