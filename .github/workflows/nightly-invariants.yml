@@ -37,6 +37,10 @@ jobs:
         env:
           # Populated via: gh secret set STAGING_API_URL -R perditioinc/reporium-api
           STAGING_API_URL: ${{ secrets.STAGING_API_URL }}
+          # KAN-147: required for /metrics/* invariants (X-Admin-Key auth via
+          # require_metrics_access). Without it, the graph-quality invariants
+          # skip rather than fail (see _get_admin helper in test module).
+          ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
         run: |
           pytest -m invariants -v --tb=short 2>&1 | tee pytest-output.txt
           echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
