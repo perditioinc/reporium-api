@@ -37,6 +37,9 @@ jobs:
       REDIS_URL: ""
       INGESTION_API_KEY: test-api-key
       GH_USERNAME: testuser
+      # Skip embedding pre-warm; the test mocks `get_embedding_model`
+      # via `_patch_embedding_model`, so no real model is needed.
+      ENVIRONMENT: test
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       # Full 55-entry set; nightly cadence absorbs the cost / latency.
       GOLDEN_SET_PATH: tests/golden_set_ask.yaml

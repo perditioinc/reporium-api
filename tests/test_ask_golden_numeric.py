@@ -333,7 +333,7 @@ async def _run_one_entry(
     return result
 
 
-@pytest.mark.timeout(300)
+@pytest.mark.timeout(600)
 @pytest.mark.asyncio
 async def test_ask_golden_set_numeric_gate(client_no_db: AsyncClient):
     """Aggregate numeric quality gate for /intelligence/ask."""
@@ -369,26 +369,26 @@ async def test_ask_golden_set_numeric_gate(client_no_db: AsyncClient):
     concurrency = int(os.getenv("ASK_GATE_CONCURRENCY", "5"))
     sem = asyncio.Semaphore(concurrency)
 
-    # Capture `asyncio.create_task` BEFORE the patch context — `_patch_create_task`
-    # patches the global `asyncio.create_task` (because `unittest.mock.patch`
-    # rewrites the attribute on the `asyncio` module reachable through the
-    # dotted path), and our test orchestrator needs the real implementation
-    # to actually schedule the entry tasks. The patch still affects the
-    # router's `asyncio.create_task` calls because both refer to the same
-    # patched module attribute during the `with` block.
-    real_create_task = asyncio.create_task
-
     try:
+        # NOTE: `_patch_create_task` is intentionally NOT used in the parallel
+        # version. It would patch `asyncio.create_task` globally (via the
+        # `app.routers.intelligence.asyncio.create_task` dotted path), which
+        # under concurrent gather can no-op tasks that FastAPI / Starlette /
+        # anyio rely on internally for request handling — manifesting as a
+        # deadlock that hits the per-test timeout. The fire-and-forget tasks
+        # the router creates (`_log_query`, `cache.set`) are safe to run for
+        # real here: `_log_query` is mocked via `_patch_log_query`, and
+        # `cache.set` is a no-op when `REDIS_URL=""` (which the workflow
+        # already sets).
         with (
             _patch_embedding_model(),
             _patch_log_query(),
-            _patch_create_task(),
         ):
-            # `real_create_task` snapshots the current contextvar context per
-            # task — required so each coroutine's `_CURRENT_MOCK_DB.set(...)`
+            # `asyncio.create_task` snapshots the current contextvar context
+            # per task — required so each coroutine's `_CURRENT_MOCK_DB.set(...)`
             # is visible only inside that task.
             tasks = [
-                real_create_task(
+                asyncio.create_task(
                     _run_one_entry(idx, entry, client_no_db, sem)
                 )
                 for idx, entry in enumerate(golden_set, start=1)
