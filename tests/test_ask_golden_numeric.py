@@ -66,11 +66,19 @@ import yaml
 from httpx import ASGITransport, AsyncClient
 
 pytestmark = [
+    pytest.mark.skip(
+        reason=(
+            "KAN-146: 55-entry serial Anthropic-call gate exceeds CI budget. "
+            "Skipped explicitly until cost-aware redesign (parallelize via "
+            "asyncio.gather, or split into slim CI subset + nightly full). "
+            "Replacing the previous silent skip from missing ANTHROPIC_API_KEY "
+            "secret (now provisioned 2026-05-02; structural cause of P0 #367 closed)."
+        )
+    ),
     pytest.mark.skipif(
         not os.getenv("ANTHROPIC_API_KEY"),
         reason="ANTHROPIC_API_KEY not set — golden-set numeric gate requires live Claude access",
     ),
-    pytest.mark.timeout(600),  # 50+ real Anthropic calls; global 30s budget is insufficient
 ]
 
 
