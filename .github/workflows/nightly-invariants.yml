@@ -28,9 +28,14 @@ jobs:
           cache: pip
 
       - name: Install dependencies
+        # KAN-148: install full requirements so tests/conftest.py imports
+        # (sqlalchemy, app.database, app.main) resolve. Previously this only
+        # installed httpx + pytest + pytest-asyncio, so conftest crashed with
+        # ModuleNotFoundError: sqlalchemy before any test could run — causing
+        # the workflow to silently no-op while reporting SUCCESS.
         run: |
           pip install --upgrade pip
-          pip install httpx pytest pytest-asyncio
+          pip install -r requirements.txt
 
       - name: Run invariant tests
         id: invariants
@@ -41,7 +46,12 @@ jobs:
           # require_metrics_access). Without it, the graph-quality invariants
           # skip rather than fail (see _get_admin helper in test module).
           ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
+        # KAN-148: `set -o pipefail` ensures pytest's non-zero exit propagates
+        # through the `| tee` pipeline. Without it, tee's exit 0 masked pytest
+        # failures and the step (and job) reported SUCCESS even when tests
+        # errored out at collection time.
         run: |
+          set -o pipefail
           pytest -m invariants -v --tb=short 2>&1 | tee pytest-output.txt
           echo "exit_code=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
