@@ -68,6 +68,7 @@ unset (e.g. on forks without secrets).
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import os
 import uuid
 from pathlib import Path
@@ -78,6 +79,14 @@ import pytest
 import pytest_asyncio
 import yaml
 from httpx import ASGITransport, AsyncClient
+
+# KAN-146: contextvar carries the per-coroutine mock DB so a single
+# process-global `dependency_overrides[get_db]` can route correctly under
+# `asyncio.gather`. Without this, the last writer of `dependency_overrides`
+# wins and concurrent in-flight requests all see the wrong fixture data.
+_CURRENT_MOCK_DB: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "_CURRENT_MOCK_DB", default=None
+)
 
 pytestmark = [
     pytest.mark.skipif(
@@ -256,10 +265,14 @@ async def _run_one_entry(
 
     Returns a dict with the per-entry result (status, scoring, forbidden
     leak detection). The aggregate-level assertions live in the caller.
-    """
-    from app.main import app
-    from app.database import get_db
 
+    Concurrency model: `dependency_overrides[get_db]` and the embedding /
+    log_query / create_task patches are installed ONCE at the test-function
+    level (see `_install_global_patches`). Per-coroutine fixture routing
+    happens via the `_CURRENT_MOCK_DB` contextvar — set here, read by the
+    global override. This avoids the last-writer-wins race that broke an
+    earlier draft of this PR.
+    """
     question = entry.get("question", "")
     expect_status = entry.get("expect_status")
     budget = int(entry.get("max_tokens_soft_budget") or 0)
@@ -267,29 +280,13 @@ async def _run_one_entry(
     rows = [_make_db_row(r) for r in (entry.get("fixture_repos") or [])]
     mock_db = _make_mock_db(rows)
 
-    async def _override_db():
-        yield mock_db
+    _CURRENT_MOCK_DB.set(mock_db)
 
     async with sem:
-        # Note: dependency_overrides is process-global; setting/popping inside
-        # the semaphore-bounded region (sem<=5) keeps the mock-DB swap
-        # serialized for the duration of each request. Other concurrent
-        # entries are also under the same lock so they don't trample each
-        # other. This is acceptable because the override is identical for
-        # every entry except for the row data, which is captured via closure.
-        app.dependency_overrides[get_db] = _override_db
-        try:
-            with (
-                _patch_embedding_model(),
-                _patch_log_query(),
-                _patch_create_task(),
-            ):
-                response = await client.post(
-                    "/intelligence/ask",
-                    json={"question": question},
-                )
-        finally:
-            app.dependency_overrides.pop(get_db, None)
+        response = await client.post(
+            "/intelligence/ask",
+            json={"question": question},
+        )
 
     result: dict[str, Any] = {
         "idx": idx,
@@ -340,6 +337,9 @@ async def _run_one_entry(
 @pytest.mark.asyncio
 async def test_ask_golden_set_numeric_gate(client_no_db: AsyncClient):
     """Aggregate numeric quality gate for /intelligence/ask."""
+    from app.main import app
+    from app.database import get_db
+
     golden_set = _load_golden_set()
 
     # Honour smaller floor for the slim CI subset; preserve >=50 invariant
@@ -350,15 +350,52 @@ async def test_ask_golden_set_numeric_gate(client_no_db: AsyncClient):
         f"Golden set must contain >= {min_entries} entries, got {len(golden_set)}"
     )
 
+    # KAN-146: install patches ONCE at the test-function level. Per-coroutine
+    # fixture data is routed via the `_CURRENT_MOCK_DB` contextvar set inside
+    # `_run_one_entry`. Doing the override per-coroutine triggered a
+    # last-writer-wins race that hung the run (see PR #458 first iteration).
+    async def _override_db():
+        db = _CURRENT_MOCK_DB.get()
+        if db is None:
+            # Fallback so unrelated dependency lookups (e.g. healthcheck)
+            # don't crash; never hit during scored entries.
+            db = _make_mock_db([])
+        yield db
+
+    app.dependency_overrides[get_db] = _override_db
+
     # KAN-146: bounded-concurrency parallelism replaces serial loop. CI uses
     # slim subset (~7 entries); nightly cron uses full set.
     concurrency = int(os.getenv("ASK_GATE_CONCURRENCY", "5"))
     sem = asyncio.Semaphore(concurrency)
-    coros = [
-        _run_one_entry(idx, entry, client_no_db, sem)
-        for idx, entry in enumerate(golden_set, start=1)
-    ]
-    results = await asyncio.gather(*coros)
+
+    # Capture `asyncio.create_task` BEFORE the patch context — `_patch_create_task`
+    # patches the global `asyncio.create_task` (because `unittest.mock.patch`
+    # rewrites the attribute on the `asyncio` module reachable through the
+    # dotted path), and our test orchestrator needs the real implementation
+    # to actually schedule the entry tasks. The patch still affects the
+    # router's `asyncio.create_task` calls because both refer to the same
+    # patched module attribute during the `with` block.
+    real_create_task = asyncio.create_task
+
+    try:
+        with (
+            _patch_embedding_model(),
+            _patch_log_query(),
+            _patch_create_task(),
+        ):
+            # `real_create_task` snapshots the current contextvar context per
+            # task — required so each coroutine's `_CURRENT_MOCK_DB.set(...)`
+            # is visible only inside that task.
+            tasks = [
+                real_create_task(
+                    _run_one_entry(idx, entry, client_no_db, sem)
+                )
+                for idx, entry in enumerate(golden_set, start=1)
+            ]
+            results = await asyncio.gather(*tasks)
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
     # Demux into the same buckets the original serial version produced.
     scored_results: list[dict[str, Any]] = []
