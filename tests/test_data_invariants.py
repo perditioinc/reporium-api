@@ -87,6 +87,30 @@ def _get(path: str, params: dict | None = None, timeout: float = 60) -> httpx.Re
     return resp
 
 
+def _get_admin(path: str, params: dict | None = None, timeout: float = 60) -> httpx.Response:
+    """Same as _get but adds X-Admin-Key for /metrics/* (require_metrics_access).
+
+    Raises pytest.skip if ADMIN_API_KEY is not set so local runs (no admin key)
+    don't false-fire; the nightly workflow injects it via secret.
+    """
+    admin_key = os.getenv("ADMIN_API_KEY")
+    if not admin_key:
+        pytest.skip("ADMIN_API_KEY not set — required for /metrics/* invariants")
+    url = f"{_base_url()}{path}"
+    headers = {"X-Admin-Key": admin_key}
+    resp = httpx.get(url, params=params, headers=headers, timeout=timeout)
+    return resp
+
+
+def _graph_quality() -> dict:
+    """Fetch /metrics/graph-quality and return parsed JSON dict."""
+    resp = _get_admin("/metrics/graph-quality")
+    assert resp.status_code == 200, (
+        f"GET /metrics/graph-quality returned {resp.status_code}: {resp.text[:300]}"
+    )
+    return resp.json()
+
+
 # ---------------------------------------------------------------------------
 # Invariant 1 — totalRepos floor
 # ---------------------------------------------------------------------------
@@ -198,3 +222,85 @@ def test_trend_snapshots_exist():
         f"trends/report.period.snapshots={snapshots} — "
         "no snapshot data; weekly ingestion cron may not be running"
     )
+
+
+# ---------------------------------------------------------------------------
+# Invariant 7 — graph quality (KAN-147; closes #362/#363/#364 measurement gap)
+# ---------------------------------------------------------------------------
+#
+# Hard-gate from day 1 (no soft-gate window). Workato->JIRA will fire nightly
+# until the four P1 issues' underlying graph-builder regressions are fixed:
+#   #362 ALTERNATIVE_TO precision_proxy ~0.38 (vs floor 0.70)
+#   #363 EXTENDS precision_proxy = 0.0
+#   #364 DEPENDS_ON live_edges floored at 89 (vs floor 1200)
+#   #365 graph quality unmonitored (this gate addresses it)
+# That visible nightly pressure is the design intent.
+
+
+@pytest.mark.invariants
+def test_graph_quality_endpoint_available():
+    """Catches the case where repo_edges table is dropped or _graph_quality_snapshot raises."""
+    snapshot = _graph_quality()
+    assert snapshot.get("available") is True, (
+        f"Graph-quality endpoint reports available=false: {snapshot}"
+    )
+
+
+@pytest.mark.invariants
+def test_graph_quality_precision_floors():
+    """Asserts precision/precision_proxy floors per edge type. Hard-gate from day 1.
+
+    KAN-147: known-broken metrics from issues #362 (ALTERNATIVE_TO 0.38),
+    #363 (EXTENDS 0.0). Will fire Workato->JIRA nightly until the underlying
+    graph-builder regressions are fixed. That is intentional.
+    """
+    PRECISION_FLOOR_EXACT = 0.95   # DEPENDS_ON exact match (not proxy)
+    PRECISION_FLOOR_PROXY = 0.70   # ALTERNATIVE_TO / EXTENDS / COMPATIBLE_WITH (issue authors' value)
+
+    snapshot = _graph_quality()
+    edge_types = snapshot.get("edge_types", {})
+
+    failures = []
+
+    deps = edge_types.get("DEPENDS_ON", {})
+    if "precision" in deps and deps["precision"] < PRECISION_FLOOR_EXACT:
+        failures.append(f"DEPENDS_ON.precision={deps['precision']:.4f} < {PRECISION_FLOOR_EXACT}")
+
+    for et in ("ALTERNATIVE_TO", "EXTENDS", "COMPATIBLE_WITH"):
+        info = edge_types.get(et, {})
+        proxy = info.get("precision_proxy")
+        if proxy is not None and proxy < PRECISION_FLOOR_PROXY:
+            failures.append(f"{et}.precision_proxy={proxy:.4f} < {PRECISION_FLOOR_PROXY}")
+
+    assert not failures, "Graph-quality precision regressions: " + "; ".join(failures)
+
+
+@pytest.mark.invariants
+def test_graph_quality_edge_count_floors():
+    """Asserts edge-count floors per type to catch the snapshot/edge-balancer
+    clobber pattern (#364: DEPENDS_ON normally 1300+, dropped to 89 silently).
+    """
+    EDGE_COUNT_FLOORS = {
+        "DEPENDS_ON":     1200,
+        "ALTERNATIVE_TO": 5000,
+        "EXTENDS":         100,
+        "COMPATIBLE_WITH": 100,
+    }
+    TOTAL_EDGES_FLOOR = 8000
+
+    snapshot = _graph_quality()
+    summary = snapshot.get("summary", {})
+    edge_types = snapshot.get("edge_types", {})
+
+    failures = []
+    total = summary.get("total_edges", 0)
+    if total < TOTAL_EDGES_FLOOR:
+        failures.append(f"total_edges={total} < {TOTAL_EDGES_FLOOR}")
+
+    for et, floor in EDGE_COUNT_FLOORS.items():
+        info = edge_types.get(et, {})
+        live = info.get("live_edges", 0)
+        if live < floor:
+            failures.append(f"{et}.live_edges={live} < {floor}")
+
+    assert not failures, "Graph-quality edge-count regressions: " + "; ".join(failures)
