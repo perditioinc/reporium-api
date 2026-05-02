@@ -90,7 +90,7 @@ jobs:
 
   notify-on-failure:
     needs: test
-    if: failure()
+    if: ${{ failure() && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') }}
     uses: perditioinc/perditio-devkit/.github/workflows/on-test-failure.yml@aa588479da71164c0bd2ee493a76ee46830d10dc # main @ 2026-04-26
     with:
       branch: ${{ github.ref_name }}
