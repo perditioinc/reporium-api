@@ -1,0 +1,164 @@
+# Slim CI subset of golden_set_ask.yaml — KAN-146.
+#
+# This file is sourced by GHA `ask-quality-gate.yml` for the per-PR run via
+# `GOLDEN_SET_PATH=tests/golden_set_ask_ci.yaml`. It exercises the most
+# distinct quality signals in ~7 entries so the gate runs in <30s of
+# parallelized Anthropic calls (vs ~30 minutes for the 55-entry full set,
+# which now runs in `nightly-ask-quality.yml`).
+#
+# Entry coverage map (cite source by the question text in golden_set_ask.yaml):
+#   1. "What is PyTorch used for?"                                — generic semantic-search (simple)
+#   2. "What does LangChain do?"                                  — generic semantic-search (simple)
+#   3. "What is Weaviate?"                                        — generic semantic-search (simple)
+#   4. "Compare LangChain and LlamaIndex for RAG applications."   — EXTENDS anchor (#363):
+#                                                                   exercises framework-extends-paradigm
+#                                                                   (LlamaIndex extends RAG conventions
+#                                                                   LangChain established).
+#   5. "Which repositories would help me build a multi-agent code review bot?"
+#                                                                 — DEPENDS_ON anchor (#364): autogen +
+#                                                                   crewai both depend on LLM tooling
+#                                                                   surface area; tests dep-graph reasoning.
+#   6. "vector database alternatives to pinecone"                 — ALTERNATIVE_TO anchor (#362) AND
+#                                                                   forbidden_repos negation anchor (#365);
+#                                                                   pinecone-python-client must NOT appear in
+#                                                                   sources. PR #439 added forbidden_repos for
+#                                                                   exactly this regression.
+#   7. (empty question)                                           — HTTP 422 edge case; no Anthropic call —
+#                                                                   keeps validator coverage cheap.
+#
+# Schema is identical to the parent file; do not invent new fields. The
+# scoring assertions in tests/test_ask_golden_numeric.py (avg quality_score
+# >= 0.7, total_tokens <= 1.2x sum_of_budgets, expect_status, forbidden_repos)
+# all apply to the entries below as-is.
+
+- question: "What is PyTorch used for?"
+  expected_themes: ["pytorch", "deep learning", "tensor"]
+  expected_repos: ["pytorch/pytorch"]
+  difficulty: simple
+  max_tokens_soft_budget: 3500
+  fixture_repos:
+    - owner: pytorch
+      name: pytorch
+      description: "Tensors and Dynamic neural networks in Python with strong GPU acceleration"
+      problem_solved: "Flexible deep learning framework with dynamic computation graphs"
+      similarity: 0.94
+      stars: 78000
+      integration_tags: [pytorch, deep-learning, gpu, tensor]
+
+- question: "What does LangChain do?"
+  expected_themes: ["langchain", "llm", "chain"]
+  expected_repos: ["langchain-ai/langchain"]
+  difficulty: simple
+  max_tokens_soft_budget: 3500
+  fixture_repos:
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "Orchestrating LLMs with tools, memory, and retrieval"
+      similarity: 0.95
+      stars: 88000
+      integration_tags: [llm, rag, agents, langchain]
+
+- question: "What is Weaviate?"
+  expected_themes: ["vector", "database", "weaviate"]
+  expected_repos: ["weaviate/weaviate"]
+  difficulty: simple
+  max_tokens_soft_budget: 3500
+  fixture_repos:
+    - owner: weaviate
+      name: weaviate
+      description: "Weaviate is an open-source vector database"
+      problem_solved: "Store and search vector embeddings at scale"
+      similarity: 0.95
+      stars: 10000
+      integration_tags: [vector-database, embeddings, search]
+
+# EXTENDS anchor (#363): tests framework-extends-paradigm reasoning.
+- question: "Compare LangChain and LlamaIndex for RAG applications."
+  expected_themes: ["langchain", "llamaindex", "rag", "retrieval"]
+  expected_repos: ["langchain-ai/langchain", "run-llama/llama_index"]
+  difficulty: medium
+  max_tokens_soft_budget: 4500
+  fixture_repos:
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "Orchestrating LLMs with tools, memory, and retrieval"
+      similarity: 0.93
+      stars: 88000
+      integration_tags: [llm, rag, agents]
+    - owner: run-llama
+      name: llama_index
+      description: "LlamaIndex is a data framework for LLM applications"
+      problem_solved: "Connecting LLMs to external data sources"
+      similarity: 0.91
+      stars: 33000
+      integration_tags: [rag, llm, data]
+
+# DEPENDS_ON anchor (#364): tests reasoning over multi-repo dependency surface.
+- question: "Which repositories would help me build a multi-agent code review bot?"
+  expected_themes: ["agent", "code", "review"]
+  expected_repos: ["microsoft/autogen", "joaomdmoura/crewai"]
+  difficulty: complex
+  max_tokens_soft_budget: 5000
+  fixture_repos:
+    - owner: microsoft
+      name: autogen
+      description: "A programming framework for agentic AI"
+      problem_solved: "Multi-agent conversational AI orchestration"
+      similarity: 0.92
+      stars: 26000
+      integration_tags: [agents, llm, multi-agent]
+    - owner: joaomdmoura
+      name: crewai
+      description: "Framework for orchestrating role-playing, autonomous AI agents"
+      problem_solved: "Role-based multi-agent collaboration"
+      similarity: 0.91
+      stars: 18000
+      integration_tags: [agents, llm, orchestration]
+    - owner: langchain-ai
+      name: langchain
+      description: "Build context-aware reasoning applications with LLMs"
+      problem_solved: "Orchestrating LLMs with tools, memory, and retrieval"
+      similarity: 0.86
+      stars: 88000
+      integration_tags: [llm, agents, tools]
+
+# ALTERNATIVE_TO (#362) + forbidden_repos negation (#365) — the regression
+# guard for "alternatives to X must not return X". See PR #439 for the
+# `forbidden_repos` field; #365 was the original sighting.
+- question: "vector database alternatives to pinecone"
+  expected_themes: ["vector", "alternative"]
+  expected_repos: ["weaviate/weaviate"]
+  forbidden_repos: ["pinecone-io/pinecone-python-client"]
+  difficulty: medium
+  max_tokens_soft_budget: 3500
+  fixture_repos:
+    - owner: weaviate
+      name: weaviate
+      description: "Open-source vector database"
+      problem_solved: "Store, search and manage vectors at scale with hybrid filtering"
+      similarity: 0.88
+      stars: 12000
+      integration_tags: [vector-db, hybrid-search, open-source]
+    - owner: qdrant
+      name: qdrant
+      description: "High-performance vector similarity search engine"
+      problem_solved: "Rust-based vector DB with payload filtering and sharding"
+      similarity: 0.86
+      stars: 20000
+      integration_tags: [vector-db, rust, embedded]
+    - owner: chroma-core
+      name: chroma
+      description: "AI-native embedding database"
+      problem_solved: "Lightweight local vector store for prototyping RAG apps"
+      similarity: 0.84
+      stars: 17000
+      integration_tags: [vector-db, embeddings, rag]
+
+# HTTP 422 edge case — no Anthropic call, validates request-validation path.
+- question: ""
+  difficulty: simple
+  max_tokens_soft_budget: 0
+  expect_status: 422
+  fixture_repos: []
