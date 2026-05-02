@@ -116,6 +116,25 @@ def _make_db_row(entry: dict[str, Any]) -> MagicMock:
     row.integration_tags = entry.get("integration_tags") or []
     row.dependencies = entry.get("dependencies") or []
     row.similarity = float(entry.get("similarity", 0.85))
+    # KAN-146: explicit defaults for fields read by `_prepare_query` /
+    # `_build_sources_block`. Without these, MagicMock auto-vivifies the
+    # attributes, the values flow into the sources-block builder, and
+    # `', '.join([..., MagicMock()])` raises TypeError. The serial
+    # version of this test was skipped when these fields were added to
+    # the prompt context, so the defect was masked until KAN-146 turned
+    # the gate back on. See `_build_sources_block` in
+    # app/routers/intelligence.py.
+    row.primary_category = entry.get("primary_category")
+    row.language = entry.get("language")
+    row.license_spdx = entry.get("license_spdx")
+    row.activity_score = entry.get("activity_score")
+    row.has_tests = entry.get("has_tests")
+    row.has_ci = entry.get("has_ci")
+    row.pros_cons = entry.get("pros_cons")
+    row.community_health_pct = entry.get("community_health_pct")
+    row.contributors_count = entry.get("contributors_count")
+    row.issue_close_rate = entry.get("issue_close_rate")
+    row.pr_merge_rate = entry.get("pr_merge_rate")
     return row
 
 
