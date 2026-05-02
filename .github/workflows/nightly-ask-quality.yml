@@ -1,0 +1,81 @@
+name: Nightly Ask Quality Gate (full set)
+# KAN-146: full 55-entry numeric golden-set gate. The per-PR variant
+# (`ask-quality-gate.yml`) runs the slim subset for fast feedback; this
+# workflow runs nightly to catch regressions that only show up at full
+# corpus breadth.
+on:
+  schedule:
+    # 06:00 UTC daily — quiet window for protected branches.
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  ask-quality-gate-full:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: reporium_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    env:
+      DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test
+      REDIS_URL: ""
+      INGESTION_API_KEY: test-api-key
+      GH_USERNAME: testuser
+      # Skip embedding pre-warm; the test mocks `get_embedding_model`
+      # via `_patch_embedding_model`, so no real model is needed.
+      ENVIRONMENT: test
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      # Full 55-entry set; nightly cadence absorbs the cost / latency.
+      GOLDEN_SET_PATH: tests/golden_set_ask.yaml
+      ASK_GATE_CONCURRENCY: '5'
+
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: '3.12'
+
+      - name: Verify ANTHROPIC_API_KEY is set
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is empty. The nightly Ask Quality Gate cannot validate without it. Provision via 'gh secret set ANTHROPIC_API_KEY --repo perditioinc/reporium-api' (canonical source: GCP Secret Manager 'anthropic-api-key')."
+            exit 1
+          fi
+          echo "ANTHROPIC_API_KEY present (${#ANTHROPIC_API_KEY} chars)"
+
+      - name: Run full numeric golden-set gate for /intelligence/ask
+        run: |
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio==0.24.0 pytest-timeout==2.3.1 httpx pyyaml
+          pytest tests/test_ask_golden_numeric.py -v -s
+
+  notify-on-failure:
+    needs: ask-quality-gate-full
+    # Only fire on the scheduled cron — workflow_dispatch is for manual
+    # debugging and shouldn't open issues for one-off failures.
+    if: ${{ failure() && github.event_name == 'schedule' }}
+    uses: perditioinc/perditio-devkit/.github/workflows/on-test-failure.yml@aa588479da71164c0bd2ee493a76ee46830d10dc # main @ 2026-04-26
+    with:
+      branch: ${{ github.ref_name }}
+      sha: ${{ github.sha }}
+      run_id: ${{ github.run_id }}
+      repo: ${{ github.repository }}
+    permissions:
+      issues: write
