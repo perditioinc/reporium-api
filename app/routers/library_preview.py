@@ -108,13 +108,15 @@ def _build_preview_repo(row: dict, tags: list[str]) -> dict:
     full_name = row.get("full_name") or f"{owner}/{name}"
     is_fork = bool(row.get("is_fork"))
 
-    # Match /library/full's stars/forks resolution: forks show parent counts.
+    # Match /library/full's stars/forks resolution: forks show parent counts;
+    # built repos always show 0 forks (we don't track inbound forks of our own
+    # repos — same convention as /library/full's _build_enriched_repo).
     if is_fork:
         stars = row.get("parent_stars") or 0
         forks = row.get("parent_forks") or 0
     else:
         stars = row.get("stargazers_count") or 0
-        forks = row.get("fork_count") or 0
+        forks = 0
 
     return {
         "id": str(row.get("id") or ""),
@@ -192,7 +194,7 @@ async def library_preview(
         SELECT id, name, owner, (owner || '/' || name) AS full_name, description,
                is_fork, forked_from, primary_language, github_url,
                parent_stars, parent_forks, parent_is_archived,
-               stargazers_count, fork_count,
+               stargazers_count,
                github_updated_at, updated_at,
                primary_category
         FROM repos
