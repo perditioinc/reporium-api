@@ -42,6 +42,15 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Verify ANTHROPIC_API_KEY is set on protected branches
+        if: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') }}
+        run: |
+          if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
+            echo "::error::ANTHROPIC_API_KEY is empty on protected branch '${GITHUB_REF}'. The Ask Quality Gate cannot validate without it. Provision via 'gh secret set ANTHROPIC_API_KEY --repo perditioinc/reporium-api' (canonical source: GCP Secret Manager 'anthropic-api-key')."
+            exit 1
+          fi
+          echo "ANTHROPIC_API_KEY present (${#ANTHROPIC_API_KEY} chars)"
+
       - name: Run numeric golden-set gate for /intelligence/ask
         if: ${{ env.ANTHROPIC_API_KEY != '' }}
         run: |

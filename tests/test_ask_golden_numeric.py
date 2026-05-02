@@ -65,10 +65,13 @@ import pytest_asyncio
 import yaml
 from httpx import ASGITransport, AsyncClient
 
-pytestmark = pytest.mark.skipif(
-    not os.getenv("ANTHROPIC_API_KEY"),
-    reason="ANTHROPIC_API_KEY not set — golden-set numeric gate requires live Claude access",
-)
+pytestmark = [
+    pytest.mark.skipif(
+        not os.getenv("ANTHROPIC_API_KEY"),
+        reason="ANTHROPIC_API_KEY not set — golden-set numeric gate requires live Claude access",
+    ),
+    pytest.mark.timeout(600),  # 50+ real Anthropic calls; global 30s budget is insufficient
+]
 
 
 GOLDEN_SET_PATH = Path(__file__).parent / "golden_set_ask.yaml"
