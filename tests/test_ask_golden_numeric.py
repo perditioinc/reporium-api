@@ -139,31 +139,45 @@ def _make_db_row(entry: dict[str, Any]) -> MagicMock:
 
 
 def _make_mock_db(rows: list[MagicMock]) -> AsyncMock:
-    """Three-call mock: semantic-cache miss, similarity fetchall, edges fetchall."""
-    cache_result = MagicMock()
-    cache_result.first.return_value = None
+    """Mock DB that dispatches results by inspecting the SQL text.
 
+    The original 3-call sequence (cache-first, similarity-fetchall, edges-
+    fetchall) silently failed when `_try_smart_route` issued an extra DB
+    query — that consumed the cache slot, then the semantic-cache call got
+    the similarity result, `result.first()` auto-vivified into a MagicMock,
+    and the handler treated it as a cache hit with MagicMock answer/model
+    (Pydantic ValidationError).
+
+    Strategy: route based on substrings in the SQL. The pgvector similarity
+    query is the only one that returns rows; everything else returns
+    empty / None.
+    """
     sim_result = MagicMock()
     sim_result.fetchall.return_value = rows
 
-    edges_result = MagicMock()
-    edges_result.fetchall.return_value = []
+    empty_result = MagicMock()
+    empty_result.fetchall.return_value = []
+    empty_result.first.return_value = None
+    empty_result.scalar.return_value = 0
+
+    async def _execute(stmt, *_args, **_kwargs):
+        # Best-effort SQL extraction: text() clauses expose the SQL via str().
+        try:
+            sql = str(stmt).lower()
+        except Exception:
+            sql = ""
+        # The pgvector similarity query is the only one that uses the `<=>`
+        # cosine-distance operator and orders by it. Match on the operator
+        # in the ORDER BY to distinguish from the semantic-cache query
+        # (which also uses `<=>` but does `LIMIT 1` and reads answer_full).
+        is_similarity_query = (
+            "<=>" in sql and "answer_full" not in sql
+        )
+        if is_similarity_query:
+            return sim_result
+        return empty_result
 
     mock_db = AsyncMock()
-    # The handler may execute additional queries (logging, session turns, etc).
-    # We return a permissive default after the three expected calls so nothing
-    # downstream raises StopIteration.
-    default_result = MagicMock()
-    default_result.fetchall.return_value = []
-    default_result.first.return_value = None
-
-    call_sequence = [cache_result, sim_result, edges_result]
-
-    async def _execute(*_args, **_kwargs):
-        if call_sequence:
-            return call_sequence.pop(0)
-        return default_result
-
     mock_db.execute = AsyncMock(side_effect=_execute)
     mock_db.commit = AsyncMock()
     return mock_db
