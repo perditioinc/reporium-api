@@ -1,6 +1,8 @@
 """
 GET /taxonomy/skill-areas — Returns all skill areas from DB, grouped by lifecycle_group.
 GET /taxonomy/skill-areas/{name}/repos — Returns repos tagged with a given skill area.
+GET /taxonomy/categories — Aggregated category counts from repos.primary_category (KAN-175).
+GET /taxonomy/tags — Aggregated tag counts from the repo_tags junction table (KAN-175).
 GET /taxonomy/dimensions — Returns distinct dimension strings with repo counts.
 GET /taxonomy/{dimension} — Returns taxonomy values for a dimension, sorted by repo_count desc.
 POST /admin/taxonomy/rebuild — Aggregates raw_values from repo_taxonomy into taxonomy_values.
@@ -8,6 +10,14 @@ POST /admin/taxonomy/embed — Generates embeddings for taxonomy_values missing 
 POST /admin/taxonomy/assign — Similarity-assigns taxonomy_values to repos via pgvector.
 
 Skill areas are stored in the skill_areas table; adding a new area requires only a DB insert.
+
+KAN-175: /taxonomy/categories and /taxonomy/tags aggregate directly from the live
+``repos`` / ``repo_tags`` corpus instead of the historically-empty
+``taxonomy_values`` table. Option B (aggregate-on-demand + Redis cache) avoids the
+mirror-and-maintain burden of Option A. Cache TTL matches /library/preview at 5 min
+and ``invalidate_library_cache()`` (in app.routers.library_full) sweeps the
+``taxonomy:`` Redis prefix on every ingest write so stale aggregates can never
+outlive a backfill — see feedback_backfill_must_invalidate_cache.md.
 """
 
 import logging
@@ -15,12 +25,13 @@ import time
 from collections import defaultdict
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 from pydantic import BaseModel
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth import require_admin_key, verify_api_key
+from app.cache_redis import redis_cache
 from app.database import get_db
 from app.models.repo import SkillArea, TaxonomyValue
 
@@ -31,6 +42,18 @@ router = APIRouter(tags=["Taxonomy"])
 # In-memory cache for skill-areas list (5 min TTL)
 _taxonomy_cache: dict = {}
 _TAXONOMY_CACHE_TTL = 300  # 5 minutes
+
+# KAN-175: Redis TTL for /taxonomy/{categories,tags} aggregations.
+# Matches /library/preview's 5-min window so a single ingest-driven
+# `invalidate_library_cache()` call sweeps both library and taxonomy keys
+# inside a single CDN cache window.
+_AGGREGATE_CACHE_TTL = 300
+
+# KAN-170 cache-control header — public + s-maxage=300 lets a future CDN/Cloud LB
+# edge-cache the aggregation; stale-while-revalidate=60 keeps total stale window
+# (s-maxage + swr = 6 min) within the Redis TTL band so an ingest-driven
+# invalidate_library_cache() flushes Redis before the CDN window expires.
+_AGGREGATE_CACHE_CONTROL = "public, s-maxage=300, stale-while-revalidate=60"
 
 
 @router.get("/skill-areas")
@@ -197,6 +220,118 @@ async def list_all_taxonomy_values(
         {"dimension": row.dimension, "value": row.value, "repo_count": row.repo_count}
         for row in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# KAN-175 — /taxonomy/categories and /taxonomy/tags aggregate directly from the
+# live `repos` / `repo_tags` corpus. These two routes MUST be declared before
+# the catch-all `/{dimension}` below so FastAPI matches the literal paths first.
+# ---------------------------------------------------------------------------
+
+
+def _aggregate_response(dimension: str, rows: list[tuple[str, int]]) -> dict:
+    """Build the response envelope for an aggregate dimension.
+
+    Each value carries ``dimension``, ``value``, and ``repo_count`` — the
+    minimal shape consumed by the reporium frontend's TaxonomyEntry interface
+    (see reporium/src/app/taxonomy/page.tsx). Backwards compatible with the
+    historical /taxonomy/{dimension} envelope: top-level ``dimension``,
+    ``values``, ``total``.
+    """
+    return {
+        "dimension": dimension,
+        "values": [
+            {"dimension": dimension, "value": value, "repo_count": int(count)}
+            for value, count in rows
+        ],
+        "total": len(rows),
+    }
+
+
+@router.get("/categories", response_model=dict)
+async def list_categories_aggregated(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """KAN-175: Aggregate primary_category counts directly from the public
+    ``repos`` corpus on demand.
+
+    Replaces the prior dead read from ``taxonomy_values`` (see issue #251) which
+    was never mirrored from ``repos``. Cached in Redis under
+    ``taxonomy:categories`` for 5 minutes and invalidated on every ingest write
+    via ``invalidate_library_cache()``.
+    """
+    response.headers["Cache-Control"] = _AGGREGATE_CACHE_CONTROL
+    redis_key = "taxonomy:categories"
+
+    cached = await redis_cache.get(redis_key)
+    if cached is not None:
+        logger.info("Redis hit /taxonomy/categories")
+        return cached
+
+    t0 = time.monotonic()
+    result = await db.execute(text(
+        "SELECT primary_category AS value, COUNT(*) AS count "
+        "FROM repos "
+        "WHERE is_private = false AND primary_category IS NOT NULL "
+        "GROUP BY primary_category "
+        "ORDER BY count DESC, value ASC"
+    ))
+    rows = [(row.value, row.count) for row in result.fetchall()]
+    body = _aggregate_response("categories", rows)
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    logger.info(
+        "/taxonomy/categories aggregated %d distinct values in %.1f ms",
+        len(rows), elapsed_ms,
+    )
+
+    await redis_cache.set(redis_key, body, ttl=_AGGREGATE_CACHE_TTL)
+    return body
+
+
+@router.get("/tags", response_model=dict)
+async def list_tags_aggregated(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """KAN-175: Aggregate tag counts from the ``repo_tags`` junction table on
+    demand.
+
+    The frontend's ``enrichedTags`` field on each repo is sourced from
+    ``repo_tags`` (see ``library_preview._build_preview_repo``), so this route
+    surfaces the same vocabulary as what powers repo cards. Public repos only.
+    Cached in Redis under ``taxonomy:tags`` for 5 minutes and invalidated on
+    every ingest write via ``invalidate_library_cache()``.
+    """
+    response.headers["Cache-Control"] = _AGGREGATE_CACHE_CONTROL
+    redis_key = "taxonomy:tags"
+
+    cached = await redis_cache.get(redis_key)
+    if cached is not None:
+        logger.info("Redis hit /taxonomy/tags")
+        return cached
+
+    t0 = time.monotonic()
+    result = await db.execute(text(
+        "SELECT t.tag AS value, COUNT(DISTINCT t.repo_id) AS count "
+        "FROM repo_tags t "
+        "JOIN repos r ON r.id = t.repo_id "
+        "WHERE r.is_private = false "
+        "GROUP BY t.tag "
+        "ORDER BY count DESC, value ASC"
+    ))
+    rows = [(row.value, row.count) for row in result.fetchall()]
+    body = _aggregate_response("tags", rows)
+
+    elapsed_ms = (time.monotonic() - t0) * 1000
+    logger.info(
+        "/taxonomy/tags aggregated %d distinct values in %.1f ms",
+        len(rows), elapsed_ms,
+    )
+
+    await redis_cache.set(redis_key, body, ttl=_AGGREGATE_CACHE_TTL)
+    return body
 
 
 @router.get("/{dimension}", response_model=dict)

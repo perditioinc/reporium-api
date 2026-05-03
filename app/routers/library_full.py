@@ -567,14 +567,20 @@ def invalidate_library_cache() -> None:
     /library/preview's keys (``library:preview:...``) — keep it broad so any
     future ``library:*`` cache surface is invalidated automatically. This
     satisfies feedback_backfill_must_invalidate_cache.md for /library/preview.
+
+    KAN-175: also sweeps the ``taxonomy:`` prefix so /taxonomy/categories and
+    /taxonomy/tags (which aggregate from the same ``repos``/``repo_tags`` rows
+    that ingest writes) cannot serve stale aggregates after a backfill.
     """
     _cache.clear()
     try:
         loop = asyncio.get_event_loop()
         if loop.is_running():
             asyncio.ensure_future(redis_cache.clear_prefix("library:"))
+            asyncio.ensure_future(redis_cache.clear_prefix("taxonomy:"))
         else:
             loop.run_until_complete(redis_cache.clear_prefix("library:"))
+            loop.run_until_complete(redis_cache.clear_prefix("taxonomy:"))
     except Exception:
         logger.warning("invalidate_library_cache: could not clear Redis prefix", exc_info=True)
 
