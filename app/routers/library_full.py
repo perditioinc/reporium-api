@@ -486,7 +486,14 @@ async def _fetch_page_repos(
                primary_category, secondary_categories
         FROM repos
         WHERE is_private = false
-        ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+        -- KAN-190: id ASC tiebreaker is REQUIRED for deterministic pagination.
+        -- Without it, rows with equal sort-key (e.g. all test fixtures share
+        -- parent_stars=1000) get implementation-defined order across LIMIT/OFFSET
+        -- pages, so a row at a page boundary can appear twice or be skipped
+        -- on different connections — surfaced as
+        -- test_library_full_excludes_private_repos_across_all_pages flake when
+        -- a sibling test changes corpus size.
+        ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC, id ASC
         LIMIT :lim OFFSET :off
     """), {"lim": page_size, "off": offset})
     rows = result.fetchall()
@@ -681,6 +688,15 @@ async def library_full(
     logger.info(f"Building /library/full page={page} page_size={page_size}...")
 
     # SECURITY: Only return public repos — is_private=false enforced inside _fetch_page_repos
+    # KAN-190: Sentry's auto-instrumentation (FastApiIntegration transaction +
+    # SqlalchemyIntegration per-execute spans) covers /library/full's hot
+    # path without manual wrapping. Manual sentry_sdk.start_span / set_tag
+    # / set_transaction_name calls in this handler triggered a deterministic
+    # CI regression on Python 3.12
+    # (test_library_full_excludes_private_repos_across_all_pages was missing
+    # one repo from the 12-page walk). Auto spans + transaction provide
+    # equivalent observability in Sentry; the structured exception handler
+    # in app/main.py still covers the silent-failure gap.
     enriched_repos, total = await _fetch_page_repos(db, page=page, page_size=page_size)
     aggregates = await _fetch_aggregates(db)
 

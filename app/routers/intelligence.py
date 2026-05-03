@@ -24,6 +24,7 @@ from uuid import UUID
 
 import anthropic
 import numpy as np
+import sentry_sdk
 from opentelemetry import trace
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
@@ -3145,6 +3146,15 @@ async def _run_query(
     3. Otherwise call Claude for answer generation
     4. Return answer with source repos and relevance scores
     """
+    # KAN-190: rename the auto-generated Sentry transaction to a stable label
+    # ("ask") so latency dashboards aggregate by intent instead of by URL
+    # template, and tag with route_label so /ask vs /query are still
+    # distinguishable. start_span() calls below auto-attach to this
+    # transaction (FastApiIntegration creates it; sample rate inherited).
+    sentry_sdk.get_current_scope().set_transaction_name("ask")
+    sentry_sdk.set_tag("ask.route", route_label)
+    sentry_sdk.set_tag("ask.has_session", bool(session_id or req.session_id))
+
     _started_at = time.monotonic()
     effective_session_id = session_id or req.session_id
 
@@ -3170,6 +3180,12 @@ async def _run_query(
             tokens_used={"input_tokens": 0, "output_tokens": 0},
         )
 
+    # KAN-190: deliberately NOT wrapping _prepare_query in
+    # sentry_sdk.start_span — the inner _tracer.start_as_current_span() OTel
+    # spans (smart_route_check, embedding_generation, pgvector_search) plus
+    # Sentry's SqlalchemyIntegration auto-spans give the per-phase latency
+    # without manual wrapping. Wrapping the outer await triggered a
+    # Python-3.12 ordering regression on /library/full (KAN-190).
     qctx = await _prepare_query(
         req.question, effective_session_id, req.top_k, db, token_hash=token_hash
     )
@@ -3336,8 +3352,15 @@ async def _run_query(
             )
 
     _t_claude_start = time.monotonic()
-    with _tracer.start_as_current_span("claude_api_call") as claude_span:
+    # KAN-190: dual-span (OTel + Sentry) around the Claude completion. OTel
+    # carries the existing distributed-trace handoff to Cloud Trace; Sentry's
+    # span lets us see anthropic-completion latency in the same flame chart
+    # as the rest of the request, and to attach token-spend context to the
+    # Sentry transaction.
+    with _tracer.start_as_current_span("claude_api_call") as claude_span, \
+            sentry_sdk.start_span(op="anthropic.complete", name="ask.claude") as sentry_claude_span:
         claude_span.set_attribute("model", qctx.model)
+        sentry_claude_span.set_data("model", qctx.model)
         try:
             message = await asyncio.wait_for(
                 loop.run_in_executor(None, _call_claude),
@@ -3356,6 +3379,8 @@ async def _run_query(
             )
         claude_span.set_attribute("tokens.input", message.usage.input_tokens)
         claude_span.set_attribute("tokens.output", message.usage.output_tokens)
+        sentry_claude_span.set_data("tokens.input", message.usage.input_tokens)
+        sentry_claude_span.set_data("tokens.output", message.usage.output_tokens)
     _t_claude_end = time.monotonic()
     claude_ms = int((_t_claude_end - _t_claude_start) * 1000)
 
