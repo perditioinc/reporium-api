@@ -23,6 +23,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from slowapi import Limiter
@@ -284,6 +285,21 @@ async def library_preview(
     # we touch Redis or DB. _parse_include itself raises HTTPException(400).
     include_tokens = _parse_include(include)
 
+    # KAN-207: rename the auto-generated FastApiIntegration transaction to a
+    # stable label and tag with filterable telemetry. We do NOT call
+    # sentry_sdk.start_transaction() directly because the FastAPI integration
+    # already created the parent transaction — the tested KAN-190 pattern
+    # (intelligence.py) renames in place and attaches child spans below.
+    # traces_sample_rate=0.1 from app/main.py governs sampling.
+    sentry_sdk.get_current_scope().set_transaction_name("library.preview")
+    sentry_sdk.set_tag("library.preview.limit", limit)
+    sentry_sdk.set_tag("library.preview.sort", sort)
+    sentry_sdk.set_tag("library.preview.category", category or "*")
+    sentry_sdk.set_tag(
+        "library.preview.include",
+        ",".join(sorted(include_tokens)) if include_tokens else "none",
+    )
+
     # KAN-170: switch to s-maxage (shared/CDN-only) so any future CDN/Cloud LB in
     # front of Cloud Run can edge-cache; browsers + non-CDN clients still hit
     # origin. stale-while-revalidate=60 keeps the total stale window (s-maxage +
@@ -298,7 +314,10 @@ async def library_preview(
     include_key = ",".join(sorted(include_tokens)) if include_tokens else "none"
     redis_key = f"library:preview:{sort}:{limit}:{cat_key}:{include_key}"
 
-    cached = await redis_cache.get(redis_key)
+    with sentry_sdk.start_span(op="cache.get", name="library.preview.cache.get") as span:
+        span.set_data("cache.key", redis_key)
+        cached = await redis_cache.get(redis_key)
+        span.set_data("cache.hit", cached is not None)
     if cached is not None:
         logger.info(
             "Redis hit /library/preview sort=%s limit=%d category=%s include=%s",
@@ -311,9 +330,12 @@ async def library_preview(
 
     # Count for `totalRepos` — public corpus size, independent of limit/category.
     # This matches /library/full so the frontend can show "Showing N of M repos".
-    total = (await db.execute(
-        text("SELECT COUNT(*) FROM repos WHERE is_private = false")
-    )).scalar() or 0
+    with sentry_sdk.start_span(op="db.query", name="library.preview.count") as span:
+        span.set_data("db.statement", "SELECT COUNT(*) FROM repos WHERE is_private = false")
+        total = (await db.execute(
+            text("SELECT COUNT(*) FROM repos WHERE is_private = false")
+        )).scalar() or 0
+        span.set_data("db.rows_total", total)
 
     # KAN-179: build the column projection list dynamically. Default columns
     # mirror the original KAN-151 SELECT exactly; extension columns appended
@@ -358,9 +380,14 @@ async def library_preview(
     if category:
         params["cat"] = category
 
-    result = await db.execute(text(sql_main), params)
-    rows = result.fetchall()
-    columns = list(result.keys())
+    with sentry_sdk.start_span(op="db.query", name="library.preview.repos") as span:
+        span.set_data("db.sort", sort)
+        span.set_data("db.limit", limit)
+        span.set_data("db.category", category or "*")
+        result = await db.execute(text(sql_main), params)
+        rows = result.fetchall()
+        columns = list(result.keys())
+        span.set_data("db.rows_returned", len(rows))
 
     if not rows:
         body = {
@@ -371,7 +398,10 @@ async def library_preview(
             "category": category,
             "repos": [],
         }
-        await redis_cache.set(redis_key, body, ttl=CACHE_TTL)
+        with sentry_sdk.start_span(op="cache.set", name="library.preview.cache.set") as span:
+            span.set_data("cache.key", redis_key)
+            span.set_data("cache.ttl", CACHE_TTL)
+            await redis_cache.set(redis_key, body, ttl=CACHE_TTL)
         return body
 
     repo_dicts = [dict(zip(columns, row)) for row in rows]
@@ -381,20 +411,24 @@ async def library_preview(
     # pattern as `_fetch_page_repos` to avoid asyncpg's `::uuid[]` parser quirk.
     # We over-fetch tags and trim per-repo in Python (cheap; ~1.8K rows in the
     # worst case at limit=500). Avoids per-repo subqueries / window functions.
-    tag_result = await db.execute(text(
-        "SELECT repo_id, tag FROM repo_tags "
-        "WHERE repo_id = ANY(CAST(:ids AS uuid[]))"
-    ), {"ids": page_ids})
-    tags_by_repo: dict[str, list[str]] = defaultdict(list)
-    for tag_row in tag_result.fetchall():
-        rid = str(tag_row.repo_id)
-        if len(tags_by_repo[rid]) < _TOP_TAGS_PER_REPO:
-            tags_by_repo[rid].append(tag_row.tag)
+    with sentry_sdk.start_span(op="db.query", name="library.preview.tags") as span:
+        span.set_data("db.repo_ids", len(page_ids))
+        tag_result = await db.execute(text(
+            "SELECT repo_id, tag FROM repo_tags "
+            "WHERE repo_id = ANY(CAST(:ids AS uuid[]))"
+        ), {"ids": page_ids})
+        tags_by_repo: dict[str, list[str]] = defaultdict(list)
+        for tag_row in tag_result.fetchall():
+            rid = str(tag_row.repo_id)
+            if len(tags_by_repo[rid]) < _TOP_TAGS_PER_REPO:
+                tags_by_repo[rid].append(tag_row.tag)
 
-    repos = [
-        _build_preview_repo(row, tags_by_repo.get(str(row["id"]), []), include_tokens)
-        for row in repo_dicts
-    ]
+    with sentry_sdk.start_span(op="serialize", name="library.preview.serialize") as span:
+        repos = [
+            _build_preview_repo(row, tags_by_repo.get(str(row["id"]), []), include_tokens)
+            for row in repo_dicts
+        ]
+        span.set_data("repos.count", len(repos))
 
     body = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
@@ -411,5 +445,8 @@ async def library_preview(
         sort, limit, cat_key, include_key, len(repos), elapsed_ms,
     )
 
-    await redis_cache.set(redis_key, body, ttl=CACHE_TTL)
+    with sentry_sdk.start_span(op="cache.set", name="library.preview.cache.set") as span:
+        span.set_data("cache.key", redis_key)
+        span.set_data("cache.ttl", CACHE_TTL)
+        await redis_cache.set(redis_key, body, ttl=CACHE_TTL)
     return body
