@@ -681,3 +681,46 @@ async def test_library_full_repo_contract_blocks_no_repo_without_isprivate(
         f"{len(missing)} repos missing privacy field — would fail Lane 2's "
         f"validate-privacy.ts and Lane 4's audit. Sample: {missing[:5]}"
     )
+
+
+# ---------------------------------------------------------------------------
+# KAN-188 — back-compat invariant: /library/full must STILL ship the aggregate
+# fields alongside the per-repo array even after KAN-188 splits them out into
+# /library/aggregates. Workato + MCP + eval runner all consume the legacy
+# shape; breaking it is a P0 outage. Pin the contract here.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_library_full_response_shape_preserved(client: AsyncClient):
+    """KAN-188 back-compat: /library/full keeps `repos` AND every aggregate.
+
+    The aggregate builders moved into library_aggregates_helpers as part of
+    KAN-188 so /library/aggregates can reuse them, but /library/full's wire
+    shape is unchanged — every field that consumers (Workato, MCP, eval
+    runner) read today must still be present.
+    """
+    resp = await client.get("/library/full?page=1&page_size=2")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    # The per-repo array is still THE primary payload of /library/full.
+    assert "repos" in body, "KAN-188 regression: /library/full dropped `repos`"
+    assert isinstance(body["repos"], list)
+
+    # Every aggregate field that has shipped on /library/full must still ship.
+    # KAN-188 made these available on a separate /library/aggregates endpoint
+    # too — but /library/full retains them for back-compat.
+    for k in (
+        "stats", "gapAnalysis", "tagMetrics", "categories",
+        "builderStats", "aiDevSkillStats", "pmSkillStats",
+    ):
+        assert k in body, (
+            f"KAN-188 back-compat regression: /library/full dropped {k!r}; "
+            "Workato + MCP + eval runner all read this field"
+        )
+
+    # Envelope keys that have shipped since KAN-151
+    for k in ("username", "generatedAt", "page", "pageSize",
+              "totalRepos", "totalPages"):
+        assert k in body, f"/library/full envelope dropped {k!r}"
