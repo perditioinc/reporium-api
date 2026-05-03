@@ -20,13 +20,14 @@ Run locally:
 NOTE on taxonomy dimensions
 ---------------------------
 The /taxonomy/<dim> endpoint uses the *repo_taxonomy dimension strings*, not
-the 16-category primary_category list from ENRICHMENT_PROMPT_V2.md.
+the 21-category primary_category list (ENRICHMENT_PROMPT_V2.md /
+reporium-ingestion ingestion/enrichment/taxonomy.py CATEGORIES).
 The 6 populated dims as of 2026-04-19 are:
     modality, use_case, deployment_context, skill_area, ai_trend, industry
 
-The 16 primary_category slugs (agents, rag-retrieval, …) are stored in
-repos.primary_category / repo_categories — a separate table — and are
-intentionally NOT queried here (they are covered by test_taxonomy_gaps.py).
+The 21 primary_category NAMES (e.g. "AI Agents", "RAG & Retrieval") are
+stored in repos.primary_category / repo_categories — a separate table — and
+are intentionally NOT queried here (they are covered by test_taxonomy_gaps.py).
 
 Audit finding: the two taxonomy systems are distinct. This invariant guards
 /taxonomy/<dim> (the taxonomy_values table populated by the rebuild job).
@@ -66,7 +67,7 @@ KNOWN_POPULATED_DIMS = [
 
 # Additional dims that may exist but are allowed to be empty (xfail-safe).
 # NOTE: "tags" and "categories" here refer to any future raw taxonomy dims,
-# not the 16-category primary_category slug list.
+# not the 21-category primary_category NAME list.
 POTENTIALLY_EMPTY_DIMS = {"tags", "categories"}
 
 MIN_POPULATED_DIMS = 3  # at least this many must return non-empty values
@@ -149,7 +150,7 @@ def test_taxonomy_dimensions_populated():
 
     Asserts that at least MIN_POPULATED_DIMS return a non-empty values list.
     These are the taxonomy_values dimensions populated by the rebuild job —
-    distinct from the 16-category primary_category slugs.
+    distinct from the 21-category primary_category NAME list.
 
     Catches: taxonomy_values table wipe, rebuild job failure, enrichment
     pipeline regression that zeroes out dimension counts.

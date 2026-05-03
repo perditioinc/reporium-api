@@ -93,7 +93,11 @@ class Repo(Base):
     # Structure: {risk_level, incident_reported, incident_date, incident_url, incident_summary}
     security_signals: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
-    # KAN-41 16-category taxonomy (backfilled by backfill_primary_category.py)
+    # KAN-41 fixed taxonomy (originally 16 categories; now 21 — see
+    # reporium-ingestion `ingestion/enrichment/taxonomy.py` `CATEGORIES`).
+    # Stores the category NAME (e.g. "AI Agents"), not an ID slug.
+    # Originally backfilled by backfill_primary_category.py (script removed);
+    # now derived from the canonical-pipeline payload during repo upsert.
     primary_category: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Prod column is text[] (verified 2026-04-05). Prior JSONB declaration caused
     # `operator does not exist: text[] @> jsonb` in /repos/discover/cross-category.
