@@ -166,7 +166,12 @@ async def library_preview(
     See `.audit/2026-05-02/library-preview-endpoint-design.md` for the full
     design (response shape, sort options, projected Lighthouse delta).
     """
-    response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=3600"
+    # KAN-170: switch to s-maxage (shared/CDN-only) so any future CDN/Cloud LB in
+    # front of Cloud Run can edge-cache; browsers + non-CDN clients still hit
+    # origin. stale-while-revalidate=60 keeps the total stale window (s-maxage +
+    # swr = 6 min) within the 5-min Redis TTL band so ingestion-driven
+    # invalidate_library_cache() flushes Redis before the CDN window expires.
+    response.headers["Cache-Control"] = "public, s-maxage=300, stale-while-revalidate=60"
 
     cat_key = category if category else "*"
     redis_key = f"library:preview:{sort}:{limit}:{cat_key}"
