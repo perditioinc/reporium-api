@@ -138,13 +138,20 @@ def _make_anthropic_message(
 
 def _make_mock_db(rows):
     """
-    Return an AsyncMock db session whose execute() returns the given rows for
-    the embedding query and an empty result for the other queries.
+    Return an AsyncMock db session whose execute() routes by SQL shape:
+      - semantic-cache lookup (``query_log`` + ``question_embedding_vec``)
+        → result.first() returns None (cache miss)
+      - pgvector similarity (``repo_embeddings`` JOIN ``repos``)
+        → result.fetchall() returns the repo rows
+      - knowledge-graph edges (``repo_edges``) → result.fetchall() returns []
 
-    The endpoint makes three DB calls in order:
-      1. _find_semantic_cache_hit  → result.first() should be None (cache miss)
-      2. pgvector similarity query → result.fetchall() returns the repo rows
-      3. knowledge-graph edge query → result.fetchall() returns []
+    KAN-182: previously this used an ordered ``side_effect=[cache, rows, edges]``
+    list. KAN-169 (PR #467) made the semantic-cache lookup conditional — for
+    negation queries (``alternatives to <token>``) ``_prepare_query`` skips
+    ``_find_semantic_cache_hit`` entirely, so the call count drops from 3 to 2
+    and the ordered list returns ``cache`` (a None-row mock) when the code
+    actually wanted ``rows`` — surfacing as an empty source list and silent
+    test breakage. Routing by SQL shape is robust to call-count changes.
     """
     mock_cache_result = MagicMock()
     mock_cache_result.first.return_value = None  # no semantic cache hit
@@ -155,9 +162,24 @@ def _make_mock_db(rows):
     mock_edge_result = MagicMock()
     mock_edge_result.fetchall.return_value = []
 
+    # Default for any unrecognized query — empty result, fail-soft.
+    mock_default = MagicMock()
+    mock_default.first.return_value = None
+    mock_default.fetchall.return_value = []
+
+    async def _route(stmt, *args, **kwargs):
+        # ``stmt`` is a SQLAlchemy ``TextClause``; str() yields the raw SQL.
+        sql = str(stmt).lower()
+        if "query_log" in sql and "question_embedding_vec" in sql:
+            return mock_cache_result
+        if "repo_embeddings" in sql and "repos" in sql:
+            return mock_result
+        if "repo_edges" in sql:
+            return mock_edge_result
+        return mock_default
+
     mock_db = AsyncMock()
-    # 1st → semantic cache check; 2nd → vector similarity search; 3rd → knowledge-graph edges
-    mock_db.execute = AsyncMock(side_effect=[mock_cache_result, mock_result, mock_edge_result])
+    mock_db.execute = AsyncMock(side_effect=_route)
     return mock_db
 
 
@@ -937,11 +959,23 @@ async def test_ask_negation_bypasses_cache(client_no_db: AsyncClient):
         assert "pinecone" not in full, (
             f"KAN-169 regression: pinecone leaked into sources via cache as {full!r}"
         )
-    # And cache.set must NOT have been called for this negation query — so
-    # this turn's response can't pollute future cache hits either.
-    assert set_mock.call_count == 0, (
-        f"KAN-169 regression: cache.set was called {set_mock.call_count} times "
-        f"for a negation query (expected 0). Calls: {set_mock.call_args_list}"
+    # And no ``llm_response:`` cache write must occur for this negation query
+    # — so this turn's response can't pollute future cache hits either.
+    #
+    # KAN-182: scope the assertion to the ``llm_response:`` namespace
+    # (mirroring the ``_get_side_effect`` filter above). The handler still
+    # legitimately writes ``llm_cost:<date>`` via ``cost_tracker.record_cost``
+    # for daily-budget accounting on EVERY live LLM call (KAN-169's bypass is
+    # explicitly scoped to the response cache, not unrelated counters).
+    # Asserting ``call_count == 0`` would conflate the two and silently fail
+    # whenever cost tracking runs.
+    llm_response_writes = [
+        c for c in set_mock.call_args_list
+        if c.args and isinstance(c.args[0], str) and c.args[0].startswith("llm_response:")
+    ]
+    assert len(llm_response_writes) == 0, (
+        f"KAN-169 regression: cache.set was called for the llm_response: namespace "
+        f"on a negation query (expected 0). llm_response: calls: {llm_response_writes}"
     )
 
 
