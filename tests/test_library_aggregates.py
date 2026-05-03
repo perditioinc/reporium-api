@@ -105,6 +105,37 @@ async def test_aggregates_tag_metrics_does_NOT_include_per_tag_repos_array(clien
 
 
 @pytest.mark.asyncio
+async def test_aggregates_categories_does_NOT_include_per_category_tags_array(client: AsyncClient):
+    """KAN-201 contract: categories entries MUST NOT carry a per-category `tags[]`.
+
+    KAN-195 audit identified `categories[].tags` as the single largest
+    contributor to /library/aggregates at ~1.52 MB / 40% of payload (3.54 MB
+    post-KAN-193). The frontend used to read this on `FilterBar.tsx:165` to
+    drive the per-category tag row; KAN-201 PR1 (reporium#306) rewired
+    FilterBar to derive the same set client-side from per-repo `enrichedTags`
+    filtered by `allCategories.includes(cat.name)`. This PR drops the field
+    server-side now that nothing reads it.
+
+    Mirrors the KAN-193 pattern (`tagMetric.repos` trim) — see
+    `test_aggregates_tag_metrics_does_NOT_include_per_tag_repos_array`.
+    """
+    resp = await client.get("/library/aggregates")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    cats = body.get("categories") or []
+    for cat in cats:
+        assert "tags" not in cat, (
+            "KAN-201 regression: categories entry leaked the per-category "
+            "`tags` array. That field dominated /library/aggregates at "
+            "~1.52 MB / 40% before KAN-201 and was dropped because the only "
+            "consumer (FilterBar) now derives the same set from per-repo "
+            "enrichedTags. If a new consumer needs it, derive client-side or "
+            "revisit the design."
+        )
+
+
+@pytest.mark.asyncio
 async def test_aggregates_field_shapes_match_library_full(client: AsyncClient):
     """Each aggregate field's runtime shape matches /library/full's wire shape.
 
