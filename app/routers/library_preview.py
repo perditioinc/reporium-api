@@ -248,7 +248,7 @@ def _build_preview_repo(row: dict, tags: list[str], include: frozenset[str]) -> 
 # ---------------------------------------------------------------------------
 
 
-@router.get("/library/preview", response_model=PreviewResponse, response_model_exclude_none=True)
+@router.get("/library/preview", response_model=PreviewResponse, response_model_exclude_unset=True)
 # 120/minute: matches the cache shape — preview is cheap (single repo SELECT
 # + one junction read) and Redis-cached for 5 min, so we can afford a higher
 # limit than /library/full's 60/minute. Frontend (KAN-152) will hit at most
