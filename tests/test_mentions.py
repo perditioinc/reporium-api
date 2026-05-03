@@ -128,14 +128,27 @@ async def test_backfill_hn_mentions_inserts(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_backfill_hn_idempotent(client: AsyncClient):
-    """Running backfill twice should not create duplicates."""
+    """Running backfill twice should not create duplicates.
+
+    KAN-184: The endpoint enforces a ~1 req/s rate limit via
+    ``await asyncio.sleep(1.0)`` between repos. By the time this test
+    runs, the session-scoped DB has accumulated repos from earlier
+    tests, and the LIMIT 200 query plus two backfill invocations would
+    push wall-time well past the 60s pytest-timeout ceiling.
+
+    The mocked ``httpx.AsyncClient`` already eliminates real network
+    cost; mocking ``asyncio.sleep`` removes the only remaining
+    time-dominating operation while preserving the idempotency
+    assertion (the on-conflict-do-nothing semantics in the SQL path).
+    """
 
     mock_client = AsyncMock()
     mock_client.get = AsyncMock(return_value=_mock_hn_response(FAKE_HN_HITS))
     mock_client.__aenter__ = AsyncMock(return_value=mock_client)
     mock_client.__aexit__ = AsyncMock(return_value=False)
 
-    with patch("app.routers.admin.httpx.AsyncClient", return_value=mock_client):
+    with patch("app.routers.admin.httpx.AsyncClient", return_value=mock_client), \
+         patch("app.routers.admin.asyncio.sleep", new=AsyncMock(return_value=None)):
         r1 = await client.post(
             "/admin/backfill-hn-mentions",
             headers={"Authorization": f"Bearer {TEST_API_KEY}"},
