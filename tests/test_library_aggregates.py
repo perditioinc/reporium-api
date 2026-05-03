@@ -74,6 +74,37 @@ async def test_aggregates_does_NOT_return_repos_array(client: AsyncClient):
 
 
 @pytest.mark.asyncio
+async def test_aggregates_tag_metrics_does_NOT_include_per_tag_repos_array(client: AsyncClient):
+    """KAN-193 contract: tagMetrics entries MUST NOT carry a per-tag `repos[]` array.
+
+    KAN-188 (PR #476) shipped /library/aggregates with the same tagMetrics
+    shape /library/full embeds — including a per-tag `repos: [name1, ...]`
+    array (capped to 20 names per tag). At ~5,329 tags this dominated the
+    3.8 MB payload.
+
+    Consumer audit (perditioinc): no production reader of tagMetric.repos
+    in reporium frontend, reporium-mcp, reporium-evals, or reporium-audit.
+    Callers needing tag → repos mapping should derive from per-repo
+    `enrichedTags` in /library/preview or /library/full.
+    """
+    resp = await client.get("/library/aggregates")
+    assert resp.status_code == 200
+    body = resp.json()
+
+    tag_metrics = body.get("tagMetrics") or []
+    # If the corpus has any tags, at least one tagMetrics entry should be
+    # present and we can check the shape. If empty (test fixtures with no
+    # enriched tags), the assertion is trivially satisfied.
+    for tm in tag_metrics:
+        assert "repos" not in tm, (
+            "KAN-193 regression: tagMetrics entry leaked the per-tag `repos` "
+            "array. That field dominated the ~3.8 MB payload before KAN-193 "
+            "and was dropped because no consumer reads it. If a real consumer "
+            "now needs it, restore as a top-5 cap or revisit the design."
+        )
+
+
+@pytest.mark.asyncio
 async def test_aggregates_field_shapes_match_library_full(client: AsyncClient):
     """Each aggregate field's runtime shape matches /library/full's wire shape.
 
