@@ -393,6 +393,11 @@ async def test_invalidate_library_cache_clears_preview_prefix():
     'library:preview:*' (this PR). If a future refactor narrows the prefix
     to 'library:page:' only, /library/preview would serve stale results
     after a backfill — see feedback_backfill_must_invalidate_cache.md.
+
+    KAN-175 also added a ``taxonomy:`` prefix sweep (covered by
+    test_invalidate_library_cache_clears_taxonomy_prefix in
+    tests/test_taxonomy_aggregation.py). Here we just assert the ``library:``
+    prefix is one of the prefixes cleared, without pinning the call count.
     """
     from app.routers import library_full
 
@@ -405,4 +410,5 @@ async def test_invalidate_library_cache_clears_preview_prefix():
         import asyncio
         await asyncio.sleep(0)
 
-    fake_clear_prefix.assert_called_once_with("library:")
+    prefixes_called = {call.args[0] for call in fake_clear_prefix.call_args_list}
+    assert "library:" in prefixes_called, prefixes_called
