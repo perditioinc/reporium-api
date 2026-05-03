@@ -320,8 +320,11 @@ async def test_preview_cache_miss_writes_to_redis(client: AsyncClient):
     assert resp.status_code == 200
     fake_set.assert_called_once()
     # First positional arg is the key — verify the canonical shape.
+    # KAN-179 extended the key with an `:include_key` suffix (`none` when no
+    # `?include=` is supplied) so different include-sets don't share a cache
+    # entry. Default request → `:none`.
     args, kwargs = fake_set.call_args
-    assert args[0] == "library:preview:updated:42:*"
+    assert args[0] == "library:preview:updated:42:*:none"
     assert kwargs.get("ttl") == 300
 
 
@@ -412,3 +415,228 @@ async def test_invalidate_library_cache_clears_preview_prefix():
 
     prefixes_called = {call.args[0] for call in fake_clear_prefix.call_args_list}
     assert "library:" in prefixes_called, prefixes_called
+
+
+# ---------------------------------------------------------------------------
+# KAN-179 — `?include=` extension tokens
+# ---------------------------------------------------------------------------
+
+
+# Exact field set the default response must surface per repo (KAN-151 contract).
+# 15 fields — same list the design memo + frontend RepoCardMinimal type carry.
+_DEFAULT_PREVIEW_FIELDS: frozenset[str] = frozenset({
+    "id", "name", "fullName", "description", "isFork", "forkedFrom",
+    "language", "stars", "forks", "lastUpdated", "primaryCategory",
+    "dbCategory", "enrichedTags", "isArchived", "url",
+})
+
+
+@pytest.mark.asyncio
+async def test_preview_default_no_include_returns_baseline_fields(client: AsyncClient):
+    """No `?include` → exactly the KAN-151 15 fields, nothing more."""
+    from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
+
+    r = await client.post(
+        "/ingest/repos",
+        json=[{**TEST_REPO_FIXTURE, "name": "preview-baseline-probe",
+               "github_url": "https://github.com/testuser/preview-baseline-probe",
+               "is_private": False}],
+        headers=AUTH_HEADERS,
+    )
+    assert r.status_code == 200
+
+    resp = await client.get("/library/preview?limit=500")
+    assert resp.status_code == 200
+    repos = resp.json()["repos"]
+    assert repos, "preview returned zero repos — fixture should have created at least one"
+    sample = repos[0]
+    assert set(sample.keys()) == _DEFAULT_PREVIEW_FIELDS, (
+        f"KAN-151 contract regression: default projection keys={set(sample.keys())}, "
+        f"expected={_DEFAULT_PREVIEW_FIELDS}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_preview_include_stats_adds_commit_stats(client: AsyncClient):
+    """?include=stats adds commitStats per repo and not on default."""
+    from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
+
+    r = await client.post(
+        "/ingest/repos",
+        json=[{**TEST_REPO_FIXTURE, "name": "preview-stats-probe",
+               "github_url": "https://github.com/testuser/preview-stats-probe",
+               "is_private": False,
+               "commits_last_7_days": 3,
+               "commits_last_30_days": 12,
+               "commits_last_90_days": 40}],
+        headers=AUTH_HEADERS,
+    )
+    assert r.status_code == 200
+
+    # Default — no commitStats key.
+    default_resp = await client.get("/library/preview?limit=500")
+    assert default_resp.status_code == 200
+    for repo in default_resp.json()["repos"]:
+        assert "commitStats" not in repo, (
+            f"default projection leaked commitStats on {repo['name']}"
+        )
+
+    # ?include=stats — commitStats present on every repo.
+    inc_resp = await client.get("/library/preview?include=stats&limit=500")
+    assert inc_resp.status_code == 200
+    repos = inc_resp.json()["repos"]
+    probe = next((r for r in repos if r["name"] == "preview-stats-probe"), None)
+    assert probe is not None, "stats probe missing from include=stats response"
+    assert "commitStats" in probe, "include=stats did not add commitStats"
+    cs = probe["commitStats"]
+    assert cs["last7Days"] == 3
+    assert cs["last30Days"] == 12
+    assert cs["last90Days"] == 40
+    # parent / quality fields must NOT appear from a stats-only request.
+    assert "parentStats" not in probe
+    assert "qualitySignals" not in probe
+
+
+@pytest.mark.asyncio
+async def test_preview_include_parent_adds_parent_stats(client: AsyncClient):
+    """?include=parent adds parentStats + upstreamCreatedAt for forks."""
+    from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
+
+    r = await client.post(
+        "/ingest/repos",
+        json=[{**TEST_REPO_FIXTURE, "name": "preview-parent-probe",
+               "github_url": "https://github.com/testuser/preview-parent-probe",
+               "is_private": False,
+               "is_fork": True,
+               "forked_from": "upstream/preview-parent-probe",
+               "parent_stars": 4242,
+               "parent_forks": 88,
+               "parent_is_archived": False}],
+        headers=AUTH_HEADERS,
+    )
+    assert r.status_code == 200
+
+    default_resp = await client.get("/library/preview?limit=500")
+    assert default_resp.status_code == 200
+    for repo in default_resp.json()["repos"]:
+        assert "parentStats" not in repo, "default projection leaked parentStats"
+        assert "upstreamCreatedAt" not in repo, "default projection leaked upstreamCreatedAt"
+
+    inc_resp = await client.get("/library/preview?include=parent&limit=500")
+    assert inc_resp.status_code == 200
+    repos = inc_resp.json()["repos"]
+    probe = next((r for r in repos if r["name"] == "preview-parent-probe"), None)
+    assert probe is not None, "parent probe missing from include=parent response"
+    assert "parentStats" in probe, "include=parent did not add parentStats"
+    ps = probe["parentStats"]
+    assert ps["owner"] == "upstream"
+    assert ps["repo"] == "preview-parent-probe"
+    assert ps["stars"] == 4242
+    assert ps["forks"] == 88
+    # upstreamCreatedAt may be empty (the ingest fixture doesn't set it), but
+    # the key is part of the parent token contract — must be present.
+    assert "upstreamCreatedAt" in probe
+    # commitStats / qualitySignals NOT present from a parent-only request.
+    assert "commitStats" not in probe
+    assert "qualitySignals" not in probe
+
+
+@pytest.mark.asyncio
+async def test_preview_include_quality_adds_quality_signals(client: AsyncClient):
+    """?include=quality adds qualitySignals (raw JSON) — public-safe field."""
+    from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
+
+    r = await client.post(
+        "/ingest/repos",
+        json=[{**TEST_REPO_FIXTURE, "name": "preview-quality-probe",
+               "github_url": "https://github.com/testuser/preview-quality-probe",
+               "is_private": False,
+               "quality_signals": {"hasReadme": True, "hasLicense": True}}],
+        headers=AUTH_HEADERS,
+    )
+    assert r.status_code == 200
+
+    inc_resp = await client.get("/library/preview?include=quality&limit=500")
+    assert inc_resp.status_code == 200
+    repos = inc_resp.json()["repos"]
+    probe = next((r for r in repos if r["name"] == "preview-quality-probe"), None)
+    assert probe is not None, "quality probe missing from include=quality response"
+    assert "qualitySignals" in probe, "include=quality did not add qualitySignals"
+    # Other tokens' fields not present.
+    assert "commitStats" not in probe
+    assert "parentStats" not in probe
+
+
+@pytest.mark.asyncio
+async def test_preview_include_multiple_tokens(client: AsyncClient):
+    """?include=stats,parent adds both projections in one response."""
+    from tests.conftest import AUTH_HEADERS, TEST_REPO_FIXTURE
+
+    r = await client.post(
+        "/ingest/repos",
+        json=[{**TEST_REPO_FIXTURE, "name": "preview-multi-probe",
+               "github_url": "https://github.com/testuser/preview-multi-probe",
+               "is_private": False, "is_fork": True,
+               "forked_from": "upstream/preview-multi-probe",
+               "parent_stars": 5000,
+               "commits_last_7_days": 7,
+               "commits_last_30_days": 21,
+               "commits_last_90_days": 63}],
+        headers=AUTH_HEADERS,
+    )
+    assert r.status_code == 200
+
+    resp = await client.get("/library/preview?include=stats,parent&limit=500")
+    assert resp.status_code == 200
+    repos = resp.json()["repos"]
+    probe = next((r for r in repos if r["name"] == "preview-multi-probe"), None)
+    assert probe is not None
+    assert "commitStats" in probe and probe["commitStats"]["last7Days"] == 7
+    assert "parentStats" in probe and probe["parentStats"]["stars"] == 5000
+    assert "upstreamCreatedAt" in probe
+    assert "qualitySignals" not in probe
+
+
+@pytest.mark.asyncio
+async def test_preview_unknown_include_returns_400(client: AsyncClient):
+    """Unknown include tokens must 400 — no silent degrade to default."""
+    resp = await client.get("/library/preview?include=hacker")
+    assert resp.status_code == 400
+    detail = resp.json().get("detail", "")
+    assert "hacker" in str(detail).lower() or "unknown" in str(detail).lower()
+
+    # Mixed valid + invalid is also rejected (so a typo in a list can't silently
+    # demote the response shape).
+    resp2 = await client.get("/library/preview?include=stats,nope")
+    assert resp2.status_code == 400
+
+
+@pytest.mark.asyncio
+async def test_preview_cache_isolation_by_include(client: AsyncClient):
+    """Two requests with different `?include=` values write distinct cache keys.
+
+    Mocks redis_cache.set so we don't depend on a real Redis. Issuing default,
+    ?include=stats, and ?include=stats,parent in sequence must produce 3
+    distinct cache keys (the include suffix differs).
+    """
+    fake_get = AsyncMock(return_value=None)
+    fake_set = AsyncMock()
+    with (
+        patch("app.routers.library_preview.redis_cache.get", fake_get),
+        patch("app.routers.library_preview.redis_cache.set", fake_set),
+    ):
+        r1 = await client.get("/library/preview?limit=10")
+        r2 = await client.get("/library/preview?limit=10&include=stats")
+        r3 = await client.get("/library/preview?limit=10&include=stats,parent")
+
+    assert r1.status_code == 200 and r2.status_code == 200 and r3.status_code == 200
+    keys_written = {call.args[0] for call in fake_set.call_args_list}
+    # Three distinct keys, all sharing the sort/limit/category prefix.
+    expected_keys = {
+        "library:preview:stars:10:*:none",
+        "library:preview:stars:10:*:stats",
+        "library:preview:stars:10:*:parent,stats",
+    }
+    assert keys_written == expected_keys, (
+        f"cache key isolation failed: wrote {keys_written}, expected {expected_keys}"
+    )

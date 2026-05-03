@@ -8,7 +8,11 @@ endpoint returns the minimal field set RepoCardMinimal needs (~1.5 KB/repo)
 plus top-5 enriched tags, with no aggregates / categories / tagMetrics. Projected
 home payload: 5.2 MB → ~0.4 MB once KAN-152 frontend migrates the caller.
 
-Ships dead — no caller until KAN-152. Intentional rollout safety.
+KAN-179 extension: optional `?include=` query parameter accepts a comma-separated
+list of tokens (`stats`, `parent`, `quality`) to opt into additional per-repo
+fields without falling back to /library/full. Default behaviour (no `?include`)
+is unchanged — KAN-151 contracts hold (15 fields per repo). Enables /insights/
++ /trends/ pages to drop /library/full (1.46 MB) calls.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, Query, Request, Response
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -50,10 +54,64 @@ _SORT_CLAUSES: dict[str, str] = {
     "activity": "activity_score DESC NULLS LAST",
 }
 
+# KAN-179: known `?include=` tokens. Each token unlocks a specific group of
+# optional projection fields. Unknown tokens 400 to keep the contract crisp
+# (so a typo can't silently degrade to default-projection).
+_VALID_INCLUDE_TOKENS: frozenset[str] = frozenset({"stats", "parent", "quality"})
+
+
+def _parse_include(raw: Optional[str]) -> frozenset[str]:
+    """Validate + normalise the `?include=` query param.
+
+    Returns a frozenset of recognised tokens. Empty / None input → empty set
+    (default projection). Unknown tokens raise HTTPException 400 — they are
+    NOT silently dropped, because that would make `?include=quality,hacker`
+    indistinguishable from `?include=quality`.
+    """
+    if not raw:
+        return frozenset()
+    tokens = {t.strip().lower() for t in raw.split(",") if t.strip()}
+    unknown = tokens - _VALID_INCLUDE_TOKENS
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown include token(s): {sorted(unknown)}. "
+                f"Valid tokens: {sorted(_VALID_INCLUDE_TOKENS)}"
+            ),
+        )
+    return frozenset(tokens)
+
 
 # ---------------------------------------------------------------------------
 # Pydantic response models — surfaced in /openapi.json
 # ---------------------------------------------------------------------------
+
+
+class ParentStats(BaseModel):
+    """Subset of /library/full's parentStats — sufficient for /insights/ + /trends/."""
+    owner: str = ""
+    repo: str = ""
+    stars: int = 0
+    forks: int = 0
+    isArchived: bool = False
+    lastCommitDate: Optional[str] = None
+    description: Optional[str] = None
+    url: Optional[str] = None
+
+
+class CommitStats(BaseModel):
+    """Lean commit aggregate — counts only, no per-commit detail.
+
+    /library/full also computes `today` from binned `recentCommits`; preview
+    intentionally omits the per-commit list (the whole point of preview is
+    avoiding the join), so `today` is sourced from the scalar columns alone
+    and may be 0 if the DB scalar isn't populated. Consumers that need the
+    daily granularity should still hit /library/full.
+    """
+    last7Days: int = 0
+    last30Days: int = 0
+    last90Days: int = 0
 
 
 class PreviewRepo(BaseModel):
@@ -61,6 +119,10 @@ class PreviewRepo(BaseModel):
 
     Strict subset of /library/full's EnrichedRepo. RepoCardMinimal consumers
     must not access fields outside this model on preview data.
+
+    KAN-179: `commitStats`, `parentStats`, `upstreamCreatedAt`, `qualitySignals`
+    are optional and only populated when the matching `?include=` token is
+    supplied. Default-projection responses are unchanged.
     """
     id: str
     name: str
@@ -77,6 +139,11 @@ class PreviewRepo(BaseModel):
     enrichedTags: list[str] = Field(default_factory=list)
     isArchived: bool = False
     url: str = ""
+    # KAN-179 extension fields — Optional, omitted from default response.
+    commitStats: Optional[CommitStats] = None
+    parentStats: Optional[ParentStats] = None
+    upstreamCreatedAt: Optional[str] = None
+    qualitySignals: Optional[dict] = None
 
 
 class PreviewResponse(BaseModel):
@@ -101,8 +168,14 @@ def _iso(val) -> str:
     return str(val)
 
 
-def _build_preview_repo(row: dict, tags: list[str]) -> dict:
-    """Project a DB row + top-N tags into the PreviewRepo shape."""
+def _build_preview_repo(row: dict, tags: list[str], include: frozenset[str]) -> dict:
+    """Project a DB row + top-N tags into the PreviewRepo shape.
+
+    `include` controls which optional KAN-179 extension fields are populated.
+    Fields outside the include set are simply omitted from the dict (Pydantic
+    serialises Optional=None, but we keep the wire compact by leaving them
+    out entirely so default responses match KAN-151 byte-for-byte).
+    """
     name = row.get("name") or ""
     owner = row.get("owner") or "perditioinc"
     full_name = row.get("full_name") or f"{owner}/{name}"
@@ -118,7 +191,7 @@ def _build_preview_repo(row: dict, tags: list[str]) -> dict:
         stars = row.get("stargazers_count") or 0
         forks = 0
 
-    return {
+    out: dict = {
         "id": str(row.get("id") or ""),
         "name": name,
         "fullName": full_name,
@@ -136,13 +209,46 @@ def _build_preview_repo(row: dict, tags: list[str]) -> dict:
         "url": row.get("github_url") or f"https://github.com/{owner}/{name}",
     }
 
+    # KAN-179 extension projections — keys ONLY present when token requested.
+    if "stats" in include:
+        out["commitStats"] = {
+            "last7Days": row.get("commits_last_7_days") or 0,
+            "last30Days": row.get("commits_last_30_days") or 0,
+            "last90Days": row.get("commits_last_90_days") or 0,
+        }
+
+    if "parent" in include:
+        forked_from = row.get("forked_from") or ""
+        if forked_from:
+            parts = forked_from.split("/", 1)
+            parent_owner = parts[0] if len(parts) == 2 else ""
+            parent_repo = parts[1] if len(parts) == 2 else forked_from
+            out["parentStats"] = {
+                "owner": parent_owner,
+                "repo": parent_repo,
+                "stars": row.get("parent_stars") or 0,
+                "forks": row.get("parent_forks") or 0,
+                "isArchived": bool(row.get("parent_is_archived")),
+                "lastCommitDate": _iso(row.get("upstream_last_push_at")) or None,
+                "description": row.get("description"),
+                "url": f"https://github.com/{forked_from}",
+            }
+        else:
+            out["parentStats"] = None
+        out["upstreamCreatedAt"] = _iso(row.get("upstream_created_at")) or None
+
+    if "quality" in include:
+        out["qualitySignals"] = row.get("quality_signals")
+
+    return out
+
 
 # ---------------------------------------------------------------------------
 # Endpoint
 # ---------------------------------------------------------------------------
 
 
-@router.get("/library/preview", response_model=PreviewResponse)
+@router.get("/library/preview", response_model=PreviewResponse, response_model_exclude_none=True)
 # 120/minute: matches the cache shape — preview is cheap (single repo SELECT
 # + one junction read) and Redis-cached for 5 min, so we can afford a higher
 # limit than /library/full's 60/minute. Frontend (KAN-152) will hit at most
@@ -156,6 +262,14 @@ async def library_preview(
     sort: str = Query(default="stars", pattern="^(stars|updated|activity)$",
                        description="Sort key: stars | updated | activity"),
     category: Optional[str] = Query(default=None, description="Optional primary_category filter"),
+    include: Optional[str] = Query(
+        default=None,
+        description=(
+            "Comma-separated extension tokens (KAN-179): `stats` (commitStats), "
+            "`parent` (parentStats + upstreamCreatedAt), `quality` (qualitySignals). "
+            "Default omits all extension fields."
+        ),
+    ),
 ):
     """Lean projection of the library for above-the-fold home rendering.
 
@@ -166,6 +280,10 @@ async def library_preview(
     See `.audit/2026-05-02/library-preview-endpoint-design.md` for the full
     design (response shape, sort options, projected Lighthouse delta).
     """
+    # KAN-179: validate include first so a malformed `?include=` 400s before
+    # we touch Redis or DB. _parse_include itself raises HTTPException(400).
+    include_tokens = _parse_include(include)
+
     # KAN-170: switch to s-maxage (shared/CDN-only) so any future CDN/Cloud LB in
     # front of Cloud Run can edge-cache; browsers + non-CDN clients still hit
     # origin. stale-while-revalidate=60 keeps the total stale window (s-maxage +
@@ -174,12 +292,17 @@ async def library_preview(
     response.headers["Cache-Control"] = "public, s-maxage=300, stale-while-revalidate=60"
 
     cat_key = category if category else "*"
-    redis_key = f"library:preview:{sort}:{limit}:{cat_key}"
+    # KAN-179: cache key includes a sorted-comma-joined include set so two
+    # requests with different `?include=` values don't collide. `none` sentinel
+    # for the empty set keeps the key visually distinct from a categories miss.
+    include_key = ",".join(sorted(include_tokens)) if include_tokens else "none"
+    redis_key = f"library:preview:{sort}:{limit}:{cat_key}:{include_key}"
 
     cached = await redis_cache.get(redis_key)
     if cached is not None:
         logger.info(
-            "Redis hit /library/preview sort=%s limit=%d category=%s", sort, limit, cat_key
+            "Redis hit /library/preview sort=%s limit=%d category=%s include=%s",
+            sort, limit, cat_key, include_key,
         )
         return cached
 
@@ -192,16 +315,39 @@ async def library_preview(
         text("SELECT COUNT(*) FROM repos WHERE is_private = false")
     )).scalar() or 0
 
+    # KAN-179: build the column projection list dynamically. Default columns
+    # mirror the original KAN-151 SELECT exactly; extension columns appended
+    # only when the matching token is in the include set. All columns are on
+    # the `repos` table (no new joins) — verified against migration 036's
+    # repos schema.
+    base_columns = [
+        "id", "name", "owner", "(owner || '/' || name) AS full_name", "description",
+        "is_fork", "forked_from", "primary_language", "github_url",
+        "parent_stars", "parent_forks", "parent_is_archived",
+        "stargazers_count",
+        "github_updated_at", "updated_at",
+        "primary_category",
+    ]
+    extra_columns: list[str] = []
+    if "stats" in include_tokens:
+        extra_columns += [
+            "commits_last_7_days", "commits_last_30_days", "commits_last_90_days",
+        ]
+    if "parent" in include_tokens:
+        # parent_stars / parent_forks / parent_is_archived / forked_from / description
+        # are already in base_columns (they're shared with the default projection).
+        # Only `upstream_*` are net-new.
+        extra_columns += ["upstream_last_push_at", "upstream_created_at"]
+    if "quality" in include_tokens:
+        extra_columns += ["quality_signals"]
+
+    select_list = ", ".join(base_columns + extra_columns)
+
     # Main projection. is_private = false is the SQL invariant — same predicate
     # as /library/full and app.db_filters.PUBLIC_REPO_SQL_PREDICATE. Optional
     # primary_category equality narrows by frontend-canonical category name.
     sql_main = f"""
-        SELECT id, name, owner, (owner || '/' || name) AS full_name, description,
-               is_fork, forked_from, primary_language, github_url,
-               parent_stars, parent_forks, parent_is_archived,
-               stargazers_count,
-               github_updated_at, updated_at,
-               primary_category
+        SELECT {select_list}
         FROM repos
         WHERE is_private = false
           {"AND primary_category = :cat" if category else ""}
@@ -246,7 +392,7 @@ async def library_preview(
             tags_by_repo[rid].append(tag_row.tag)
 
     repos = [
-        _build_preview_repo(row, tags_by_repo.get(str(row["id"]), []))
+        _build_preview_repo(row, tags_by_repo.get(str(row["id"]), []), include_tokens)
         for row in repo_dicts
     ]
 
@@ -261,8 +407,8 @@ async def library_preview(
 
     elapsed_ms = (time.monotonic() - t0) * 1000
     logger.info(
-        "/library/preview built sort=%s limit=%d category=%s -> %d repos in %.1f ms",
-        sort, limit, cat_key, len(repos), elapsed_ms,
+        "/library/preview built sort=%s limit=%d category=%s include=%s -> %d repos in %.1f ms",
+        sort, limit, cat_key, include_key, len(repos), elapsed_ms,
     )
 
     await redis_cache.set(redis_key, body, ttl=CACHE_TTL)
