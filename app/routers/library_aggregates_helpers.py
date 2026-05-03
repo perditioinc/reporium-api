@@ -633,17 +633,18 @@ def build_categories(repos: list) -> list:
         "Data Science & Analytics": "\U0001F4CA",
     }
 
+    # KAN-201: drop the per-category `tags` array. It was the single largest
+    # contributor to /library/aggregates at ~1.52 MB / 40% of payload (KAN-195
+    # audit). The frontend now derives the same set client-side from per-repo
+    # `enrichedTags` filtered by `allCategories.includes(cat.name)` (see
+    # FilterBar `categoryTagsMap` and HomePageClient — KAN-201 PR1, reporium#306).
+    # Mirrors the KAN-193 trim that dropped `tagMetric.repos`.
     categories = []
     for cat, cat_repo_list in sorted(cat_repos.items()):
-        cat_tags = set()
-        for r in cat_repo_list:
-            cat_tags.update(r["enrichedTags"])
-
         categories.append({
             "id": cat.lower().replace(" ", "-"),
             "name": cat,
             "description": f"Repos related to {cat.lower()}",
-            "tags": sorted(cat_tags),
             "repoCount": len(cat_repo_list),
             "color": COLORS.get(cat, "#94a3b8"),
             "icon": ICONS.get(cat, "\U0001F4E6"),
