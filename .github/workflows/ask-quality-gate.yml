@@ -4,6 +4,7 @@ on:
     branches: [dev, main]
   pull_request:
     branches: [dev, main]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -30,7 +31,7 @@ jobs:
 
     env:
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/reporium_test
-      REDIS_URL: ""
+      REDIS_URL: ${{ secrets.REDIS_URL }}
       INGESTION_API_KEY: test-api-key
       GH_USERNAME: testuser
       # `ENVIRONMENT=test` skips the embedding-model pre-warm in
