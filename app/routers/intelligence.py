@@ -378,6 +378,153 @@ _ROUTE_TEMPORAL = re.compile(
 
 
 # ---------------------------------------------------------------------------
+# KAN-166: Negation post-filter — close P1 #365 self-match
+#
+# When a user asks "alternatives to pinecone" / "similar to langchain" / "instead
+# of openai", the retrieval layer can return X itself as the top match (because
+# X is the most semantically similar repo to a query that mentions X by name).
+# That contradicts the user's intent and is a documented retrieval bug (#365).
+#
+# PR #439 added the ``forbidden_repos`` golden-set primitive that asserts the
+# response.sources list does not contain X. This filter is the structural
+# enforcement of that contract on the handler side: after candidate sources
+# are ranked, drop any source whose name (or owner/name) lowercased contains
+# the captured negation token.
+#
+# Conservative matcher: minimum token length of 3, vendor-prefix-stripped
+# substring match against the lowercased repo ``name`` and ``full_name``. We
+# do NOT touch the public API or the regex itself.
+# ---------------------------------------------------------------------------
+
+_ASK_NEGATION_PATTERN = re.compile(
+    r"(?:"
+    r"alternative(?:s)?\s+to"
+    r"|alternatives?\s+for"
+    r"|similar\s+to"
+    r"|comparable\s+to"
+    r"|like\s+(?!a\b|an\b|the\b|that\b|this\b|these\b|those\b)"  # "repos like X" but not "repos like a..."
+    r"|instead\s+of"
+    r"|other\s+than"
+    r"|besides"
+    r"|replacement(?:s)?\s+for"
+    r"|substitute(?:s)?\s+for"
+    r"|competitor(?:s)?\s+(?:to|of)"
+    r")\s+([\w][\w\-./]{2,})",
+    re.IGNORECASE,
+)
+
+# Minimum length for a captured negation token. Below this we skip the filter
+# entirely — short tokens like "ai" or "ml" would otherwise filter every
+# repo whose name happens to contain those letters.
+_NEGATION_MIN_TOKEN_LEN = 3
+
+# Vendor-style prefixes that should be stripped before substring matching, so
+# "alternatives to pinecone" matches a repo named "pinecone-io/pinecone-python-client".
+_VENDOR_PREFIX_RE = re.compile(r"^[\w]+[-/]")
+
+
+def _normalize_negation_token(token: str | None) -> str | None:
+    """Lowercase + strip + drop punctuation tail. Returns None if too short."""
+    if not token:
+        return None
+    t = token.strip().lower()
+    # Trim trailing punctuation a user might include ("pinecone?" "pinecone.")
+    t = re.sub(r"[^\w\-./]+$", "", t)
+    # Drop a leading vendor prefix if the token came in as "owner/name" form.
+    if "/" in t:
+        t = t.split("/")[-1]
+    if len(t) < _NEGATION_MIN_TOKEN_LEN:
+        return None
+    return t
+
+
+def _extract_negation_token(question: str) -> str | None:
+    """
+    Detect ``alternatives to X``-style phrases and return normalized X.
+
+    Returns None if no negation phrase is present, the captured token is
+    shorter than ``_NEGATION_MIN_TOKEN_LEN``, or the question is empty.
+    """
+    if not question:
+        return None
+    match = _ASK_NEGATION_PATTERN.search(question)
+    if not match:
+        return None
+    return _normalize_negation_token(match.group(1))
+
+
+def _source_matches_negated_token(source: dict, negated_token: str | None) -> bool:
+    """
+    Return True if ``source`` should be dropped because it represents the
+    repo the user asked for *alternatives to*.
+
+    Match shape: lowercased substring on the source's ``name``, ``owner/name``,
+    AND ``forked_from`` (if present, since fork canonicalization may make the
+    upstream the user-visible identity). Vendor prefix stripped from the repo
+    side too — "pinecone-io/pinecone-python-client" should match the token
+    "pinecone".
+
+    Conservative: require ``negated_token`` to be at least
+    ``_NEGATION_MIN_TOKEN_LEN`` characters and to align on a word boundary
+    inside the candidate string (so "ai" wouldn't match "openai", but the
+    short-token guard already excludes "ai" anyway).
+    """
+    if not negated_token or len(negated_token) < _NEGATION_MIN_TOKEN_LEN:
+        return False
+
+    candidates: list[str] = []
+    name = (source.get("name") or "").lower()
+    owner = (source.get("owner") or "").lower()
+    forked_from = (source.get("forked_from") or "").lower()
+    if name:
+        candidates.append(name)
+        # Strip a vendor-prefix variant so "pinecone-python-client" -> "python-client"
+        # also gets a chance, with the leading "pinecone" already covered above.
+    if owner and name:
+        candidates.append(f"{owner}/{name}")
+    if forked_from:
+        candidates.append(forked_from)
+
+    # Word-boundary substring check on each candidate. Word boundary means we
+    # don't accidentally match "ai" inside "chai"; tokens of length >= 3 with
+    # boundary alignment are conservative enough for the repo namespace.
+    pattern = re.compile(rf"(?:^|[\W_]){re.escape(negated_token)}(?:$|[\W_])")
+    for cand in candidates:
+        if pattern.search(cand):
+            return True
+    return False
+
+
+def _apply_negation_filter(
+    sources: list[dict],
+    negated_token: str | None,
+    *,
+    log_label: str = "ask",
+) -> list[dict]:
+    """
+    Drop any source matching the negated token. No-op if no token captured.
+
+    Logs each drop at INFO with a stable structured form so we can grep
+    production logs for false positives without adding a dedicated metric.
+    """
+    if not negated_token:
+        return sources
+    _log = logging.getLogger(__name__)
+    kept: list[dict] = []
+    for s in sources:
+        if _source_matches_negated_token(s, negated_token):
+            full_name = "{}/{}".format(s.get("owner") or "?", s.get("name") or "?")
+            _log.info(
+                "%s.negation_filter dropped",
+                log_label,
+                extra={"repo": full_name, "token": negated_token},
+            )
+            continue
+        kept.append(s)
+    return kept
+
+
+# ---------------------------------------------------------------------------
 # Off-topic domain boundary filter ($0 — rejects before Claude call)
 # ---------------------------------------------------------------------------
 
@@ -2775,6 +2922,20 @@ async def _prepare_query(
 
     # Sort descending by similarity
     scored.sort(key=lambda r: r["similarity"], reverse=True)
+
+    # KAN-166: drop self-match for "alternatives to X" / "similar to X" queries
+    # before slicing to top_k — otherwise X knocks out a legitimate candidate
+    # and the LLM still sees X in context. Closes P1 #365 structurally.
+    negated_token = _extract_negation_token(question)
+    if negated_token:
+        before = len(scored)
+        scored = _apply_negation_filter(scored, negated_token, log_label="ask")
+        if len(scored) != before:
+            logger.info(
+                "ask.negation_filter applied: question=%r token=%r kept=%d/%d",
+                question[:80], negated_token, len(scored), before,
+            )
+
     top_for_answer = scored[:top_k]
 
     # 4. Build context for Claude — KAN-ask-cache: context hygiene

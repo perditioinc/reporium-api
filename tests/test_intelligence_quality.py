@@ -510,3 +510,313 @@ async def test_ask_no_matching_repos_answer_still_returned(client_no_db: AsyncCl
     data = response.json()
     assert data["sources"] == [], "Expected empty sources list when no repos match"
     assert len(data["answer"].strip()) > 0, "Answer must still be present even with no matching repos"
+
+
+# ---------------------------------------------------------------------------
+# KAN-166: /ask negation post-filter — close P1 #365 self-match
+#
+# When a user asks "alternatives to X", the retrieval layer can return X
+# itself as the top match. PR #439 added the `forbidden_repos` golden-set
+# primitive; KAN-166 adds the structural enforcement on the handler side.
+# ---------------------------------------------------------------------------
+
+# --- Module-level helper unit tests (no DB / no HTTP) ----------------------
+
+def test_extract_negation_token_alternatives_to():
+    from app.routers.intelligence import _extract_negation_token
+    assert _extract_negation_token("alternatives to pinecone") == "pinecone"
+    assert _extract_negation_token("vector database alternatives to pinecone") == "pinecone"
+    assert _extract_negation_token("Alternatives To Pinecone") == "pinecone"
+
+
+def test_extract_negation_token_similar_to():
+    from app.routers.intelligence import _extract_negation_token
+    assert _extract_negation_token("repos similar to langchain") == "langchain"
+    assert _extract_negation_token("tools comparable to weaviate") == "weaviate"
+
+
+def test_extract_negation_token_instead_of():
+    from app.routers.intelligence import _extract_negation_token
+    assert _extract_negation_token("a vector db instead of pinecone") == "pinecone"
+
+
+def test_extract_negation_token_owner_slash_name_normalized():
+    from app.routers.intelligence import _extract_negation_token
+    # "alternatives to pinecone-io/pinecone" should normalize to the repo name
+    assert _extract_negation_token("alternatives to pinecone-io/pinecone") == "pinecone"
+
+
+def test_extract_negation_token_short_token_returns_none():
+    """Short tokens (< 3 chars) like "ai" or "ml" must NOT trigger the filter."""
+    from app.routers.intelligence import _extract_negation_token
+    assert _extract_negation_token("alternatives to ai") is None
+    assert _extract_negation_token("alternatives to ml") is None
+
+
+def test_extract_negation_token_no_negation_returns_none():
+    from app.routers.intelligence import _extract_negation_token
+    assert _extract_negation_token("What is PyTorch used for?") is None
+    assert _extract_negation_token("show me python libraries") is None
+    assert _extract_negation_token("") is None
+    assert _extract_negation_token(None) is None  # type: ignore[arg-type]
+
+
+def test_source_matches_negated_token_pinecone_variants():
+    from app.routers.intelligence import _source_matches_negated_token
+    # Direct name match
+    assert _source_matches_negated_token(
+        {"name": "pinecone", "owner": "pinecone-io", "forked_from": None},
+        "pinecone",
+    ) is True
+    # Vendor-prefixed name (the canonical #365 case)
+    assert _source_matches_negated_token(
+        {"name": "pinecone-python-client", "owner": "pinecone-io", "forked_from": None},
+        "pinecone",
+    ) is True
+
+
+def test_source_matches_negated_token_does_not_overmatch():
+    """Word-boundary alignment — token "ai" inside "openai" should NOT match.
+
+    (Belt-and-suspenders: short-token guard already excludes 'ai', but the
+    matcher itself should also be conservative so that future relaxations of
+    the min-length cap don't accidentally over-filter.)
+    """
+    from app.routers.intelligence import _source_matches_negated_token
+    # "ai" is below MIN_LEN, but even if forced through, "openai" should not
+    # match because of word boundaries — assert via a longer non-matching pair.
+    assert _source_matches_negated_token(
+        {"name": "weaviate", "owner": "weaviate", "forked_from": None},
+        "pinecone",
+    ) is False
+    assert _source_matches_negated_token(
+        {"name": "qdrant", "owner": "qdrant", "forked_from": None},
+        "pinecone",
+    ) is False
+
+
+def test_apply_negation_filter_no_token_is_noop():
+    from app.routers.intelligence import _apply_negation_filter
+    sources = [{"name": "x", "owner": "y", "forked_from": None}]
+    assert _apply_negation_filter(sources, None) == sources
+    assert _apply_negation_filter(sources, "") == sources
+
+
+def test_apply_negation_filter_drops_self_match_keeps_others():
+    from app.routers.intelligence import _apply_negation_filter
+    sources = [
+        {"name": "pinecone-python-client", "owner": "pinecone-io", "forked_from": None},
+        {"name": "weaviate", "owner": "weaviate", "forked_from": None},
+        {"name": "qdrant", "owner": "qdrant", "forked_from": None},
+    ]
+    kept = _apply_negation_filter(sources, "pinecone")
+    kept_names = [s["name"] for s in kept]
+    assert "pinecone-python-client" not in kept_names
+    assert "weaviate" in kept_names
+    assert "qdrant" in kept_names
+
+
+# --- End-to-end /ask handler tests with mocked DB rows ---------------------
+
+# Negation-filter fixture rows: pinecone (the to-be-dropped) + 3 alternatives.
+NEGATION_ROWS = [
+    _make_db_row(
+        repo_id=str(uuid.uuid4()),
+        name="pinecone-python-client",
+        owner="pinecone-io",
+        forked_from="pinecone-io/pinecone-python-client",
+        description="Official Python client for Pinecone vector database",
+        problem_solved="Vector storage and similarity search via managed service",
+        similarity=0.95,
+        stars=2500,
+        integration_tags=["vector-db", "managed", "saas"],
+    ),
+    _make_db_row(
+        repo_id=str(uuid.uuid4()),
+        name="weaviate",
+        owner="weaviate",
+        forked_from="weaviate/weaviate",
+        description="Open-source vector database",
+        problem_solved="Self-hosted vector DB with hybrid search",
+        similarity=0.88,
+        stars=12000,
+        integration_tags=["vector-db", "open-source"],
+    ),
+    _make_db_row(
+        repo_id=str(uuid.uuid4()),
+        name="qdrant",
+        owner="qdrant",
+        forked_from="qdrant/qdrant",
+        description="High-performance vector similarity search engine",
+        problem_solved="Rust-based vector DB with payload filtering",
+        similarity=0.86,
+        stars=20000,
+        integration_tags=["vector-db", "rust"],
+    ),
+    _make_db_row(
+        repo_id=str(uuid.uuid4()),
+        name="chroma",
+        owner="chroma-core",
+        forked_from="chroma-core/chroma",
+        description="AI-native embedding database",
+        problem_solved="Lightweight local vector store for prototyping RAG apps",
+        similarity=0.84,
+        stars=17000,
+        integration_tags=["vector-db", "embeddings"],
+    ),
+]
+
+
+@pytest.mark.asyncio
+async def test_ask_negation_drops_self_match(client_no_db: AsyncClient):
+    """KAN-166: 'alternatives to pinecone' must NOT return pinecone in sources."""
+    from app.main import app
+    from app.database import get_db
+
+    _, override = _override_db(NEGATION_ROWS)
+    app.dependency_overrides[get_db] = override
+
+    with (
+        _patch_embedding_model(),
+        _patch_anthropic_key(),
+        _patch_anthropic(),
+        _patch_log_query(),
+        _patch_create_task(),
+    ):
+        try:
+            response = await client_no_db.post(
+                "/intelligence/ask",
+                json={"question": "vector database alternatives to pinecone"},
+            )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 200, response.text
+    sources = response.json()["sources"]
+    # Hard assertion: NO source whose name lowercased contains "pinecone".
+    for s in sources:
+        full = f"{(s.get('owner') or '').lower()}/{(s.get('name') or '').lower()}"
+        assert "pinecone" not in full, (
+            f"KAN-166 regression: pinecone leaked into sources as {full!r}"
+        )
+
+
+@pytest.mark.asyncio
+async def test_ask_negation_preserves_non_match(client_no_db: AsyncClient):
+    """KAN-166: vector-db alternatives that don't match the negated token stay."""
+    from app.main import app
+    from app.database import get_db
+
+    _, override = _override_db(NEGATION_ROWS)
+    app.dependency_overrides[get_db] = override
+
+    with (
+        _patch_embedding_model(),
+        _patch_anthropic_key(),
+        _patch_anthropic(),
+        _patch_log_query(),
+        _patch_create_task(),
+    ):
+        try:
+            response = await client_no_db.post(
+                "/intelligence/ask",
+                json={"question": "vector database alternatives to pinecone"},
+            )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 200, response.text
+    source_names = {(s.get("name") or "").lower() for s in response.json()["sources"]}
+    # Three alternatives must survive — they're the actual answer.
+    assert "weaviate" in source_names
+    assert "qdrant" in source_names
+    assert "chroma" in source_names
+
+
+@pytest.mark.asyncio
+async def test_ask_negation_short_token_skipped(client_no_db: AsyncClient):
+    """KAN-166: 'alternatives to ai' has a short token — filter must NOT fire."""
+    from app.main import app
+    from app.database import get_db
+
+    # Use a fixture that contains "ai" as a substring of multiple repos so we
+    # can prove they all stay (filter is a no-op for sub-3-char tokens).
+    ai_rows = [
+        _make_db_row(
+            repo_id=str(uuid.uuid4()),
+            name="openai-cookbook",
+            owner="openai",
+            forked_from="openai/openai-cookbook",
+            description="Examples and guides for using the OpenAI API",
+            problem_solved="Reference implementations for LLM workflows",
+            similarity=0.91,
+            stars=55000,
+            integration_tags=["llm", "examples"],
+        ),
+        _make_db_row(
+            repo_id=str(uuid.uuid4()),
+            name="langchain",
+            owner="langchain-ai",
+            forked_from="langchain-ai/langchain",
+            description="Build context-aware reasoning applications",
+            problem_solved="Orchestrating LLMs with tools and memory",
+            similarity=0.88,
+            stars=85000,
+            integration_tags=["llm", "agents"],
+        ),
+    ]
+    _, override = _override_db(ai_rows)
+    app.dependency_overrides[get_db] = override
+
+    with (
+        _patch_embedding_model(),
+        _patch_anthropic_key(),
+        _patch_anthropic(),
+        _patch_log_query(),
+        _patch_create_task(),
+    ):
+        try:
+            response = await client_no_db.post(
+                "/intelligence/ask",
+                json={"question": "alternatives to ai"},
+            )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 200, response.text
+    source_names = {(s.get("name") or "").lower() for s in response.json()["sources"]}
+    # The short-token guard skipped the filter — both repos remain.
+    assert "openai-cookbook" in source_names
+    assert "langchain" in source_names
+
+
+@pytest.mark.asyncio
+async def test_ask_no_negation_no_filter(client_no_db: AsyncClient):
+    """KAN-166: a non-negation query keeps every retrieved source intact."""
+    from app.main import app
+    from app.database import get_db
+
+    _, override = _override_db(NEGATION_ROWS)
+    app.dependency_overrides[get_db] = override
+
+    with (
+        _patch_embedding_model(),
+        _patch_anthropic_key(),
+        _patch_anthropic(),
+        _patch_log_query(),
+        _patch_create_task(),
+    ):
+        try:
+            response = await client_no_db.post(
+                "/intelligence/ask",
+                json={"question": "What are the best vector databases?"},
+            )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 200, response.text
+    source_names = {(s.get("name") or "").lower() for s in response.json()["sources"]}
+    # No negation phrase in the question → pinecone must remain in sources.
+    assert "pinecone-python-client" in source_names
+    # And the others stay too.
+    assert "weaviate" in source_names
