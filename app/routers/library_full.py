@@ -694,10 +694,15 @@ async def library_full(
     logger.info(f"Building /library/full page={page} page_size={page_size}...")
 
     # SECURITY: Only return public repos — is_private=false enforced inside _fetch_page_repos
-    with sentry_sdk.start_span(op="db.query", name="library_full.fetch_page_repos"):
-        enriched_repos, total = await _fetch_page_repos(db, page=page, page_size=page_size)
-    with sentry_sdk.start_span(op="db.query", name="library_full.fetch_aggregates"):
-        aggregates = await _fetch_aggregates(db)
+    # Note: Sentry's SqlalchemyIntegration auto-instruments each db.execute call,
+    # so we deliberately do NOT wrap these awaits in start_span() — duplicate
+    # spans interact with asyncpg + pytest-asyncio's loop on Python 3.12 in a
+    # way that perturbs sort-tie ordering downstream
+    # (test_library_full_excludes_private_repos_across_all_pages, KAN-190).
+    # The auto-spans give us the same db.query timeline in Sentry without the
+    # double-instrumentation hazard.
+    enriched_repos, total = await _fetch_page_repos(db, page=page, page_size=page_size)
+    aggregates = await _fetch_aggregates(db)
 
     response = {
         "username": "perditioinc",

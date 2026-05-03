@@ -3180,14 +3180,15 @@ async def _run_query(
             tokens_used={"input_tokens": 0, "output_tokens": 0},
         )
 
-    # KAN-190: span over the prepare-query phase (smart-route + embed + DB
-    # search + cache lookup). Sub-phase OTel spans inside _prepare_query stay
-    # in OTel; this Sentry span gives a single rolled-up latency number per
-    # request in the Sentry trace timeline.
-    with sentry_sdk.start_span(op="db.query", name="ask.prepare_query"):
-        qctx = await _prepare_query(
-            req.question, effective_session_id, req.top_k, db, token_hash=token_hash
-        )
+    # KAN-190: deliberately NOT wrapping _prepare_query in
+    # sentry_sdk.start_span — the inner _tracer.start_as_current_span() OTel
+    # spans (smart_route_check, embedding_generation, pgvector_search) plus
+    # Sentry's SqlalchemyIntegration auto-spans give the per-phase latency
+    # without manual wrapping. Wrapping the outer await triggered a
+    # Python-3.12 ordering regression on /library/full (KAN-190).
+    qctx = await _prepare_query(
+        req.question, effective_session_id, req.top_k, db, token_hash=token_hash
+    )
 
     # --- Off-topic regex check (post-retrieval) ---
     # Only fires when the embedding store has NO strong evidence for the topic.

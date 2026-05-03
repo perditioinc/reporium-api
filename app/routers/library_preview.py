@@ -325,10 +325,12 @@ async def library_preview(
 
     # Count for `totalRepos` — public corpus size, independent of limit/category.
     # This matches /library/full so the frontend can show "Showing N of M repos".
-    with sentry_sdk.start_span(op="db.query", name="library_preview.count_public"):
-        total = (await db.execute(
-            text("SELECT COUNT(*) FROM repos WHERE is_private = false")
-        )).scalar() or 0
+    # Note: deliberately NOT wrapping db.execute in sentry_sdk.start_span — the
+    # SqlalchemyIntegration auto-spans cover this, and double-wrapping triggered
+    # a Python-3.12 ordering regression on /library/full pagination (KAN-190).
+    total = (await db.execute(
+        text("SELECT COUNT(*) FROM repos WHERE is_private = false")
+    )).scalar() or 0
 
     # KAN-179: build the column projection list dynamically. Default columns
     # mirror the original KAN-151 SELECT exactly; extension columns appended
@@ -373,10 +375,9 @@ async def library_preview(
     if category:
         params["cat"] = category
 
-    with sentry_sdk.start_span(op="db.query", name="library_preview.fetch_repos"):
-        result = await db.execute(text(sql_main), params)
-        rows = result.fetchall()
-        columns = list(result.keys())
+    result = await db.execute(text(sql_main), params)
+    rows = result.fetchall()
+    columns = list(result.keys())
 
     if not rows:
         body = {
@@ -397,11 +398,10 @@ async def library_preview(
     # pattern as `_fetch_page_repos` to avoid asyncpg's `::uuid[]` parser quirk.
     # We over-fetch tags and trim per-repo in Python (cheap; ~1.8K rows in the
     # worst case at limit=500). Avoids per-repo subqueries / window functions.
-    with sentry_sdk.start_span(op="db.query", name="library_preview.fetch_tags"):
-        tag_result = await db.execute(text(
-            "SELECT repo_id, tag FROM repo_tags "
-            "WHERE repo_id = ANY(CAST(:ids AS uuid[]))"
-        ), {"ids": page_ids})
+    tag_result = await db.execute(text(
+        "SELECT repo_id, tag FROM repo_tags "
+        "WHERE repo_id = ANY(CAST(:ids AS uuid[]))"
+    ), {"ids": page_ids})
     tags_by_repo: dict[str, list[str]] = defaultdict(list)
     for tag_row in tag_result.fetchall():
         rid = str(tag_row.repo_id)
