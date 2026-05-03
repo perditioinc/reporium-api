@@ -2,7 +2,7 @@ import hashlib
 import json
 import math
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 from sqlalchemy import func, select, or_, cast, Text
@@ -432,8 +432,19 @@ async def get_repo(name: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
 
 
 @router.get("/repos/{owner}/{repo}", response_model=RepoDetail)
-async def get_repo_by_owner(owner: str, repo: str, db: AsyncSession = Depends(get_db)) -> RepoDetail:
+async def get_repo_by_owner(
+    owner: str,
+    repo: str,
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+) -> RepoDetail:
     """Get a single repo by owner/name."""
+    # KAN-180: extend KAN-170 Cache-Control pattern (s-maxage + swr) to repo detail.
+    # Read-only public-data fetch keyed by owner/name; CDN edge can re-serve the
+    # detail payload for 5 min before revalidating. Browsers ignore s-maxage and
+    # still hit origin every visit, so freshness on first paint is unaffected.
+    response.headers["Cache-Control"] = "public, s-maxage=300, stale-while-revalidate=60"
+
     stmt = (
         select(Repo)
         .where(Repo.owner == owner, Repo.name == repo, public_repo_filter())
