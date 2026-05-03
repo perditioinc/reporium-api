@@ -269,11 +269,11 @@ async def _seed_enriched_repos(count: int, *, fresh: bool = True) -> list[str]:
                     INSERT INTO repos (
                         id, owner, name, github_url, primary_category,
                         integration_tags, readme_summary, is_private,
-                        created_at, updated_at
+                        updated_at
                     ) VALUES (
                         :id, :owner, :name, :url, :pc,
                         CAST(:tags AS JSONB), :summary, false,
-                        NOW(), :updated_at
+                        :updated_at
                     )
                     """
                 ),
