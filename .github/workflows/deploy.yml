@@ -266,35 +266,60 @@ jobs:
           INGEST_API_KEY: ${{ secrets.INGESTION_API_KEY }}
           ADMIN_API_KEY: ${{ secrets.ADMIN_API_KEY }}
         run: |
+          # KAN-218 follow-up: previous version used `curl -sf ... && echo "X
+          # triggered" || echo "X skipped"` which silently masks any failure
+          # (curl exits non-zero, the `||` always wins, workflow continues
+          # green even when the POST returned 5xx or timed out). That's the
+          # exact silent-failure pattern that hid the forksync 9-day outage
+          # surfaced 2026-05-03 (KAN-218). Same protocol applied here:
+          # capture HTTP status, emit ::warning:: annotation on non-2xx so
+          # the failure is visible in the GH Actions UI without blocking the
+          # deploy (these are best-effort post-deploy admin endpoints, NOT
+          # gates — service is already live before this step runs).
+          set +e  # don't abort on first non-zero — collect all warnings
+          fail_count=0
+
+          probe() {
+            local label="$1"; local url="$2"; shift 2
+            local body
+            body=$(mktemp)
+            local code
+            code=$(curl -s -o "$body" -w "%{http_code}" "$@" "$url")
+            local size; size=$(wc -c < "$body")
+            if [ "$code" -ge 200 ] && [ "$code" -lt 300 ]; then
+              echo "  $label: HTTP $code (${size}B)"
+            else
+              echo "::warning::$label: HTTP $code — body: $(head -c 300 "$body")"
+              fail_count=$((fail_count+1))
+            fi
+            rm -f "$body"
+          }
+
           # Wait for Cloud Run to be healthy
           sleep 15
-          # Rebuild taxonomy_values from repo_taxonomy (fast batch INSERT)
-          curl -sf -X POST "${API_URL}/taxonomy/rebuild" \
-            -H "Authorization: Bearer ${INGEST_API_KEY}" \
-            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -d '{}' --max-time 60 \
-            && echo "Taxonomy rebuild triggered" || echo "Taxonomy rebuild skipped"
-          # Re-derive categories from current tags (idempotent)
-          curl -sf -X POST "${API_URL}/admin/backfill/categories" \
-            -H "Authorization: Bearer ${INGEST_API_KEY}" \
-            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
-            -H "Content-Type: application/json" \
-            --max-time 60 \
-            && echo "Category backfill triggered" || echo "Category backfill skipped"
-          # Backfill embeddings (background — don't block deploy)
-          curl -sf -X POST "${API_URL}/admin/embeddings/backfill" \
-            -H "Authorization: Bearer ${INGEST_API_KEY}" \
-            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
-            -H "Content-Type: application/json" \
-            --max-time 60 \
-            && echo "Embeddings backfill triggered" || echo "Embeddings backfill skipped"
-          # Bust graph edge cache so new typed-edge query is reflected immediately
-          curl -sf -X POST "${API_URL}/admin/cache/graph/invalidate" \
-            -H "X-Admin-Key: ${ADMIN_API_KEY}" \
-            -H "Content-Type: application/json" \
-            --max-time 30 \
-            && echo "Graph cache invalidated" || echo "Graph cache invalidation skipped"
+
+          probe "Taxonomy rebuild" "${API_URL}/taxonomy/rebuild" \
+            -X POST -H "Authorization: Bearer ${INGEST_API_KEY}" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" -H "Content-Type: application/json" \
+            -d '{}' --max-time 60
+
+          probe "Category backfill" "${API_URL}/admin/backfill/categories" \
+            -X POST -H "Authorization: Bearer ${INGEST_API_KEY}" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" -H "Content-Type: application/json" \
+            --max-time 60
+
+          probe "Embeddings backfill" "${API_URL}/admin/embeddings/backfill" \
+            -X POST -H "Authorization: Bearer ${INGEST_API_KEY}" \
+            -H "X-Admin-Key: ${ADMIN_API_KEY}" -H "Content-Type: application/json" \
+            --max-time 60
+
+          probe "Graph cache invalidate" "${API_URL}/admin/cache/graph/invalidate" \
+            -X POST -H "X-Admin-Key: ${ADMIN_API_KEY}" \
+            -H "Content-Type: application/json" --max-time 30
+
+          if [ "$fail_count" -gt 0 ]; then
+            echo "::warning::$fail_count of 4 post-deploy admin probes failed — see annotations above. Service is live but stale state may persist."
+          fi
 
       - name: Smoke test graph endpoint
         if: success()
