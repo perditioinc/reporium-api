@@ -23,7 +23,6 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
-import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from slowapi import Limiter
@@ -281,13 +280,6 @@ async def library_preview(
     See `.audit/2026-05-02/library-preview-endpoint-design.md` for the full
     design (response shape, sort options, projected Lighthouse delta).
     """
-    # KAN-190: rename Sentry transaction to a stable hot-path label
-    # ("library_preview") + tag with the cardinality-relevant query params so
-    # latency dashboards group by sort/limit/category instead of just URL.
-    sentry_sdk.get_current_scope().set_transaction_name("library_preview")
-    sentry_sdk.set_tag("library_preview.sort", sort)
-    sentry_sdk.set_tag("library_preview.has_category", category is not None)
-
     # KAN-179: validate include first so a malformed `?include=` 400s before
     # we touch Redis or DB. _parse_include itself raises HTTPException(400).
     include_tokens = _parse_include(include)
@@ -306,28 +298,19 @@ async def library_preview(
     include_key = ",".join(sorted(include_tokens)) if include_tokens else "none"
     redis_key = f"library:preview:{sort}:{limit}:{cat_key}:{include_key}"
 
-    # KAN-190: cache lookup span — surfaces Redis latency separately from DB
-    # in the Sentry trace, so a slow Redis hit (rare but happens) doesn't
-    # masquerade as a slow query.
-    with sentry_sdk.start_span(op="cache.get", name="library_preview.redis"):
-        cached = await redis_cache.get(redis_key)
+    cached = await redis_cache.get(redis_key)
     if cached is not None:
         logger.info(
             "Redis hit /library/preview sort=%s limit=%d category=%s include=%s",
             sort, limit, cat_key, include_key,
         )
-        sentry_sdk.set_tag("library_preview.cache_hit", True)
         return cached
 
-    sentry_sdk.set_tag("library_preview.cache_hit", False)
     t0 = time.monotonic()
     order_by = _SORT_CLAUSES[sort]
 
     # Count for `totalRepos` — public corpus size, independent of limit/category.
     # This matches /library/full so the frontend can show "Showing N of M repos".
-    # Note: deliberately NOT wrapping db.execute in sentry_sdk.start_span — the
-    # SqlalchemyIntegration auto-spans cover this, and double-wrapping triggered
-    # a Python-3.12 ordering regression on /library/full pagination (KAN-190).
     total = (await db.execute(
         text("SELECT COUNT(*) FROM repos WHERE is_private = false")
     )).scalar() or 0
@@ -428,6 +411,5 @@ async def library_preview(
         sort, limit, cat_key, include_key, len(repos), elapsed_ms,
     )
 
-    with sentry_sdk.start_span(op="cache.set", name="library_preview.redis_write"):
-        await redis_cache.set(redis_key, body, ttl=CACHE_TTL)
+    await redis_cache.set(redis_key, body, ttl=CACHE_TTL)
     return body

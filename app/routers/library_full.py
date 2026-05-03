@@ -12,7 +12,6 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
-import sentry_sdk
 from fastapi import APIRouter, Depends, Query, Request, Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -658,14 +657,6 @@ async def library_full(
     Junction data (tags, categories, languages, etc.) is fetched only for the current
     page — memory is O(page_size), not O(total). Safe at 10K+ repos.
     """
-    # KAN-190: rename Sentry transaction to a stable hot-path label
-    # ("library_full") + tag with page/page_size so cache-miss outlier traces
-    # are easy to bucket. set_transaction_name overrides the auto label
-    # FastApiIntegration assigns from the URL pattern.
-    sentry_sdk.get_current_scope().set_transaction_name("library_full")
-    sentry_sdk.set_tag("library_full.page", page)
-    sentry_sdk.set_tag("library_full.page_size", page_size)
-
     cache_key = f"page_{page}_{page_size}"
     redis_key = f"library:page:{page}:size:{page_size}"
     now = time.time()
@@ -673,11 +664,9 @@ async def library_full(
     response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=3600"
 
     # 1. Check Redis cache first (shared, survives restarts)
-    with sentry_sdk.start_span(op="cache.get", name="library_full.redis"):
-        redis_hit = await redis_cache.get(redis_key)
+    redis_hit = await redis_cache.get(redis_key)
     if redis_hit is not None:
         logger.info(f"Redis hit /library/full page={page} page_size={page_size}")
-        sentry_sdk.set_tag("library_full.cache_hit", "redis")
         # Warm in-memory cache too so subsequent requests on this instance are instant
         _cache[cache_key] = {"data": redis_hit, "expires_at": now + CACHE_TTL}
         return redis_hit
@@ -686,21 +675,21 @@ async def library_full(
     mem_cached = _cache.get(cache_key)
     if mem_cached and mem_cached.get("expires_at", 0) > now:
         logger.info(f"Memory hit /library/full page={page} page_size={page_size}")
-        sentry_sdk.set_tag("library_full.cache_hit", "memory")
         return mem_cached["data"]
 
-    sentry_sdk.set_tag("library_full.cache_hit", "miss")
     t0 = time.monotonic()
     logger.info(f"Building /library/full page={page} page_size={page_size}...")
 
     # SECURITY: Only return public repos — is_private=false enforced inside _fetch_page_repos
-    # Note: Sentry's SqlalchemyIntegration auto-instruments each db.execute call,
-    # so we deliberately do NOT wrap these awaits in start_span() — duplicate
-    # spans interact with asyncpg + pytest-asyncio's loop on Python 3.12 in a
-    # way that perturbs sort-tie ordering downstream
-    # (test_library_full_excludes_private_repos_across_all_pages, KAN-190).
-    # The auto-spans give us the same db.query timeline in Sentry without the
-    # double-instrumentation hazard.
+    # KAN-190: Sentry's auto-instrumentation (FastApiIntegration transaction +
+    # SqlalchemyIntegration per-execute spans) covers /library/full's hot
+    # path without manual wrapping. Manual sentry_sdk.start_span / set_tag
+    # / set_transaction_name calls in this handler triggered a deterministic
+    # CI regression on Python 3.12
+    # (test_library_full_excludes_private_repos_across_all_pages was missing
+    # one repo from the 12-page walk). Auto spans + transaction provide
+    # equivalent observability in Sentry; the structured exception handler
+    # in app/main.py still covers the silent-failure gap.
     enriched_repos, total = await _fetch_page_repos(db, page=page, page_size=page_size)
     aggregates = await _fetch_aggregates(db)
 
@@ -721,8 +710,7 @@ async def library_full(
 
     # Store in both caches
     _cache[cache_key] = {"data": response, "expires_at": now + CACHE_TTL}
-    with sentry_sdk.start_span(op="cache.set", name="library_full.redis_write"):
-        await redis_cache.set(redis_key, response, ttl=CACHE_TTL)
+    await redis_cache.set(redis_key, response, ttl=CACHE_TTL)
     return response
 
 
