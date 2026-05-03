@@ -69,6 +69,9 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
+import hashlib
+import json
+import logging
 import os
 import uuid
 from pathlib import Path
@@ -80,6 +83,8 @@ import pytest_asyncio
 import yaml
 from httpx import ASGITransport, AsyncClient
 
+logger = logging.getLogger(__name__)
+
 # KAN-146: contextvar carries the per-coroutine mock DB so a single
 # process-global `dependency_overrides[get_db]` can route correctly under
 # `asyncio.gather`. Without this, the last writer of `dependency_overrides`
@@ -87,6 +92,126 @@ from httpx import ASGITransport, AsyncClient
 _CURRENT_MOCK_DB: contextvars.ContextVar[Any] = contextvars.ContextVar(
     "_CURRENT_MOCK_DB", default=None
 )
+
+
+# ---------------------------------------------------------------------------
+# KAN-176: Redis evaluator cache (24h TTL). Skip Anthropic on cache hit.
+# ---------------------------------------------------------------------------
+# Each `/intelligence/ask` invocation in the gate triggers ~3-4 Haiku calls
+# inside the API (smart-route probe, semantic-cache embedding, main answer,
+# optional judge). Caching the *response* keyed by `(model, entry, question)`
+# lets identical re-runs (same fixture set, same question text) skip the
+# Anthropic chain entirely.
+#
+# Cache scope:
+#   - Hit only when REDIS_URL is set and the runner can reach it. CI runners
+#     in `ask-quality-gate.yml` currently set REDIS_URL="" so the wrapper
+#     degrades to a pure pass-through (zero behaviour change). To realize the
+#     cost reduction, point CI at a real Redis (or Upstash) instance.
+#   - TTL is 24h: shorter than fixture-edit cadence (intentional invalidation
+#     comes from changing the entry yaml, which changes the hash anyway).
+#   - Key shape: `ask_gate:eval:<sha256[:16]>`. Truncated to keep keys short
+#     while leaving 64 bits of collision resistance — fine for ~tens of
+#     entries.
+#
+# Cache key model component: defaults to "router" because the API picks
+# Haiku vs Sonnet *per question* via `_COMPLEX_PATTERNS`. Override with
+# `ASK_GATE_CACHE_MODEL` to bust the cache when bumping model versions
+# (e.g. set to `claude-haiku-4-6` when migrating).
+_ASK_GATE_CACHE_PREFIX = "ask_gate:eval:"
+_ASK_GATE_CACHE_TTL_SECONDS = 24 * 3600  # 24h
+
+
+def _evaluator_cache_key(model: str, entry: dict[str, Any], prompt: str) -> str:
+    """SHA-256 hash of (model, entry-yaml, prompt) — first 16 hex chars."""
+    h = hashlib.sha256()
+    h.update(model.encode("utf-8"))
+    h.update(b"|")
+    # `default=str` so any non-JSON-serializable fixture value (Path, set, …)
+    # falls back to repr() rather than blowing up the test before the API call.
+    h.update(json.dumps(entry, sort_keys=True, default=str).encode("utf-8"))
+    h.update(b"|")
+    h.update(prompt.encode("utf-8"))
+    return f"{_ASK_GATE_CACHE_PREFIX}{h.hexdigest()[:16]}"
+
+
+def _cache_model_id() -> str:
+    """Identifier baked into the cache key — flip to invalidate on model swap."""
+    return os.getenv("ASK_GATE_CACHE_MODEL", "router").strip() or "router"
+
+
+class _CachedResponse:
+    """Drop-in stand-in for httpx.Response when serving from cache.
+
+    `_run_one_entry` only reads `.status_code`, `.json()`, and `.text` from
+    the response object, so we mimic just that surface.
+    """
+
+    __slots__ = ("status_code", "_payload", "text")
+
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self.status_code = 200
+        self._payload = payload
+        # `.text` is consulted only on the error path (status != 200), but
+        # populate it defensively in case future code reads it on success.
+        self.text = json.dumps(payload)
+
+    def json(self) -> dict[str, Any]:
+        return self._payload
+
+
+async def _ask_with_cache(
+    client: AsyncClient,
+    model: str,
+    entry: dict[str, Any],
+    question: str,
+) -> Any:
+    """POST /intelligence/ask, consulting the Redis eval cache first.
+
+    Returns either an httpx.Response (cache miss / Redis unavailable) or a
+    `_CachedResponse` (cache hit). Both expose `.status_code`, `.json()`,
+    and `.text` so the caller is agnostic.
+
+    Cache writes happen only on 200 OK responses — error responses are
+    intentionally re-issued every run so transient API failures don't get
+    pinned for 24h.
+    """
+    key = _evaluator_cache_key(model, entry, question)
+
+    # Import lazily so test collection doesn't require Redis libs to be
+    # importable on every machine.
+    try:
+        from app.cache_redis import redis_cache
+    except Exception:
+        redis_cache = None  # type: ignore[assignment]
+
+    if redis_cache is not None:
+        try:
+            cached = await redis_cache.get(key)
+        except Exception:
+            cached = None
+        if cached is not None:
+            logger.info("ask_gate.cache_hit key=%s", key)
+            return _CachedResponse(cached)
+
+    response = await client.post(
+        "/intelligence/ask",
+        json={"question": question},
+    )
+
+    if redis_cache is not None and response.status_code == 200:
+        try:
+            await redis_cache.set(
+                key,
+                response.json(),
+                ttl=_ASK_GATE_CACHE_TTL_SECONDS,
+            )
+            logger.info("ask_gate.cache_write key=%s", key)
+        except Exception:
+            # Cache write must never break the gate.
+            logger.warning("ask_gate.cache_write_failed key=%s", key, exc_info=True)
+
+    return response
 
 pytestmark = [
     pytest.mark.skipif(
@@ -316,9 +441,16 @@ async def _run_one_entry(
     _CURRENT_MOCK_DB.set(mock_db)
 
     async with sem:
-        response = await client.post(
-            "/intelligence/ask",
-            json={"question": question},
+        # KAN-176: Redis-backed eval cache (24h TTL). Cache hit short-circuits
+        # the HTTP call entirely, skipping the ~3-4 Anthropic calls fanned out
+        # inside `/intelligence/ask`. Falls through to a real POST when Redis
+        # is unset/unreachable, preserving exact prior behaviour for
+        # REDIS_URL="" runners.
+        response = await _ask_with_cache(
+            client,
+            _cache_model_id(),
+            entry,
+            question,
         )
 
     result: dict[str, Any] = {
