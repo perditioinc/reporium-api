@@ -97,3 +97,45 @@ async def test_get_trends_report_returns_sorted_report(monkeypatch):
     assert payload["trending"][0]["repoCount"] == 12
     assert payload["trending"][0]["changePercent"] == 200.0
     assert payload["emerging"][0]["name"] == "Agents"
+
+
+# ---------------------------------------------------------------------------
+# KAN-180: Cache-Control header on /trends/report
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_trends_report_response_has_cache_control(monkeypatch):
+    """KAN-180: /trends/report must carry public, s-maxage=300, swr=60.
+
+    Extends the KAN-170 pattern (originally only on /library/preview) to a
+    second read-only public-data endpoint. The header is set unconditionally
+    so it appears on both miss-path and cache-hit responses.
+    """
+    async def fake_get_db():
+        yield FakeTrendSession()
+
+    async def fake_cache_get(_key):
+        return None
+
+    async def fake_cache_set(_key, _value, ttl=None):
+        return None
+
+    app.dependency_overrides[get_db] = fake_get_db
+    monkeypatch.setattr(trends_router.cache, "get", fake_cache_get)
+    monkeypatch.setattr(trends_router.cache, "set", fake_cache_set)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/trends/report")
+
+    app.dependency_overrides.clear()
+
+    assert response.status_code == 200
+    cc = response.headers.get("cache-control", "")
+    assert "public" in cc, f"KAN-180: expected 'public' in Cache-Control, got: {cc!r}"
+    assert "s-maxage=300" in cc, (
+        f"KAN-180: expected s-maxage=300 in Cache-Control, got: {cc!r}"
+    )
+    assert "stale-while-revalidate=60" in cc, (
+        f"KAN-180: expected stale-while-revalidate=60 in Cache-Control, got: {cc!r}"
+    )

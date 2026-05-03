@@ -102,7 +102,17 @@ async def get_trends(response: Response, db: AsyncSession = Depends(get_db)) -> 
 
 
 @router.get("/trends/report", response_model=TrendReportOut)
-async def get_trends_report(db: AsyncSession = Depends(get_db)) -> TrendReportOut:
+async def get_trends_report(
+    response: Response,
+    db: AsyncSession = Depends(get_db),
+) -> TrendReportOut:
+    # KAN-180: extend KAN-170 Cache-Control pattern (s-maxage + swr) to /trends/report.
+    # Read-only public-data fetch with 5-min Redis TTL; aligning the CDN window with
+    # the cache TTL means edge caches see a fresh report no later than ingestion's
+    # next refresh. Header is set unconditionally (before cache check) so cache hits
+    # also carry the directive.
+    response.headers["Cache-Control"] = "public, s-maxage=300, stale-while-revalidate=60"
+
     cached = await cache.get("trends:report")
     if cached:
         return TrendReportOut(**cached)
