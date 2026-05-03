@@ -128,3 +128,33 @@ async def test_repo_detail_includes_stargazers_count(client: AsyncClient):
     data = response.json()
     assert "stargazers_count" in data
     assert data["stargazers_count"] == 42
+
+
+# ---------------------------------------------------------------------------
+# KAN-180: Cache-Control header on /repos/{owner}/{name}
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_repos_detail_response_has_cache_control(client: AsyncClient):
+    """KAN-180: /repos/{owner}/{name} must carry public, s-maxage=300, swr=60.
+
+    Extends the KAN-170 pattern (originally only on /library/preview) to repo
+    detail by owner/name. Set unconditionally so CDN edges can cache the
+    response for 5 min while browsers still revalidate on every visit.
+    """
+    await client.post("/ingest/repos", json=[TEST_REPO_FIXTURE], headers=AUTH_HEADERS)
+
+    owner = TEST_REPO_FIXTURE["owner"]
+    name = TEST_REPO_FIXTURE["name"]
+    response = await client.get(f"/repos/{owner}/{name}")
+    assert response.status_code == 200
+
+    cc = response.headers.get("cache-control", "")
+    assert "public" in cc, f"KAN-180: expected 'public' in Cache-Control, got: {cc!r}"
+    assert "s-maxage=300" in cc, (
+        f"KAN-180: expected s-maxage=300 in Cache-Control, got: {cc!r}"
+    )
+    assert "stale-while-revalidate=60" in cc, (
+        f"KAN-180: expected stale-while-revalidate=60 in Cache-Control, got: {cc!r}"
+    )
