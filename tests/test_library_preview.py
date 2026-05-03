@@ -332,13 +332,34 @@ async def test_preview_cache_miss_writes_to_redis(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_preview_sets_cache_control_header(client: AsyncClient):
-    """public, max-age=300, stale-while-revalidate=3600 — per the design memo."""
+    """public, s-maxage=300, stale-while-revalidate=60 — per KAN-170.
+
+    s-maxage (shared/CDN caches only) replaces max-age so a future CDN /
+    Cloud LB in front of Cloud Run can edge-cache repeated requests.
+    Browsers ignore s-maxage and still revalidate every visit.
+    """
     resp = await client.get("/library/preview?limit=2")
     assert resp.status_code == 200
     cc = resp.headers.get("cache-control", "")
     assert "public" in cc
-    assert "max-age=300" in cc
-    assert "stale-while-revalidate=3600" in cc
+    assert "s-maxage=300" in cc
+    assert "stale-while-revalidate=60" in cc
+
+
+@pytest.mark.asyncio
+async def test_preview_response_has_cache_control(client: AsyncClient):
+    """KAN-170 explicit invariant: response carries s-maxage=300.
+
+    Asserted independently from the full directive string so a future swr
+    tweak doesn't accidentally regress the s-maxage signal that lets CDN
+    edges cache the response.
+    """
+    resp = await client.get("/library/preview?limit=2")
+    assert resp.status_code == 200
+    cc = resp.headers.get("cache-control", "")
+    assert "s-maxage=300" in cc, (
+        f"KAN-170: expected s-maxage=300 in Cache-Control, got: {cc!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
