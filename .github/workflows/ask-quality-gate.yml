@@ -2,8 +2,24 @@ name: Ask Quality Gate
 on:
   push:
     branches: [dev, main]
+    # Cost win: skip Anthropic-billed gate on doc/workflow-only changes.
+    # 7-entry slim gate ≈ ~28 Anthropic Haiku calls per run; at ~5 PRs/day
+    # the gate runs on noise PRs that don't touch ask logic. Per cost audit
+    # 4h-run 2026-04-30, this avoids ~30% of Haiku calls.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '.github/workflows/**'
+      - 'README*'
+      - 'LICENSE*'
   pull_request:
     branches: [dev, main]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '.github/workflows/**'
+      - 'README*'
+      - 'LICENSE*'
   workflow_dispatch:
 
 permissions:
