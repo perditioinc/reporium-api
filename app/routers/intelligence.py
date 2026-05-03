@@ -2718,6 +2718,13 @@ class QueryContext:
     t_embed_ms: float = 0.0
     t_search_ms: float = 0.0
     t_context_ms: float = 0.0
+    # KAN-169: when True, skip both Redis and semantic-cache lookup AND skip
+    # writing this query's response back to either cache. Closes the cache-hit
+    # gap left by KAN-166: the negation post-filter only runs on the live
+    # retrieval path, so cached entries created before the fix (or by a
+    # not-yet-categorized variant) could re-surface a self-match. Set when
+    # _extract_negation_token captures a token.
+    skip_cache: bool = False
 
 
 async def _prepare_query(
@@ -2762,25 +2769,47 @@ async def _prepare_query(
     # "What is an LLM?" and "what is a large language model" share a cache row.
     normalized_question = _normalize_question(question)
     redis_cache_key = f"llm_response:{hashlib.md5(normalized_question.encode()).hexdigest()}"
-    redis_cached = await cache.get(redis_cache_key)
-    if redis_cached is not None:
-        logger.info("ask: Redis cache hit for question")
-        return QueryContext(
-            sources=redis_cached.get("sources", []),
-            context_text="",
-            model=redis_cached.get("model", "redis-cache"),
-            session_history=[],
-            cache_result={
-                "answer": redis_cached["answer"],
-                "sources": redis_cached.get("sources", []),
-                "tokens_used": redis_cached.get("tokens_used", {"input": 0, "output": 0, "total": 0}),
-                "cache_source": "redis",
-                "cache_hit": True,
-            },
-            query_embedding=None,
-            route_label=None,
-            redis_cache_key=redis_cache_key,
+
+    # KAN-169: detect negation queries and bypass the cache. Closes the gap
+    # left by KAN-166: the negation post-filter runs on the live retrieval
+    # path only, so a cached entry written before the fix (or under a query
+    # variant that didn't trip the regex) can still surface a self-match on
+    # HIT. We:
+    #   - skip the Redis lookup AND the semantic-cache lookup below
+    #   - leave redis_cache_key empty so the handler's cache.set is gated off
+    #     by the existing `if qctx.redis_cache_key:` checks
+    #   - drop redis_cache_key from the QueryContext returned at the end so
+    #     this query's answer is never written back to Redis either
+    # Negation queries are a small fraction of traffic, so the cache-miss cost
+    # is negligible relative to the correctness win.
+    _negated_token_for_cache = _extract_negation_token(question)
+    skip_cache = _negated_token_for_cache is not None
+    if skip_cache:
+        logger.info(
+            "ask: cache bypass for negation query (token=%r)",
+            _negated_token_for_cache,
         )
+
+    if not skip_cache:
+        redis_cached = await cache.get(redis_cache_key)
+        if redis_cached is not None:
+            logger.info("ask: Redis cache hit for question")
+            return QueryContext(
+                sources=redis_cached.get("sources", []),
+                context_text="",
+                model=redis_cached.get("model", "redis-cache"),
+                session_history=[],
+                cache_result={
+                    "answer": redis_cached["answer"],
+                    "sources": redis_cached.get("sources", []),
+                    "tokens_used": redis_cached.get("tokens_used", {"input": 0, "output": 0, "total": 0}),
+                    "cache_source": "redis",
+                    "cache_hit": True,
+                },
+                query_embedding=None,
+                route_label=None,
+                redis_cache_key=redis_cache_key,
+            )
 
     t_smart = time.perf_counter()
 
@@ -2833,26 +2862,28 @@ async def _prepare_query(
             redis_cache_key=redis_cache_key,
         )
 
-    # 2. Semantic cache check
-    cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
-    if cached is not None:
-        cached_answer, cached_sources, cached_model = cached
-        return QueryContext(
-            sources=[s.model_dump() for s in cached_sources],
-            context_text="",
-            model=cached_model or "semantic-cache",
-            session_history=[],
-            cache_result={
-                "answer": cached_answer,
-                "sources": [s.model_dump() for s in cached_sources],
-                "tokens_used": {"input": 0, "output": 0, "total": 0},
-                "cache_source": "semantic",
-                "cache_hit": True,
-            },
-            query_embedding=query_embedding.tolist() if hasattr(query_embedding, 'tolist') else list(query_embedding),
-            route_label=None,
-            redis_cache_key=redis_cache_key,
-        )
+    # 2. Semantic cache check — KAN-169: skipped for negation queries; see
+    # the cache-bypass block above for rationale.
+    if not skip_cache:
+        cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
+        if cached is not None:
+            cached_answer, cached_sources, cached_model = cached
+            return QueryContext(
+                sources=[s.model_dump() for s in cached_sources],
+                context_text="",
+                model=cached_model or "semantic-cache",
+                session_history=[],
+                cache_result={
+                    "answer": cached_answer,
+                    "sources": [s.model_dump() for s in cached_sources],
+                    "tokens_used": {"input": 0, "output": 0, "total": 0},
+                    "cache_source": "semantic",
+                    "cache_hit": True,
+                },
+                query_embedding=query_embedding.tolist() if hasattr(query_embedding, 'tolist') else list(query_embedding),
+                route_label=None,
+                redis_cache_key=redis_cache_key,
+            )
 
     t_embed = time.perf_counter()
 
@@ -3064,6 +3095,13 @@ async def _prepare_query(
         (t_context - t0) * 1000,
     )
 
+    # KAN-169: when negation bypass is active, blank out redis_cache_key. The
+    # handler's cache writes are gated on `if qctx.redis_cache_key:`, so an
+    # empty string prevents this answer from being written back to Redis.
+    # Combined with skip_cache=True (which the handler also reads to suppress
+    # writing the embedding to query_log), this closes the semantic-cache
+    # write path too — preventing future negation-shaped queries from hitting
+    # a stale row.
     return QueryContext(
         sources=[{
             "name": r["name"],
@@ -3082,7 +3120,8 @@ async def _prepare_query(
         query_embedding=query_embedding.tolist() if hasattr(query_embedding, 'tolist') else list(query_embedding),
         route_label=None,
         embedding_candidates=len(scored),
-        redis_cache_key=redis_cache_key,
+        redis_cache_key="" if skip_cache else redis_cache_key,
+        skip_cache=skip_cache,
         t_smart_ms=(t_smart - t0) * 1000,
         t_embed_ms=(t_embed - t_smart) * 1000,
         t_search_ms=(t_search - t_embed) * 1000,
@@ -3393,7 +3432,13 @@ async def _run_query(
         "tokens_used": tokens_used,
         "model": qctx.model,
     }
-    if _negative:
+    # KAN-169: gate Redis writes on redis_cache_key; the negation-bypass path
+    # in _prepare_query clears the key so this query's response is never
+    # written back to the cache.
+    if not qctx.redis_cache_key:
+        if qctx.skip_cache:
+            logger.info("ask: skipping Redis cache write (negation bypass)")
+    elif _negative:
         _cache_payload["negative"] = True
         asyncio.create_task(cache.set(qctx.redis_cache_key, _cache_payload, ttl=60)).add_done_callback(_task_done_callback)
         logger.info("ask: negative-cached low-quality answer (len=%d)", len(answer or ""))
@@ -3405,9 +3450,12 @@ async def _run_query(
     # invisible to the pgvector-backed semantic cache lookup (which filters
     # ``question_embedding_vec IS NOT NULL``). Keeps observability while
     # preventing bad answers from being recycled.
+    # KAN-169: same NULL-embedding trick for negation-bypass queries — keeps
+    # the row in query_log for observability but prevents the semantic cache
+    # from ever surfacing it on a future "alternatives to X" lookup.
     _log_embedding = (
         None
-        if _negative
+        if (_negative or qctx.skip_cache)
         else (np.array(qctx.query_embedding) if qctx.query_embedding else None)
     )
     asyncio.create_task(_log_query(
@@ -3887,16 +3935,24 @@ async def intelligence_ask_stream(
                         "tokens_used": tokens_info,
                         "model": qctx.model,
                     }
-                    if _stream_negative:
+                    # KAN-169: gate Redis writes on redis_cache_key; negation
+                    # bypass in _prepare_query clears the key so the streamed
+                    # answer is never written back to the cache.
+                    if not qctx.redis_cache_key:
+                        if qctx.skip_cache:
+                            logger.info("ask/stream: skipping Redis cache write (negation bypass)")
+                    elif _stream_negative:
                         _stream_payload["negative"] = True
                         asyncio.create_task(cache.set(qctx.redis_cache_key, _stream_payload, ttl=60)).add_done_callback(_task_done_callback)
                         logger.info("ask/stream: negative-cached low-quality answer (len=%d)", len(full_answer or ""))
                     else:
                         asyncio.create_task(cache.set(qctx.redis_cache_key, _stream_payload, ttl=1800)).add_done_callback(_task_done_callback)
-                    # Fire-and-forget log
+                    # Fire-and-forget log — KAN-169: NULL embedding for
+                    # negation-bypass queries so the semantic cache can never
+                    # recycle this row on a future "alternatives to X" lookup.
                     _stream_log_embedding = (
                         None
-                        if _stream_negative
+                        if (_stream_negative or qctx.skip_cache)
                         else (np.array(qctx.query_embedding) if qctx.query_embedding else None)
                     )
                     asyncio.create_task(_log_query(
