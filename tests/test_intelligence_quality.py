@@ -820,3 +820,180 @@ async def test_ask_no_negation_no_filter(client_no_db: AsyncClient):
     assert "pinecone-python-client" in source_names
     # And the others stay too.
     assert "weaviate" in source_names
+
+
+# ---------------------------------------------------------------------------
+# KAN-169: cache-hit gap from KAN-166 — negation queries must bypass cache
+#
+# KAN-166 added a post-filter that drops "alternatives to X" self-matches at
+# retrieval time. But the cache layers (Redis fast-path + pgvector semantic
+# cache) sit BEFORE the post-filter, so an entry written before the fix (or
+# under a query variant the regex didn't catch) can still surface a stale
+# self-match on HIT for up to TTL=1800s.
+#
+# Approach A (chosen): when _extract_negation_token captures a token, skip
+# both cache lookups in _prepare_query AND skip both cache writes in the
+# handler. Negation queries are rare; the cache-miss cost is well worth the
+# correctness guarantee.
+# ---------------------------------------------------------------------------
+
+
+def _patch_cache(llm_response_returns=None):
+    """
+    Patch app.routers.intelligence.cache.get to return ``llm_response_returns``
+    when called with a key matching the ``llm_response:`` prefix (the Redis
+    fast-path used by _prepare_query for the negation-bypass test). All other
+    cache namespaces (smart_route, graph_edges, etc.) get None — otherwise the
+    same stale payload would be misinterpreted as a smart-route result and
+    short-circuit before our negation gate even runs.
+
+    cache.set is replaced with a tracking AsyncMock so the test can assert it
+    is NOT called for negation queries (proves write-side bypass).
+
+    Uses ``new=AsyncMock(...)`` rather than ``side_effect`` so the patched
+    attribute is awaitable — a plain MagicMock would hang on ``await``.
+    """
+    from unittest.mock import AsyncMock
+
+    async def _get_side_effect(key):
+        if key and isinstance(key, str) and key.startswith("llm_response:"):
+            return llm_response_returns
+        return None
+
+    get_mock = AsyncMock(side_effect=_get_side_effect)
+    set_mock = AsyncMock()
+
+    cache_get_patch = patch(
+        "app.routers.intelligence.cache.get",
+        new=get_mock,
+    )
+    cache_set_patch = patch(
+        "app.routers.intelligence.cache.set",
+        new=set_mock,
+    )
+    return cache_get_patch, cache_set_patch, set_mock
+
+
+@pytest.mark.asyncio
+async def test_ask_negation_bypasses_cache(client_no_db: AsyncClient):
+    """
+    KAN-169: a negation query ("alternatives to pinecone") must bypass the
+    Redis cache even if a stale entry from before KAN-166 still has pinecone
+    in its sources. We pre-populate cache.get with that stale payload and
+    verify the live response is filtered AND that cache.set is NOT called
+    for this query (so the bypass is symmetric — no future calls inherit
+    a fresh self-match either).
+    """
+    from app.main import app
+    from app.database import get_db
+
+    _, override = _override_db(NEGATION_ROWS)
+    app.dependency_overrides[get_db] = override
+
+    # Stale cache entry: pre-fix payload that includes pinecone in sources.
+    # If the bypass works, this should NEVER appear in the response.
+    stale_payload = {
+        "answer": "STALE: Pinecone is the best vector database!",
+        "sources": [{
+            "name": "pinecone-python-client",
+            "owner": "pinecone-io",
+            "forked_from": "pinecone-io/pinecone-python-client",
+            "relevance_score": 0.95,
+            "integration_tags": ["vector-db", "managed"],
+        }],
+        "tokens_used": {"input": 0, "output": 0, "total": 0},
+        "model": "stale-cache",
+    }
+
+    cache_get_patch, cache_set_patch, set_mock = _patch_cache(llm_response_returns=stale_payload)
+
+    with (
+        _patch_embedding_model(),
+        _patch_anthropic_key(),
+        _patch_anthropic(),
+        _patch_log_query(),
+        _patch_create_task(),
+        cache_get_patch,
+        cache_set_patch,
+    ):
+        try:
+            response = await client_no_db.post(
+                "/intelligence/ask",
+                json={"question": "vector database alternatives to pinecone"},
+            )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    # Stale cache answer must NOT have leaked through.
+    assert "STALE" not in data["answer"], (
+        "KAN-169 regression: stale cache entry returned for a negation query"
+    )
+    # Sources must NOT include pinecone — proves the negation filter ran on
+    # the live retrieval path (not the bypassed cache).
+    for s in data["sources"]:
+        full = f"{(s.get('owner') or '').lower()}/{(s.get('name') or '').lower()}"
+        assert "pinecone" not in full, (
+            f"KAN-169 regression: pinecone leaked into sources via cache as {full!r}"
+        )
+    # And cache.set must NOT have been called for this negation query — so
+    # this turn's response can't pollute future cache hits either.
+    assert set_mock.call_count == 0, (
+        f"KAN-169 regression: cache.set was called {set_mock.call_count} times "
+        f"for a negation query (expected 0). Calls: {set_mock.call_args_list}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_ask_non_negation_uses_cache(client_no_db: AsyncClient):
+    """
+    KAN-169: a non-negation query MUST still use the Redis cache fast-path.
+    Verifies the bypass is scoped to negation queries only (no regression
+    on cache hit rate for the common case).
+    """
+    from app.main import app
+    from app.database import get_db
+
+    _, override = _override_db(GOLDEN_ROWS)
+    app.dependency_overrides[get_db] = override
+
+    # Cached entry for a normal RAG-frameworks question — must be returned.
+    cached_payload = {
+        "answer": "CACHED: LangChain and LlamaIndex are great RAG frameworks.",
+        "sources": [{
+            "name": "langchain",
+            "owner": "langchain-ai",
+            "forked_from": "langchain-ai/langchain",
+            "relevance_score": 0.93,
+            "integration_tags": ["llm", "rag"],
+        }],
+        "tokens_used": {"input": 0, "output": 0, "total": 0},
+        "model": "redis-cache",
+    }
+
+    cache_get_patch, cache_set_patch, set_mock = _patch_cache(llm_response_returns=cached_payload)
+
+    with (
+        _patch_embedding_model(),
+        _patch_anthropic_key(),
+        _patch_anthropic(),
+        _patch_log_query(),
+        _patch_create_task(),
+        cache_get_patch,
+        cache_set_patch,
+    ):
+        try:
+            response = await client_no_db.post(
+                "/intelligence/ask",
+                json={"question": "What are the best RAG frameworks?"},
+            )
+        finally:
+            app.dependency_overrides.pop(get_db, None)
+
+    assert response.status_code == 200, response.text
+    data = response.json()
+    # Cache hit was honored — the cached answer text must come through.
+    assert data["answer"].startswith("CACHED:"), (
+        "KAN-169 regression: non-negation query did NOT use the Redis cache"
+    )
