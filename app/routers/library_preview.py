@@ -23,6 +23,7 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import Optional
 
+import sentry_sdk
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, Field
 from slowapi import Limiter
@@ -280,6 +281,13 @@ async def library_preview(
     See `.audit/2026-05-02/library-preview-endpoint-design.md` for the full
     design (response shape, sort options, projected Lighthouse delta).
     """
+    # KAN-190: rename Sentry transaction to a stable hot-path label
+    # ("library_preview") + tag with the cardinality-relevant query params so
+    # latency dashboards group by sort/limit/category instead of just URL.
+    sentry_sdk.get_current_scope().set_transaction_name("library_preview")
+    sentry_sdk.set_tag("library_preview.sort", sort)
+    sentry_sdk.set_tag("library_preview.has_category", category is not None)
+
     # KAN-179: validate include first so a malformed `?include=` 400s before
     # we touch Redis or DB. _parse_include itself raises HTTPException(400).
     include_tokens = _parse_include(include)
@@ -298,22 +306,29 @@ async def library_preview(
     include_key = ",".join(sorted(include_tokens)) if include_tokens else "none"
     redis_key = f"library:preview:{sort}:{limit}:{cat_key}:{include_key}"
 
-    cached = await redis_cache.get(redis_key)
+    # KAN-190: cache lookup span — surfaces Redis latency separately from DB
+    # in the Sentry trace, so a slow Redis hit (rare but happens) doesn't
+    # masquerade as a slow query.
+    with sentry_sdk.start_span(op="cache.get", name="library_preview.redis"):
+        cached = await redis_cache.get(redis_key)
     if cached is not None:
         logger.info(
             "Redis hit /library/preview sort=%s limit=%d category=%s include=%s",
             sort, limit, cat_key, include_key,
         )
+        sentry_sdk.set_tag("library_preview.cache_hit", True)
         return cached
 
+    sentry_sdk.set_tag("library_preview.cache_hit", False)
     t0 = time.monotonic()
     order_by = _SORT_CLAUSES[sort]
 
     # Count for `totalRepos` — public corpus size, independent of limit/category.
     # This matches /library/full so the frontend can show "Showing N of M repos".
-    total = (await db.execute(
-        text("SELECT COUNT(*) FROM repos WHERE is_private = false")
-    )).scalar() or 0
+    with sentry_sdk.start_span(op="db.query", name="library_preview.count_public"):
+        total = (await db.execute(
+            text("SELECT COUNT(*) FROM repos WHERE is_private = false")
+        )).scalar() or 0
 
     # KAN-179: build the column projection list dynamically. Default columns
     # mirror the original KAN-151 SELECT exactly; extension columns appended
@@ -358,9 +373,10 @@ async def library_preview(
     if category:
         params["cat"] = category
 
-    result = await db.execute(text(sql_main), params)
-    rows = result.fetchall()
-    columns = list(result.keys())
+    with sentry_sdk.start_span(op="db.query", name="library_preview.fetch_repos"):
+        result = await db.execute(text(sql_main), params)
+        rows = result.fetchall()
+        columns = list(result.keys())
 
     if not rows:
         body = {
@@ -381,10 +397,11 @@ async def library_preview(
     # pattern as `_fetch_page_repos` to avoid asyncpg's `::uuid[]` parser quirk.
     # We over-fetch tags and trim per-repo in Python (cheap; ~1.8K rows in the
     # worst case at limit=500). Avoids per-repo subqueries / window functions.
-    tag_result = await db.execute(text(
-        "SELECT repo_id, tag FROM repo_tags "
-        "WHERE repo_id = ANY(CAST(:ids AS uuid[]))"
-    ), {"ids": page_ids})
+    with sentry_sdk.start_span(op="db.query", name="library_preview.fetch_tags"):
+        tag_result = await db.execute(text(
+            "SELECT repo_id, tag FROM repo_tags "
+            "WHERE repo_id = ANY(CAST(:ids AS uuid[]))"
+        ), {"ids": page_ids})
     tags_by_repo: dict[str, list[str]] = defaultdict(list)
     for tag_row in tag_result.fetchall():
         rid = str(tag_row.repo_id)
@@ -411,5 +428,6 @@ async def library_preview(
         sort, limit, cat_key, include_key, len(repos), elapsed_ms,
     )
 
-    await redis_cache.set(redis_key, body, ttl=CACHE_TTL)
+    with sentry_sdk.start_span(op="cache.set", name="library_preview.redis_write"):
+        await redis_cache.set(redis_key, body, ttl=CACHE_TTL)
     return body

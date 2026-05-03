@@ -1,14 +1,17 @@
 import asyncio
+import hashlib
 import json
 import logging
 import os
 import time
+import traceback
 import uuid
 from contextlib import asynccontextmanager
 
 import sentry_sdk
 
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -16,6 +19,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.middleware import SlowAPIMiddleware
 from slowapi.util import get_remote_address
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.cache import cache
 from app.rate_limit import rate_limit_storage
@@ -29,6 +33,11 @@ from app.telemetry import init_telemetry
 _EXTRA_FIELDS = frozenset({
     "method", "path", "status_code", "duration_ms",
     "request_id", "trace_id", "user_id", "route",
+    # KAN-190: structured-exception fields emitted by the global exception
+    # handler. Keeping the schema in this frozenset ensures the JSON formatter
+    # promotes them out of `record.__dict__` into top-level fields that
+    # Cloud Logging can index.
+    "error_class", "error_message", "stack_hash", "client_host",
 })
 
 
@@ -309,6 +318,82 @@ async def add_security_headers(request: Request, call_next):
         "frame-ancestors 'none'"
     )
     return response
+
+
+# ---------------------------------------------------------------------------
+# KAN-190: structured exception logging
+#
+# Closes the silent-failure observability gap: today an unhandled 5xx emits a
+# free-text traceback that's hard to grep, aggregate, or alert on. This handler
+# normalizes every uncaught Exception into a single JSON line with a stable
+# field schema, plus a short `stack_hash` for grouping recurrences without
+# leaking the full stack to logs.
+#
+# Scope:
+#   - HTTPException (4xx/5xx with explicit status) is NOT caught here — those
+#     are intentional, and FastAPI's default handler already returns the
+#     correct status + body. Catching them would double-log every 404.
+#   - RequestValidationError (422 from pydantic) is also delegated to FastAPI's
+#     default; user-input errors are noisy and not actionable as exceptions.
+#   - Sentry's FastApiIntegration (auto-enabled in sentry-sdk 2.x) captures
+#     the exception event independently of this handler, so we don't lose
+#     stacktrace fidelity in Sentry.
+# ---------------------------------------------------------------------------
+@app.exception_handler(StarletteHTTPException)
+async def _passthrough_http_exception_handler(request: Request, exc: StarletteHTTPException):
+    # Re-raise into FastAPI's default handler so 4xx semantics are preserved.
+    # Registering our own handler for the unhandled-Exception case below would
+    # otherwise shadow FastAPI's HTTPException handler.
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+        headers=getattr(exc, "headers", None),
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _passthrough_validation_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content={"detail": exc.errors()},
+    )
+
+
+@app.exception_handler(Exception)
+async def structured_exception_handler(request: Request, exc: Exception):
+    """Emit a structured log line for every uncaught exception, then return 500.
+
+    Fields emitted (top-level JSON keys, indexable in Cloud Logging):
+        route          — request.url.path
+        method         — HTTP method
+        error_class    — exception class name
+        error_message  — str(exc), truncated to 500 chars to bound payload size
+                         and avoid spilling user input / secrets
+        stack_hash     — first 16 chars of sha256(traceback) for cheap grouping
+        client_host    — request.client.host (None if not available)
+
+    Sentry capture: relies on FastApiIntegration's auto-capture upstream of
+    this handler. We do NOT call sentry_sdk.capture_exception() here to avoid
+    double-reporting the same error.
+    """
+    stack_hash = hashlib.sha256(traceback.format_exc().encode()).hexdigest()[:16]
+    logger.error(
+        "api.unhandled_exception",
+        extra={
+            "route": request.url.path,
+            "method": request.method,
+            "error_class": exc.__class__.__name__,
+            "error_message": str(exc)[:500],
+            "stack_hash": stack_hash,
+            "client_host": request.client.host if request.client else None,
+        },
+        exc_info=exc,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal Server Error"},
+    )
+
 
 app.include_router(library.router)
 app.include_router(graph.router)

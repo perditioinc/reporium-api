@@ -12,6 +12,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timezone
 
+import sentry_sdk
 from fastapi import APIRouter, Depends, Query, Request, Response
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -657,6 +658,14 @@ async def library_full(
     Junction data (tags, categories, languages, etc.) is fetched only for the current
     page — memory is O(page_size), not O(total). Safe at 10K+ repos.
     """
+    # KAN-190: rename Sentry transaction to a stable hot-path label
+    # ("library_full") + tag with page/page_size so cache-miss outlier traces
+    # are easy to bucket. set_transaction_name overrides the auto label
+    # FastApiIntegration assigns from the URL pattern.
+    sentry_sdk.get_current_scope().set_transaction_name("library_full")
+    sentry_sdk.set_tag("library_full.page", page)
+    sentry_sdk.set_tag("library_full.page_size", page_size)
+
     cache_key = f"page_{page}_{page_size}"
     redis_key = f"library:page:{page}:size:{page_size}"
     now = time.time()
@@ -664,9 +673,11 @@ async def library_full(
     response.headers["Cache-Control"] = "public, max-age=300, stale-while-revalidate=3600"
 
     # 1. Check Redis cache first (shared, survives restarts)
-    redis_hit = await redis_cache.get(redis_key)
+    with sentry_sdk.start_span(op="cache.get", name="library_full.redis"):
+        redis_hit = await redis_cache.get(redis_key)
     if redis_hit is not None:
         logger.info(f"Redis hit /library/full page={page} page_size={page_size}")
+        sentry_sdk.set_tag("library_full.cache_hit", "redis")
         # Warm in-memory cache too so subsequent requests on this instance are instant
         _cache[cache_key] = {"data": redis_hit, "expires_at": now + CACHE_TTL}
         return redis_hit
@@ -675,14 +686,18 @@ async def library_full(
     mem_cached = _cache.get(cache_key)
     if mem_cached and mem_cached.get("expires_at", 0) > now:
         logger.info(f"Memory hit /library/full page={page} page_size={page_size}")
+        sentry_sdk.set_tag("library_full.cache_hit", "memory")
         return mem_cached["data"]
 
+    sentry_sdk.set_tag("library_full.cache_hit", "miss")
     t0 = time.monotonic()
     logger.info(f"Building /library/full page={page} page_size={page_size}...")
 
     # SECURITY: Only return public repos — is_private=false enforced inside _fetch_page_repos
-    enriched_repos, total = await _fetch_page_repos(db, page=page, page_size=page_size)
-    aggregates = await _fetch_aggregates(db)
+    with sentry_sdk.start_span(op="db.query", name="library_full.fetch_page_repos"):
+        enriched_repos, total = await _fetch_page_repos(db, page=page, page_size=page_size)
+    with sentry_sdk.start_span(op="db.query", name="library_full.fetch_aggregates"):
+        aggregates = await _fetch_aggregates(db)
 
     response = {
         "username": "perditioinc",
@@ -701,7 +716,8 @@ async def library_full(
 
     # Store in both caches
     _cache[cache_key] = {"data": response, "expires_at": now + CACHE_TTL}
-    await redis_cache.set(redis_key, response, ttl=CACHE_TTL)
+    with sentry_sdk.start_span(op="cache.set", name="library_full.redis_write"):
+        await redis_cache.set(redis_key, response, ttl=CACHE_TTL)
     return response
 
 
