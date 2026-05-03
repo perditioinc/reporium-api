@@ -25,7 +25,7 @@ from unittest.mock import MagicMock
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from app.main import (
@@ -166,10 +166,12 @@ def _isolated_app() -> FastAPI:
     return iso
 
 
-def test_unhandled_exception_returns_500_with_generic_body(caplog):
+@pytest.mark.asyncio
+async def test_unhandled_exception_returns_500_with_generic_body(caplog):
     caplog.set_level(logging.ERROR, logger="app.main")
-    client = TestClient(_isolated_app(), raise_server_exceptions=False)
-    resp = client.get("/boom")
+    iso = _isolated_app()
+    async with AsyncClient(transport=ASGITransport(app=iso, raise_app_exceptions=False), base_url="http://test") as ac:
+        resp = await ac.get("/boom")
     assert resp.status_code == 500
     assert resp.json() == {"detail": "Internal Server Error"}
 
@@ -183,14 +185,16 @@ def test_unhandled_exception_returns_500_with_generic_body(caplog):
     ), "structured exception log was not emitted for /boom"
 
 
-def test_http_exception_4xx_does_not_hit_unhandled_handler(caplog):
+@pytest.mark.asyncio
+async def test_http_exception_4xx_does_not_hit_unhandled_handler(caplog):
     """HTTPException(404) must be passed through to FastAPI's default 4xx
     response shape and MUST NOT log api.unhandled_exception (otherwise every
     404 from a typo'd URL would page on-call).
     """
     caplog.set_level(logging.ERROR, logger="app.main")
-    client = TestClient(_isolated_app(), raise_server_exceptions=False)
-    resp = client.get("/notfound")
+    iso = _isolated_app()
+    async with AsyncClient(transport=ASGITransport(app=iso, raise_app_exceptions=False), base_url="http://test") as ac:
+        resp = await ac.get("/notfound")
     assert resp.status_code == 404
     assert resp.json() == {"detail": "nope"}
 
