@@ -486,7 +486,14 @@ async def _fetch_page_repos(
                primary_category, secondary_categories
         FROM repos
         WHERE is_private = false
-        ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC
+        -- KAN-190: id ASC tiebreaker is REQUIRED for deterministic pagination.
+        -- Without it, rows with equal sort-key (e.g. all test fixtures share
+        -- parent_stars=1000) get implementation-defined order across LIMIT/OFFSET
+        -- pages, so a row at a page boundary can appear twice or be skipped
+        -- on different connections — surfaced as
+        -- test_library_full_excludes_private_repos_across_all_pages flake when
+        -- a sibling test changes corpus size.
+        ORDER BY COALESCE(parent_stars, stargazers_count, 0) DESC, id ASC
         LIMIT :lim OFFSET :off
     """), {"lim": page_size, "off": offset})
     rows = result.fetchall()
