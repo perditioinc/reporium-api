@@ -271,6 +271,26 @@ class TestBuildTagMetrics:
         repos = [_make_repo("r1", ["Active", "Forked", "Built by Me"])]
         assert _build_tag_metrics(repos) == []
 
+    def test_kan_193_no_per_tag_repos_array(self):
+        """KAN-193: tagMetric entries no longer carry a per-tag `repos[]` array.
+
+        That array dominated the 3.8 MB /library/aggregates payload and was
+        dropped after a consumer audit found no production reader for it.
+        Both /library/full and /library/aggregates inherit this trim because
+        they share build_tag_metrics().
+        """
+        repos = [
+            _make_repo("r1", ["RAG", "Python"]),
+            _make_repo("r2", ["RAG"]),
+        ]
+        metrics = _build_tag_metrics(repos)
+        assert metrics, "expected at least one tagMetric for non-system tags"
+        for m in metrics:
+            assert "repos" not in m, (
+                "KAN-193 regression: build_tag_metrics emitted a per-tag "
+                "`repos` array. That field was dropped intentionally."
+            )
+
 
 # ---------------------------------------------------------------------------
 # sanitize_repo — upstreamCreatedAt fallback fix
@@ -724,3 +744,24 @@ async def test_library_full_response_shape_preserved(client: AsyncClient):
     for k in ("username", "generatedAt", "page", "pageSize",
               "totalRepos", "totalPages"):
         assert k in body, f"/library/full envelope dropped {k!r}"
+
+
+@pytest.mark.asyncio
+async def test_library_full_tag_metrics_does_NOT_include_per_tag_repos_array(client: AsyncClient):
+    """KAN-193: /library/full also drops tagMetrics[].repos.
+
+    Both /library/full and /library/aggregates share the build_tag_metrics
+    helper; the trim applies to both. Consumer audit (perditioinc) showed
+    no production reader of tagMetric.repos in reporium frontend,
+    reporium-mcp, reporium-evals, or reporium-audit, so dropping it from
+    both endpoints is back-compat-safe.
+    """
+    resp = await client.get("/library/full?page=1&page_size=2")
+    assert resp.status_code == 200
+    body = resp.json()
+    tag_metrics = body.get("tagMetrics") or []
+    for tm in tag_metrics:
+        assert "repos" not in tm, (
+            "KAN-193 regression: /library/full's tagMetrics entry leaked "
+            "the per-tag `repos` array."
+        )

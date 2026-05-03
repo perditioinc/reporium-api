@@ -563,7 +563,13 @@ def build_tag_metrics(repos: list) -> list:
             "relatedTags": [],
             "mostRecentRepo": tag_repo_list[0]["name"] if tag_repo_list else "",
             "mostRecentDate": tag_repo_list[0]["lastUpdated"] if tag_repo_list else "",
-            "repos": [r["name"] for r in tag_repo_list[:20]],
+            # KAN-193: per-tag `repos: [name1, name2, ...]` array dropped
+            # (~70% payload reduction on /library/aggregates: 3.8 MB → ~1 MB).
+            # Consumer audit (perditioinc): no production reader of
+            # tagMetric.repos in reporium frontend, reporium-mcp, reporium-evals,
+            # or reporium-audit. Callers needing tag→repos mapping should
+            # derive from per-repo `enrichedTags` in /library/preview or
+            # /library/full.
             "avgUpstreamAge": 0,
             "avgTimeSinceForked": 0,
             "mostOutdatedRepo": "",
