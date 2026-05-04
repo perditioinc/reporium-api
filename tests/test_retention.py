@@ -36,7 +36,13 @@ async def test_purge_old_query_logs_executes_parameterized_delete():
     sql_clause = call_args.args[0]
     params = call_args.args[1]
     assert "DELETE FROM query_log" in str(sql_clause)
-    assert "created_at" in str(sql_clause)
+    # KAN-226: column is `timestamp` (not `created_at`) per app/models/query_log.py.
+    # The original test asserted `created_at`, which validated a real bug — the
+    # SQL used a column that doesn't exist on the live DB; retention silently
+    # failed for the column-reference's lifetime. Fixed in retention.py and
+    # this test updated to assert the correct column.
+    assert "timestamp" in str(sql_clause)
+    assert "created_at" not in str(sql_clause)
     assert params == {"days": 90}
 
 
