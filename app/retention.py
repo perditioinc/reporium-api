@@ -14,11 +14,21 @@ RETENTION_INTERVAL_SECONDS = 24 * 60 * 60  # 24 hours
 
 
 async def purge_old_query_logs(days: int = RETENTION_DAYS) -> int:
-    """Delete query_log rows older than ``days`` days. Returns row count."""
+    """Delete query_log rows older than ``days`` days. Returns row count.
+
+    Bug fix: previously referenced `created_at` column which doesn't exist
+    on `query_log` — the actual column is `timestamp` (per app/models/query_log.py).
+    Migration 037's docstring also says `created_at DESC` but the actual SQL
+    correctly uses `timestamp DESC`. The retention_loop has been failing every
+    24h with `column "created_at" does not exist` (~1/day in Cloud SQL ERROR
+    logs since the column reference was introduced); the broad except in
+    retention_loop swallowed the error so old query_log rows accumulated
+    without being purged. PII/cost data leak risk over time.
+    """
     async with async_session_factory() as db:
         # Parameterized interval to avoid SQL injection
         result = await db.execute(
-            text("DELETE FROM query_log WHERE created_at < NOW() - (:days || ' days')::interval"),
+            text("DELETE FROM query_log WHERE timestamp < NOW() - (:days || ' days')::interval"),
             {"days": days},
         )
         await db.commit()
