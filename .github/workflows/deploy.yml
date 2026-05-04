@@ -32,9 +32,22 @@ jobs:
       # Cloud Run constraint: traffic tag + service name must be ≤ 46 chars.
       # service="reporium-api" (12) + "-" + tag → tag must be ≤ 33 chars.
       # Short SHA (7 chars) + "candidate-" prefix (10) = 17 chars. Safe.
-      - name: Compute short SHA
+      - name: Compute short SHA + image ref
         id: meta
-        run: echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+        run: |
+          echo "short_sha=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          echo "image=us-central1-docker.pkg.dev/perditio-platform/cloud-run-source-deploy/reporium-api:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      # KAN-222: build + push image directly to Artifact Registry instead of
+      # using deploy-cloudrun's `source: .` (which uses Cloud Build under the
+      # hood). Same pattern as KAN-215 for reporium-mcp. Drops the deploy SA's
+      # need for cloudbuild.builds.builder + serviceusage.serviceUsageConsumer
+      # + storage.admin (just artifactregistry.writer required).
+      - name: Build + push image to Artifact Registry
+        run: |
+          gcloud auth configure-docker us-central1-docker.pkg.dev --quiet
+          docker build -t "${{ steps.meta.outputs.image }}" .
+          docker push "${{ steps.meta.outputs.image }}"
 
       # Option B1 — no-traffic candidate revision + migrate + promote.
       #
@@ -44,22 +57,26 @@ jobs:
       #
       #   1. Build + deploy a new revision with `no_traffic: true` and a
       #      `candidate-<sha>` traffic tag. Current revision keeps 100% of traffic.
-      #   2. Resolve that revision's image URI back from Cloud Run.
-      #   3. Point `reporium-alembic` at that image and `--command=alembic`
+      #   2. Point `reporium-alembic` at that image and `--command=alembic`
       #      `--args=upgrade,head`.
-      #   4. Execute the job with `--wait`. If migrations fail, the workflow fails
+      #   3. Execute the job with `--wait`. If migrations fail, the workflow fails
       #      here — the candidate revision continues to serve 0% traffic and the
       #      old revision keeps serving users. Nothing is promoted.
-      #   5. Only on migration success, shift traffic to the new revision.
+      #   4. Only on migration success, shift traffic to the new revision.
       #
       # `no_traffic` and `tag` are supported inputs on
       # google-github-actions/deploy-cloudrun@v2.7.6 (verified in action.yml).
+      # Post-KAN-222: `image:` (not `source:`) — the build step above pushes the
+      # image with the exact tag we control. Image URI is now known upfront, so
+      # the post-deploy "Resolve candidate revision image URI" step that did
+      # gcloud round-trips is replaced by a direct steps.meta.outputs.image
+      # reference for the alembic job update.
       - uses: google-github-actions/deploy-cloudrun@251330ba9a8a34bfbc1622895f42e1d53fd14522 # v2.7.6
         id: deploy
         with:
           service: reporium-api
           region: us-central1
-          source: .
+          image: ${{ steps.meta.outputs.image }}
           no_traffic: true
           tag: candidate-${{ steps.meta.outputs.short_sha }}
           env_vars: |-
@@ -82,14 +99,13 @@ jobs:
             --subnet=default
             --vpc-egress=private-ranges-only
 
-      - name: Resolve candidate revision image URI
+      - name: Resolve candidate revision name (image already known)
         id: image
-        # The candidate revision carries tag `candidate-<sha>` but serves 0% traffic.
-        # Read the image URI from the tagged revision in `status.traffic[]` — do NOT
-        # use `spec.template.spec.containers[0].image`, which reflects the newest
-        # template but not necessarily the revision actually referenced by the tag.
-        # Cross-referencing the tag with `status.traffic[].revisionName` and looking
-        # up that revision's image is bulletproof across Cloud Build naming changes.
+        # KAN-222: image URI is known upfront from the build step
+        # (steps.meta.outputs.image). Only the revision NAME needs to be
+        # resolved (used by traffic-promotion step to identify which revision
+        # to point traffic at). Use the tag → revision lookup; the image URI
+        # comes from steps.meta.outputs.image directly downstream.
         run: |
           set -euo pipefail
           TAG="candidate-${{ steps.meta.outputs.short_sha }}"
@@ -104,18 +120,10 @@ jobs:
               --format="value(status.traffic)" >&2 || true
             exit 1
           fi
-          IMAGE_URI="$(gcloud run revisions describe "${REVISION}" \
-            --project=perditio-platform \
-            --region=us-central1 \
-            --format='value(spec.containers[0].image)')"
-          if [ -z "${IMAGE_URI}" ]; then
-            echo "Failed to resolve image URI for revision ${REVISION}" >&2
-            exit 1
-          fi
           echo "Candidate revision: ${REVISION}"
-          echo "Candidate image:    ${IMAGE_URI}"
+          echo "Candidate image:    ${{ steps.meta.outputs.image }}"
           echo "revision=${REVISION}" >> "$GITHUB_OUTPUT"
-          echo "uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+          echo "uri=${{ steps.meta.outputs.image }}" >> "$GITHUB_OUTPUT"
 
       - name: Point alembic job at candidate image
         # Codex audit on PR #392: `gcloud run jobs execute reporium-alembic` runs the
