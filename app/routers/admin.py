@@ -1736,6 +1736,7 @@ async def backfill_licenses(
     updated = 0
     failed = 0
     skipped = 0
+    updated_names: list[str] = []
 
     async with httpx.AsyncClient(headers=headers) as client:
         # Create tasks for all repos
@@ -1759,12 +1760,20 @@ async def backfill_licenses(
                 {"spdx": spdx, "id": str(row.id)},
             )
             updated += 1
+            updated_names.append(row.name)
         except Exception as exc:
             failed += 1
             logger.warning("License update failed for %s/%s: %s", row.owner, row.name, exc)
 
     if updated > 0:
         await db.commit()
+        # KAN-233: invalidate caches that include license_spdx so next
+        # /library/full and /repos/{name} reads see the new values immediately
+        # instead of waiting up to TTL for natural expiration.
+        await cache.invalidate("library:full*")
+        await cache.invalidate("repos:list:*")
+        for name in updated_names:
+            await cache.invalidate(f"repos:detail:{name}")
 
     return {"total": total, "updated": updated, "failed": failed, "skipped": skipped, "dry_run": False}
 
@@ -1948,6 +1957,7 @@ async def backfill_community_signals(
     updated = 0
     failed = 0
     skipped = 0
+    updated_names: list[str] = []
 
     async with httpx.AsyncClient(headers=headers) as client:
         tasks = [
@@ -1996,6 +2006,7 @@ async def backfill_community_signals(
                 params,
             )
             updated += 1
+            updated_names.append(row.name)
         except Exception as exc:
             failed += 1
             logger.warning(
@@ -2004,6 +2015,13 @@ async def backfill_community_signals(
 
     if updated > 0:
         await db.commit()
+        # KAN-233: invalidate caches that include quality_signals fields so
+        # next /library/preview and /repos/{name} reads see the new values
+        # immediately instead of waiting up to TTL for natural expiration.
+        await cache.invalidate("library:full*")
+        await cache.invalidate("repos:list:*")
+        for name in updated_names:
+            await cache.invalidate(f"repos:detail:{name}")
 
     return {"total": total, "updated": updated, "failed": failed, "skipped": skipped, "dry_run": False}
 
@@ -2326,6 +2344,7 @@ async def backfill_dependencies(
     dependencies_inserted = 0
     failed = 0
     skipped = 0
+    updated_names: list[str] = []
 
     sem = asyncio.Semaphore(10)
     headers = {
@@ -2387,6 +2406,7 @@ async def backfill_dependencies(
             if repo_inserted > 0:
                 repos_with_deps += 1
                 dependencies_inserted += repo_inserted
+                updated_names.append(row.name)
 
             # Commit per repo to avoid holding large transactions
             try:
@@ -2394,6 +2414,15 @@ async def backfill_dependencies(
             except Exception as exc:
                 logger.warning("Commit failed after %s/%s: %s", row.owner, row.name, exc)
                 failed += 1
+
+    # KAN-233: dependencies feed graph builders (DEPENDS_ON edges) and
+    # /repos/{name} responses. Invalidate after the per-repo commits so
+    # next reads see fresh data immediately.
+    if updated_names:
+        await cache.invalidate("library:full*")
+        await cache.invalidate("repos:list:*")
+        for name in updated_names:
+            await cache.invalidate(f"repos:detail:{name}")
 
     return {
         "total_repos": total_repos,
