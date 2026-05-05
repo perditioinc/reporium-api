@@ -534,8 +534,20 @@ def build_stats(repos: list) -> dict:
     }
 
 
+# KAN-237: tags appearing on only 1 repo aren't useful for any aggregate UI
+# (StatsBar, MetricsSidebar, RecommendationsWidget all rank by repoCount and
+# the tail is never displayed). At ~5300 unique tags / ~1870 repos, the
+# corpus is roughly 1 repo per tag — so this filter cuts tagMetrics by ~70%.
+# Verified via /admin/data-quality + /metrics/data-quality probes 2026-05-04.
+TAG_METRICS_MIN_REPOS = 2
+
+
 def build_tag_metrics(repos: list) -> list:
-    """Build TagMetrics[] from enriched repos. System tags are excluded."""
+    """Build TagMetrics[] from enriched repos. System tags are excluded.
+
+    Tags appearing on fewer than ``TAG_METRICS_MIN_REPOS`` repos are also
+    excluded — see KAN-237 for the rationale.
+    """
     tag_repos = defaultdict(list)
     for r in repos:
         for t in r["enrichedTags"]:
@@ -545,6 +557,8 @@ def build_tag_metrics(repos: list) -> list:
     metrics = []
     total = len(repos) if repos else 1
     for tag, tag_repo_list in sorted(tag_repos.items()):
+        if len(tag_repo_list) < TAG_METRICS_MIN_REPOS:
+            continue
         lang_counter = Counter()
         for r in tag_repo_list:
             if r["language"]:
