@@ -231,38 +231,57 @@ class TestBuildBuilderStats:
 # ---------------------------------------------------------------------------
 
 class TestBuildTagMetrics:
+    # KAN-237: tagMetrics now requires >= 2 repos per tag (singletons excluded
+    # — they aren't useful for any aggregate UI and dominate payload size).
+    # All multi-repo fixtures below use 2+ instances of the asserted tag.
 
     def test_active_tag_excluded(self):
-        repos = [_make_repo("r1", ["Active", "Python"])]
+        repos = [
+            _make_repo("r1", ["Active", "Python"]),
+            _make_repo("r2", ["Active", "Python"]),
+        ]
         metrics = {m["tag"]: m for m in _build_tag_metrics(repos)}
         assert "Active" not in metrics
         assert "Python" in metrics
 
     def test_forked_tag_excluded(self):
-        repos = [_make_repo("r1", ["Forked", "LangChain"])]
+        repos = [
+            _make_repo("r1", ["Forked", "LangChain"]),
+            _make_repo("r2", ["Forked", "LangChain"]),
+        ]
         metrics = {m["tag"]: m for m in _build_tag_metrics(repos)}
         assert "Forked" not in metrics
+        assert "LangChain" in metrics
 
     def test_built_by_me_excluded(self):
-        repos = [_make_repo("r1", ["Built by Me", "RAG"])]
+        repos = [
+            _make_repo("r1", ["Built by Me", "RAG"]),
+            _make_repo("r2", ["Built by Me", "RAG"]),
+        ]
         metrics = {m["tag"]: m for m in _build_tag_metrics(repos)}
         assert "Built by Me" not in metrics
+        assert "RAG" in metrics
 
     def test_all_system_tags_excluded(self):
-        repos = [_make_repo("r1", list(SYSTEM_TAGS) + ["real-tag"])]
+        repos = [
+            _make_repo("r1", list(SYSTEM_TAGS) + ["real-tag"]),
+            _make_repo("r2", list(SYSTEM_TAGS) + ["real-tag"]),
+        ]
         metrics = {m["tag"]: m for m in _build_tag_metrics(repos)}
         for st in SYSTEM_TAGS:
             assert st not in metrics, f"System tag '{st}' should be excluded"
         assert "real-tag" in metrics
 
     def test_real_tags_counted_correctly(self):
+        # KAN-237: Python now appears on 2 repos so it survives the singleton
+        # filter; vLLM stays at 2 as before.
         repos = [
             _make_repo("r1", ["vLLM", "Python"]),
-            _make_repo("r2", ["vLLM", "Rust"]),
+            _make_repo("r2", ["vLLM", "Python"]),
         ]
         metrics = {m["tag"]: m for m in _build_tag_metrics(repos)}
         assert metrics["vLLM"]["repoCount"] == 2
-        assert metrics["Python"]["repoCount"] == 1
+        assert metrics["Python"]["repoCount"] == 2
 
     def test_empty_repos_returns_empty(self):
         assert _build_tag_metrics([]) == []
@@ -270,6 +289,25 @@ class TestBuildTagMetrics:
     def test_repo_with_only_system_tags_contributes_nothing(self):
         repos = [_make_repo("r1", ["Active", "Forked", "Built by Me"])]
         assert _build_tag_metrics(repos) == []
+
+    def test_kan_237_singleton_tags_excluded(self):
+        """KAN-237: tags appearing on only 1 repo are dropped from tagMetrics.
+
+        At ~5300 unique tags / ~1870 repos the corpus has ~1 repo per tag, so
+        most tags are singletons that don't surface in any UI. Filtering them
+        out shrinks /library/aggregates by ~70% (verified live 2026-05-04).
+        """
+        repos = [
+            _make_repo("r1", ["singleton-tag", "shared-tag"]),
+            _make_repo("r2", ["other-singleton", "shared-tag"]),
+        ]
+        metrics = {m["tag"]: m for m in _build_tag_metrics(repos)}
+        # Shared tag (2 repos) survives.
+        assert "shared-tag" in metrics
+        assert metrics["shared-tag"]["repoCount"] == 2
+        # Singletons dropped.
+        assert "singleton-tag" not in metrics
+        assert "other-singleton" not in metrics
 
     def test_kan_193_no_per_tag_repos_array(self):
         """KAN-193: tagMetric entries no longer carry a per-tag `repos[]` array.
