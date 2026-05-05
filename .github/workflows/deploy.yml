@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write   # KAN-236: required for Workload Identity Federation
 
 jobs:
   deploy:
@@ -17,9 +18,15 @@ jobs:
         with:
           python-version: '3.12'
 
-      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.9
+      # KAN-236: migrated from GCP_SA_KEY (long-lived) to Workload Identity
+      # Federation. The github-pool/github-provider was set up for KAN-210
+      # / reporium-mcp deploys; this binding adds reporium-api as a second
+      # consumer (see iam.serviceAccountUser binding on the reporium-api SA
+      # for principalSet attribute.repository=perditioinc/reporium-api).
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
+          workload_identity_provider: projects/573778300586/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+          service_account: reporium-api@perditio-platform.iam.gserviceaccount.com
 
       - name: Install dependencies
         run: |
