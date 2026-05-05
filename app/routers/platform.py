@@ -383,19 +383,31 @@ async def _graph_quality_snapshot(db: AsyncSession) -> dict[str, Any]:
         if len(source_tags & target_tags) >= 2:
             valid_compatible.add(edge)
 
-    # EXTENDS proxy - valid when the source fork still points at the target repo full name.
+    # EXTENDS proxy — valid when both repos share the same upstream owner.
+    # KAN-228: builder semantic was changed (reporium-ingestion#86) from
+    # "fork resolution" (KAN-155, produced 0 edges in production because
+    # perditioinc/* repos never have their forked_from string land back in
+    # the repos table) to "shared upstream owner" (KAN-164, ~1704 live
+    # edges). This validator now mirrors the new builder: an edge is valid
+    # iff both endpoints have a parsable forked_from with the same owner
+    # component (case-insensitive). Mirrors scripts/build_knowledge_graph.py
+    # build_extends() in reporium-ingestion.
     live_extends = live_edges_by_type.get("EXTENDS", set())
-    valid_extends: set[tuple[str, str]] = set()
-    eligible_extends_repos: set[str] = set()
+    upstream_owner_by_repo: dict[str, str] = {}
     for repo_id, row in repo_by_id.items():
         forked_from = row["forked_from"]
-        if not row["is_fork"] or not forked_from:
+        if not forked_from or "/" not in forked_from:
             continue
-        target_repo_id = full_name_index.get(forked_from)
-        if target_repo_id:
-            eligible_extends_repos.add(repo_id)
-            if (repo_id, target_repo_id) in live_extends:
-                valid_extends.add((repo_id, target_repo_id))
+        owner = forked_from.split("/", 1)[0].strip().lower()
+        if owner:
+            upstream_owner_by_repo[repo_id] = owner
+    eligible_extends_repos = set(upstream_owner_by_repo.keys())
+    valid_extends: set[tuple[str, str]] = set()
+    for edge in live_extends:
+        src_owner = upstream_owner_by_repo.get(edge[0])
+        tgt_owner = upstream_owner_by_repo.get(edge[1])
+        if src_owner and src_owner == tgt_owner:
+            valid_extends.add(edge)
 
     edge_types = {
         "DEPENDS_ON": depends_on,
