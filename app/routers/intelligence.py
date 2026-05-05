@@ -1435,7 +1435,7 @@ async def _try_smart_route_inner(question: str, db: AsyncSession) -> dict | None
             FROM repo_ai_dev_skills sk
             JOIN repos r ON r.id = sk.repo_id
             WHERE r.is_private = false
-              AND sk.skill_name ILIKE :skill
+              AND sk.skill ILIKE :skill
             ORDER BY COALESCE(r.parent_stars, r.stargazers_count, 0) DESC
             LIMIT 10
         """), {"skill": f"%{skill}%"})
