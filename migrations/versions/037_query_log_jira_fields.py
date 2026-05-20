@@ -1,4 +1,4 @@
-"""Add JIRA integration fields to query_log for Workato Recipe 2.
+"""Add JIRA integration fields to query_log (admin endpoint write-back).
 
 Changes:
   1. jira_ticket_key VARCHAR(32) NULL  — JIRA ticket created from the ask
@@ -9,7 +9,7 @@ Changes:
 
   Indexes:
   - idx_query_log_created_at_desc  (created_at DESC) — dashboard time-range queries
-  - idx_query_log_jira_ticket_key  partial on non-null jira_ticket_key — Workato lookups
+  - idx_query_log_jira_ticket_key  partial on non-null jira_ticket_key — ticket-key lookups
 
 Revision ID: 037
 Revises: 036

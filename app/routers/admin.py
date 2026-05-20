@@ -2377,7 +2377,7 @@ async def backfill_hn_mentions(
     }
 
 
-# ── KAN-165: JIRA × Reporium AI ask admin endpoints (Workato Recipe 2) ───────
+# ── KAN-165: JIRA × Reporium AI ask admin endpoints ──────────────────────────
 
 class AskRow(BaseModel):
     """Serialised view of a query_log row returned by the asks admin endpoints."""
@@ -2438,7 +2438,7 @@ async def list_asks(
     _api_key: str = Depends(verify_api_key),
     _admin_key: None = Depends(require_admin_key),
 ):
-    """List /ask log entries with optional filters. Used by Workato Recipe 2."""
+    """List /ask log entries with optional filters. Vendor-agnostic admin endpoint."""
 
     base_q = select(QueryLog)
     count_q = select(func.count()).select_from(QueryLog)
@@ -2480,7 +2480,7 @@ async def patch_ask(
     _api_key: str = Depends(verify_api_key),
     _admin_key: None = Depends(require_admin_key),
 ):
-    """Partially update a query_log row (JIRA fields). Called by Workato Recipe 2."""
+    """Partially update a query_log row (JIRA fields). Vendor-agnostic admin endpoint."""
 
     result = await db.execute(select(QueryLog).where(QueryLog.id == ask_id))
     row = result.scalar_one_or_none()
