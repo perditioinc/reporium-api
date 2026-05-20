@@ -15,7 +15,7 @@ class QueryLog(Base):
       - Cost tracking  (tokens_prompt + tokens_completion → cost_usd)
       - Semantic caching (question similarity search)
       - Abuse detection (hashed_ip anomaly detection)
-      - JIRA workflow integration (Workato Recipe 2)
+      - JIRA workflow integration (via admin endpoints)
     """
 
     __tablename__ = "query_log"
@@ -48,8 +48,8 @@ class QueryLog(Base):
     model: Mapped[str | None] = mapped_column(Text)
     cache_hit: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
 
-    # ── JIRA integration fields (KAN-165 / Workato Recipe 2) ─────────────────
-    # Set by Workato after creating a JIRA ticket from the ask
+    # ── JIRA integration fields (KAN-165) ────────────────────────────────────
+    # Set by external automation after creating a JIRA ticket from the ask
     jira_ticket_key: Mapped[str | None] = mapped_column(String(32), nullable=True)
     # "open" | "in_progress" | "done" | "rejected"
     jira_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
@@ -57,5 +57,5 @@ class QueryLog(Base):
     action_taken: Mapped[str | None] = mapped_column(Text, nullable=True)
     # Computed spend in cents (input_tokens + output_tokens × model rate)
     cost_cents: Mapped[int | None] = mapped_column(Integer, nullable=True)
-    # "positive" | "negative" | "neutral" — optional, written by Workato
+    # "positive" | "negative" | "neutral" — optional, written by external automation
     sentiment: Mapped[str | None] = mapped_column(String(16), nullable=True)

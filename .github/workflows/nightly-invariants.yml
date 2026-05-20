@@ -48,26 +48,3 @@ jobs:
           name: invariants-pytest-output
           path: pytest-output.txt
           retention-days: 14
-
-      - name: Notify Workato on failure
-        if: failure()
-        env:
-          WORKATO_WEBHOOK_URL: ${{ secrets.WORKATO_WEBHOOK_URL }}
-        run: |
-          if [ -z "$WORKATO_WEBHOOK_URL" ]; then
-            echo "WORKATO_WEBHOOK_URL not set — skipping JIRA notification"
-            exit 0
-          fi
-          # Post failure payload to Workato webhook → JIRA recipe
-          curl -s -X POST "$WORKATO_WEBHOOK_URL" \
-            -H "Content-Type: application/json" \
-            -d "{
-              \"event\": \"nightly_invariants_failed\",
-              \"repo\": \"perditioinc/reporium-api\",
-              \"run_url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
-              \"branch\": \"${{ github.ref_name }}\",
-              \"timestamp\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"
-            }" \
-            --fail-with-body \
-          && echo "Workato notified" \
-          || echo "Workato notification failed — non-fatal"

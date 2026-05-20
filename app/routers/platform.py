@@ -530,7 +530,7 @@ async def platform_metrics_alias(
     db: AsyncSession = Depends(get_db),
     _gate: None = Depends(require_metrics_access),
 ) -> dict:
-    """Legacy alias for /metrics/latest — kept for Workato connector compatibility."""
+    """Legacy alias for /metrics/latest — retained for backwards compatibility."""
     return await metrics_latest(db=db, _gate=_gate)
 
 
