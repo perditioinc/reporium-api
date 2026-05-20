@@ -156,7 +156,7 @@ async def test_patch_ask_404_when_not_found(client: AsyncClient):
 
 @pytest.mark.asyncio
 async def test_patch_ask_sets_jira_ticket_key(client: AsyncClient):
-    ask_id = await _insert_query_log(question="workato patch test")
+    ask_id = await _insert_query_log(question="admin patch test")
 
     response = await client.patch(
         f"/admin/asks/{ask_id}",
