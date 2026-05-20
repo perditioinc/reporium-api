@@ -257,7 +257,7 @@ def test_trend_snapshots_exist():
     which silently masked the empty-table case as XFAIL (still GREEN).
     Removed 2026-04-30 after the empty-snapshots state went undetected
     for 10+ days. The strict assertion below now fails loudly so the
-    nightly workflow turns RED and notifies Workato → JIRA.
+    nightly workflow turns RED.
     """
     resp = _get("/trends/report")
     assert resp.status_code == 200, (
