@@ -13,6 +13,14 @@ jobs:
     runs-on: ubuntu-latest
     # Skip gracefully on forks / environments without the required secret.
     if: ${{ github.event.pull_request.head.repo.fork == false || github.event_name == 'push' }}
+    # ADVISORY (2026-05-21): test_ask_golden_set_numeric_gate runs the full
+    # 50+ entry golden set against real Anthropic — exceeds 30 min wall time
+    # at any timeout setting (see KAN-DRAFT-gate-timeout-bump commit ddbd5dd:
+    # "1800s also insufficient"). Until the KAN-146 redesign (slim per-PR /
+    # nightly-full split) lands, this gate REPORTS but does NOT BLOCK merges.
+    # Drop continue-on-error once KAN-146 ships.
+    continue-on-error: true
+    timeout-minutes: 30
 
     services:
       postgres:
