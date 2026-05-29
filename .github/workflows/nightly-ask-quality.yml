@@ -71,7 +71,7 @@ jobs:
     # Only fire on the scheduled cron — workflow_dispatch is for manual
     # debugging and shouldn't open issues for one-off failures.
     if: ${{ failure() && github.event_name == 'schedule' }}
-    uses: perditioinc/perditio-devkit/.github/workflows/on-test-failure.yml@aa588479da71164c0bd2ee493a76ee46830d10dc # main @ 2026-04-26
+    uses: perditioinc/git-devkit/.github/workflows/on-test-failure.yml@main # main @ 2026-04-26
     with:
       branch: ${{ github.ref_name }}
       sha: ${{ github.sha }}
