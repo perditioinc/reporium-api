@@ -174,12 +174,16 @@ class RepoIngestItem(BaseModel):
     open_issues_count: int = 0
     license_spdx: str | None = None
 
-    commits_last_7_days: int = 0
-    commits_last_30_days: int = 0
-    commits_last_90_days: int = 0
+    # None = "unknown, don't touch" — the _upsert_repo null-skip guard then
+    # preserves the stored value instead of overwriting it with 0. Ingestion
+    # sends None when GitHub commit-activity is unavailable for a repo, so a
+    # transient fetch failure can never blank out real commit counts.
+    commits_last_7_days: int | None = None
+    commits_last_30_days: int | None = None
+    commits_last_90_days: int | None = None
 
     readme_summary: str | None = None
-    activity_score: int = 0
+    activity_score: int | None = None
     activity_score_breakdown: dict | None = None
 
     github_updated_at: datetime | None = None
