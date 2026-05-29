@@ -81,6 +81,56 @@ async def test_ingest_empty_arrays_preserve_existing_junction_data(client: Async
 
 
 @pytest.mark.asyncio
+async def test_ingest_null_commit_stats_preserve_existing(client: AsyncClient):
+    """Commit-stat freeze guard: a payload that omits commit counts / activity_score
+    (which deserialize to None) must NOT zero out the stored values. Ingestion sends
+    None when GitHub commit-activity is unavailable, so a transient fetch failure can
+    never blank real commit counts. A brand-new repo with no counts still defaults to 0.
+    """
+    from sqlalchemy import text as _text
+    import app.database as db_module
+
+    seeded = {
+        **TEST_REPO_FIXTURE,
+        "name": "commit-preserve-repo",
+        "github_url": "https://github.com/testuser/commit-preserve-repo",
+        "commits_last_7_days": 5,
+        "commits_last_30_days": 22,
+        "commits_last_90_days": 60,
+        "activity_score": 88,
+    }
+    assert (await client.post("/ingest/repos", json=[seeded], headers=AUTH_HEADERS)).status_code == 200
+
+    # Re-ingest with commit/activity fields omitted entirely (-> None on the model).
+    sparse = {k: v for k, v in seeded.items()
+              if k not in {"commits_last_7_days", "commits_last_30_days",
+                           "commits_last_90_days", "activity_score"}}
+    assert (await client.post("/ingest/repos", json=[sparse], headers=AUTH_HEADERS)).status_code == 200
+
+    async with db_module.async_session_factory() as session:
+        row = (await session.execute(
+            _text("SELECT commits_last_7_days, commits_last_30_days, commits_last_90_days, "
+                  "activity_score FROM repos WHERE name = :n"),
+            {"n": "commit-preserve-repo"},
+        )).one()
+    assert tuple(row) == (5, 22, 60, 88), f"omitted commit stats were not preserved: {tuple(row)}"
+
+    # A brand-new repo whose counts are unknown must insert cleanly with the 0 default.
+    new_repo = {k: v for k, v in TEST_REPO_FIXTURE.items()
+                if k not in {"commits_last_7_days", "commits_last_30_days",
+                             "commits_last_90_days", "activity_score"}}
+    new_repo |= {"name": "commit-new-repo",
+                 "github_url": "https://github.com/testuser/commit-new-repo"}
+    assert (await client.post("/ingest/repos", json=[new_repo], headers=AUTH_HEADERS)).status_code == 200
+    async with db_module.async_session_factory() as session:
+        row = (await session.execute(
+            _text("SELECT commits_last_7_days, activity_score FROM repos WHERE name = :n"),
+            {"n": "commit-new-repo"},
+        )).one()
+    assert tuple(row) == (0, 0), f"new repo without counts should default to 0, got {tuple(row)}"
+
+
+@pytest.mark.asyncio
 async def test_ingest_cannot_republish_private_repo(client: AsyncClient):
     private_payload = {
         **TEST_REPO_FIXTURE,
