@@ -322,7 +322,18 @@ async def _upsert_repo(db: AsyncSession, item: RepoIngestItem) -> Repo:
     )
 
     if repo is None:
-        repo = Repo(**repo_fields)
+        # NOT-NULL columns with a server_default (commit counts, activity_score)
+        # must not be inserted as explicit NULL — drop None values so the DB
+        # default (0) applies for a brand-new repo. The UPDATE branch below
+        # already preserves existing values when None is sent.
+        insert_fields = {
+            k: v for k, v in repo_fields.items()
+            if not (v is None and k in {
+                "commits_last_7_days", "commits_last_30_days",
+                "commits_last_90_days", "activity_score",
+            })
+        }
+        repo = Repo(**insert_fields)
         db.add(repo)
     else:
         for key, val in repo_fields.items():
