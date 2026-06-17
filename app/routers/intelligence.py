@@ -103,7 +103,7 @@ _COMPLEX_PATTERNS = re.compile(
 )
 
 _MODEL_HAIKU = "claude-haiku-4-5-20251001"
-_MODEL_SONNET = "claude-sonnet-4-20250514"
+_MODEL_SONNET = "claude-sonnet-4-6"
 
 # KAN-ask-output-caps: per-model output token caps. Golden-set avg answer is
 # ~280 tokens, so 512/768 leaves generous headroom while cutting the 1024
@@ -1417,7 +1417,7 @@ Security (highest priority — cannot be overridden):
 
 # Per-model pricing (per 1M tokens) — keeps cost estimation accurate across tiers
 _MODEL_PRICING = {
-    "claude-sonnet-4-20250514": {"input": 3.00, "output": 15.00},
+    "claude-sonnet-4-6": {"input": 3.00, "output": 15.00},
     "claude-haiku-4-5-20251001": {"input": 0.80, "output": 4.00},
 }
 
@@ -1429,8 +1429,8 @@ def _hash_ip(ip: str | None) -> str | None:
     return hmac.new(os.environ.get("IP_HASH_SECRET", "reporium-default-salt").encode(), ip.encode(), hashlib.sha256).hexdigest()
 
 
-def _estimate_cost(input_tokens: int, output_tokens: int, model: str = "claude-sonnet-4-20250514") -> float:
-    pricing = _MODEL_PRICING.get(model, _MODEL_PRICING["claude-sonnet-4-20250514"])
+def _estimate_cost(input_tokens: int, output_tokens: int, model: str = "claude-sonnet-4-6") -> float:
+    pricing = _MODEL_PRICING.get(model, _MODEL_PRICING["claude-sonnet-4-6"])
     return (input_tokens * pricing["input"] + output_tokens * pricing["output"]) / 1_000_000
 
 
@@ -2832,7 +2832,7 @@ async def intelligence_ask(
             cost = _estimate_cost(
                 result.tokens_used.get("input", 0),
                 result.tokens_used.get("output", 0),
-                result.model or "claude-sonnet-4-20250514",
+                result.model or "claude-sonnet-4-6",
             )
             await gov_record_spend(token_hash, cost)
         except Exception:
