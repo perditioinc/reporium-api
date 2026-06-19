@@ -78,6 +78,15 @@ def test_fetch_n_default_and_override(monkeypatch):
     assert rerank.rerank_fetch_n() == 80
 
 
+def test_fetch_n_is_clamped_and_bad_value_falls_back(monkeypatch):
+    monkeypatch.setenv("RERANK_FETCH_N", "100000")
+    assert rerank.rerank_fetch_n() == 100  # hard cap
+    monkeypatch.setenv("RERANK_FETCH_N", "0")
+    assert rerank.rerank_fetch_n() == 1     # floor
+    monkeypatch.setenv("RERANK_FETCH_N", "notanint")
+    assert rerank.rerank_fetch_n() == 50    # default on parse error
+
+
 def test_name_lookup_queries_are_detected():
     assert rerank.is_name_lookup_query("vector database alternatives to pinecone")
     assert rerank.is_name_lookup_query("something similar to langchain")

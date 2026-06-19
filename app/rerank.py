@@ -15,12 +15,14 @@ from __future__ import annotations
 import logging
 import os
 import re
+import threading
 
 logger = logging.getLogger(__name__)
 
-# "alternatives to X" / "similar to X" / "like X" queries want the exact-named
-# repo; the offline eval showed reranking HURTS these (dense ordering wins), so
-# the caller skips reranking for them.
+# "alternatives to X" / "similar to X" / "replacement for X" queries want the
+# exact-named repo; the offline eval showed reranking HURTS these (dense ordering
+# wins), so the caller skips reranking for them. (Kept deliberately narrow to
+# avoid false positives like "I would like a tool for ...".)
 _NAME_LOOKUP_RE = re.compile(r"\b(alternatives?\s+to|similar\s+to|replacement\s+for)\b", re.I)
 
 
@@ -28,8 +30,10 @@ def is_name_lookup_query(question: str) -> bool:
     return bool(question and _NAME_LOOKUP_RE.search(question))
 
 _reranker = None
+_reranker_lock = threading.Lock()
 _DEFAULT_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
 _DEFAULT_FETCH_N = 50
+_MAX_FETCH_N = 100  # hard cap so a bad env value cannot blow up DB fetch + rerank cost
 _MAX_TEXT_LEN = 512
 
 
@@ -38,11 +42,15 @@ def rerank_enabled() -> bool:
 
 
 def rerank_fetch_n() -> int:
-    """How many dense candidates to fetch for reranking (more than top_k)."""
+    """How many dense candidates to fetch for reranking (more than top_k), bounded."""
     try:
-        return max(1, int(os.environ.get("RERANK_FETCH_N", _DEFAULT_FETCH_N)))
+        val = int(os.environ.get("RERANK_FETCH_N", _DEFAULT_FETCH_N))
     except ValueError:
         return _DEFAULT_FETCH_N
+    clamped = min(max(1, val), _MAX_FETCH_N)
+    if clamped != val:
+        logger.warning("RERANK_FETCH_N=%s clamped to %d", val, clamped)
+    return clamped
 
 
 def _model_name() -> str:
@@ -50,13 +58,15 @@ def _model_name() -> str:
 
 
 def get_reranker():
-    """Lazy-load the CrossEncoder once (mirrors app.embeddings.get_embedding_model)."""
+    """Lazy-load the CrossEncoder once, concurrency-safe (mirrors get_embedding_model)."""
     global _reranker
     if _reranker is None:
-        from sentence_transformers import CrossEncoder
-        logger.info("Loading cross-encoder reranker %s ...", _model_name())
-        _reranker = CrossEncoder(_model_name())
-        logger.info("Cross-encoder reranker loaded")
+        with _reranker_lock:
+            if _reranker is None:  # double-checked: only the first caller loads
+                from sentence_transformers import CrossEncoder
+                logger.info("Loading cross-encoder reranker %s ...", _model_name())
+                _reranker = CrossEncoder(_model_name())
+                logger.info("Cross-encoder reranker loaded")
     return _reranker
 
 
