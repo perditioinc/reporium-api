@@ -45,6 +45,30 @@ async def test_cache_lookup_sql_excludes_negative_sentiment():
 
 
 @pytest.mark.asyncio
+async def test_cache_lookup_sql_normalizes_sentiment():
+    """The exclusion must normalize case/whitespace before comparing.
+
+    The sentiment column is written un-normalized by PATCH /admin/asks/{id},
+    so values like 'Negative', 'NEGATIVE', or 'negative ' (trailing space)
+    must still be excluded. The SQL therefore wraps the column in
+    lower(trim(...)) and compares to the lowercase literal 'negative'.
+    """
+    db = AsyncMock()
+    db.execute = AsyncMock(return_value=SimpleNamespace(first=lambda: None))
+
+    await _find_semantic_cache_hit(
+        db, question_embedding=np.full(384, 0.1, dtype=np.float32)
+    )
+
+    sql = _captured_sql(db)
+    # Both case-folding and whitespace-trimming must be applied to sentiment.
+    assert "lower(" in sql, "exclusion must case-fold sentiment with lower()"
+    assert "trim(" in sql, "exclusion must strip whitespace from sentiment with trim()"
+    # Still compared against the canonical lowercase literal.
+    assert "'negative'" in sql
+
+
+@pytest.mark.asyncio
 async def test_negative_rated_answer_not_served():
     """When the DB (correctly filtering) returns no row, result is a miss."""
     db = AsyncMock()
