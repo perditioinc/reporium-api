@@ -1,0 +1,124 @@
+# Reporium $0 local-OSS substrate (REPORIUM-$0-01, issue #6).
+#
+# Stands up the whole reporium-api stack LOCALLY with ZERO cloud spend, by
+# substituting every paid GCP dependency with an OSS / emulator equivalent:
+#
+#   Paid (prod)        ->  $0 local substitute (this file)
+#   -----------------      ----------------------------------------------------
+#   Cloud SQL (pg)     ->  pgvector/pgvector:pg16        (db)
+#   Memorystore Redis  ->  redis:7-alpine               (redis)
+#   GCP Pub/Sub        ->  Pub/Sub emulator             (pubsub)  [local broker]
+#   Cloud Run (api)    ->  local docker container        (api)
+#   Paid embeddings    ->  sentence-transformers model baked into the api image
+#                          (all-MiniLM-L6-v2, runs CPU-only, offline) — $0
+#   Secret Manager     ->  plain env vars (this file)    — never contacted
+#
+# The api code is UNCHANGED. GCP Pub/Sub is substituted transparently via the
+# google-cloud client convention: when PUBSUB_EMULATOR_HOST is set, the client
+# talks to the local emulator instead of real Pub/Sub — no code change, $0.
+#
+# Usage (from repo root):  make -f local/Makefile up   (or: make up)
+# This file is SELF-CONTAINED — it does not depend on the root docker-compose.yml.
+
+name: reporium-local
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: reporium
+    ports:
+      - '5432:5432'
+    volumes:
+      - reporium_local_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d reporium']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - '6379:6379'
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # Local broker — substitutes GCP Pub/Sub. Speaks the real Pub/Sub gRPC API,
+  # so the unmodified google-cloud-pubsub client in reporium-events/api works
+  # against it when PUBSUB_EMULATOR_HOST points here. Pre-creates the
+  # reporium-events topic so publishers don't 404 on first publish.
+  pubsub:
+    image: thekevjames/gcloud-pubsub-emulator:latest
+    environment:
+      # host:port the emulator binds (0.0.0.0 so the api container can reach it)
+      PUBSUB_EMULATOR_HOST: '0.0.0.0:8681'
+      # auto-create <project>,<topic>[,<topic>...] on startup
+      PUBSUB_PROJECT1: 'reporium-local,reporium-events'
+    ports:
+      - '8681:8681'
+    healthcheck:
+      # the emulator serves a plain TCP listener on 8681; a successful bash
+      # /dev/tcp connect proves it is accepting connections.
+      test: ['CMD-SHELL', 'timeout 2 bash -c "echo > /dev/tcp/127.0.0.1/8681"']
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: apply alembic migrations against the local Postgres, then exit 0.
+  # Reuses the api image (alembic + app config are already inside it).
+  migrate:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ['alembic', 'upgrade', 'head']
+    environment:
+      DATABASE_URL: 'postgresql+asyncpg://postgres:postgres@db:5432/reporium'
+      ENVIRONMENT: development
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: 'no'
+
+  api:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    environment:
+      DATABASE_URL: 'postgresql+asyncpg://postgres:postgres@db:5432/reporium'
+      REDIS_URL: 'redis://redis:6379'
+      INGESTION_API_KEY: local-dev-key
+      INGEST_API_KEY: local-dev-key
+      GH_USERNAME: perditioinc
+      ENVIRONMENT: development
+      PORT: '8080'
+      # Pub/Sub substitution — unmodified google client routes here.
+      PUBSUB_EMULATOR_HOST: 'pubsub:8681'
+      GOOGLE_CLOUD_PROJECT: 'reporium-local'
+      GCP_PROJECT: 'reporium-local'
+    ports:
+      - '8080:8080'
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      pubsub:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test:
+        - 'CMD-SHELL'
+        - "python -c \"import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3).status==200 else 1)\""
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 90s
+
+volumes:
+  reporium_local_pgdata:

@@ -3,9 +3,13 @@
 ## [Unreleased] - 2026-04-08
 
 ### Added
+- **$0 local-OSS substrate** (`local/`, `Makefile`, `scripts/smoke.sh`): runs the full api stack locally at zero cloud spend by substituting paid GCP deps with OSS equivalents (Cloud SQL → pgvector, Memorystore → redis, GCP Pub/Sub → Pub/Sub emulator as the local broker, paid embeddings → baked-in sentence-transformers). `make up | down | smoke | seed`. App code unchanged; Pub/Sub substituted via `PUBSUB_EMULATOR_HOST` (no code change). Smoke proves up → healthy → `/health` db=ok → `down -v`. (REPORIUM-$0-01, system-design#6)
 - **Similar repos fallback**: If `/intelligence/similar/{owner}/{name}` returns zero candidates (repo has no categories or tags), falls back to surfacing repos sharing the same `primary_category`, ordered by star count.
 - **Edge type colors in 3D graph**: Knowledge graph edges now rendered in distinct colors per relationship type (amber=ALTERNATIVE_TO, green=COMPATIBLE_WITH, blue=DEPENDS_ON, violet=SIMILAR_TO, pink=EXTENDS).
 - **`/graph/edges` now returns typed relationship edges**: After fetching pgvector similarity edges, also queries the `repo_edges` table for ALTERNATIVE_TO, COMPATIBLE_WITH, DEPENDS_ON, EXTENDS edges. Typed edges override SIMILAR_TO when the same (source, target) pair exists. Degrades gracefully if `repo_edges` table is missing. `edgeTypes` field in response now lists all distinct types present in the data.
+
+### Fixed
+- **Alembic clean-DB `upgrade head` on `dev`**: ported `migrations/env.py` to `transaction_per_migration=True` + `engine.connect()` (already present on `main`), so migration 038's `autocommit_block()` (CREATE INDEX CONCURRENTLY) no longer raises `AssertionError` on a fresh database. Restores dev↔main parity; required for the local substrate to migrate a clean DB.
 
 ### Changed
 - **pgvector retrieval threshold**: Lowered from 0.45 → 0.40 in the adaptive top_k filter to surface more relevant repos per ask query.
