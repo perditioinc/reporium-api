@@ -42,6 +42,7 @@ from app.governance import (
 )
 from app.database import async_session_factory, get_db
 from app.embeddings import get_embedding_model
+from app import rerank as _rerank
 from app.models.session import AskSession
 from app.rate_limit import rate_limit_storage
 from app.slo_observer import token_observer
@@ -2214,7 +2215,14 @@ async def _prepare_query(
         )
 
     # 2. Semantic cache check
-    cached = await _find_semantic_cache_hit(db, question_embedding=query_embedding)
+    # When reranking is enabled, BYPASS the semantic-cache READ: the cache holds
+    # dense-ordered answers, so serving them would mask the rerank and muddy any
+    # A/B. The rerank arm always computes fresh. (Write-side cache partitioning
+    # by rerank mode is a tracked pre-deploy follow-up before mixed-traffic use.)
+    cached = (
+        None if _rerank.rerank_enabled()
+        else await _find_semantic_cache_hit(db, question_embedding=query_embedding)
+    )
     if cached is not None:
         cached_answer, cached_sources, cached_model = cached
         return QueryContext(
@@ -2240,7 +2248,13 @@ async def _prepare_query(
     vec_str = vec_to_pg(query_embedding)
 
     # 3. pgvector HNSW index scan — O(log N) instead of O(N) Python loop
-    fetch_k = top_k + 10
+    # Reranking (flag-gated, off by default) needs a larger candidate pool to
+    # reorder; otherwise the legacy top_k+10 fetch is preserved exactly.
+    fetch_k = (
+        max(top_k + 10, _rerank.rerank_fetch_n())
+        if _rerank.rerank_enabled()
+        else top_k + 10
+    )
     with _tracer.start_as_current_span("pgvector_search") as search_span:
         result = await db.execute(
             text("""
@@ -2302,6 +2316,19 @@ async def _prepare_query(
 
     # Sort descending by similarity
     scored.sort(key=lambda r: r["similarity"], reverse=True)
+
+    # Flag-gated cross-encoder rerank of the dense candidates. PROVEN (offline
+    # pooled-relevance eval) to significantly improve nDCG@10/MRR on realistic
+    # semantic queries. Skipped for name-lookup ("alternatives to X") queries
+    # where dense ordering wins. OFF by default; failures degrade to dense order.
+    if (_rerank.rerank_enabled() and len(scored) > 1
+            and not _rerank.is_name_lookup_query(question)):
+        try:
+            # Offload the sync CPU/Torch work to a thread so it never blocks the
+            # event loop (and other /ask requests) on this async path.
+            scored = await asyncio.to_thread(_rerank.rerank_candidates, question, scored)
+        except Exception as exc:  # never let reranking break the answer path
+            logger.warning("rerank skipped (error): %s", exc)
     top_for_answer = scored[:top_k]
 
     # 4. Build context for Claude — KAN-ask-cache: context hygiene
