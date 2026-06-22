@@ -2,7 +2,11 @@
 
 ## [Unreleased] - 2026-04-08
 
+### Fixed
+- **Thumbs-down answers no longer re-served from the semantic cache** (reporium#433 / KAN-586): `_find_semantic_cache_hit` now excludes `query_log` rows with `sentiment = 'negative'`. Previously a wrong/unhelpful answer that a user (or an admin via PATCH `/admin/asks`) marked thumbs-down could still be returned instantly from the semantic cache on the next near-identical question, propagating the bad answer indefinitely. The next identical query now falls through to a fresh generation. No-op for NULL/positive-sentiment rows.
+
 ### Added
+- **Local, $0 groundedness/faithfulness eval for /ask** (reporium#433 item #17): new `app/eval/groundedness.py` adapter over the merged `local-inference` verifier (Vectara HHEM-2.1-Open offline cross-encoder primary, local Ollama 7B NLI fallback) scores how well an `/ask` answer is grounded in its retrieved context. CI-safe: `verifier_available()` gates the real-verifier tests so they skip cleanly when no local backend is present (the default CI runner). Demo at `scripts/groundedness_eval.py`. Real HHEM run: grounded answer scored 0.9496, hallucinated answer 0.0094 over the same context (separation +0.9402). No frontier model, no paid API.
 - **Similar repos fallback**: If `/intelligence/similar/{owner}/{name}` returns zero candidates (repo has no categories or tags), falls back to surfacing repos sharing the same `primary_category`, ordered by star count.
 - **Edge type colors in 3D graph**: Knowledge graph edges now rendered in distinct colors per relationship type (amber=ALTERNATIVE_TO, green=COMPATIBLE_WITH, blue=DEPENDS_ON, violet=SIMILAR_TO, pink=EXTENDS).
 - **`/graph/edges` now returns typed relationship edges**: After fetching pgvector similarity edges, also queries the `repo_edges` table for ALTERNATIVE_TO, COMPATIBLE_WITH, DEPENDS_ON, EXTENDS edges. Typed edges override SIMILAR_TO when the same (source, target) pair exists. Degrades gracefully if `repo_edges` table is missing. `edgeTypes` field in response now lists all distinct types present in the data.

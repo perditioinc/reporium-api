@@ -1841,6 +1841,13 @@ async def _find_semantic_cache_hit(
     *,
     question_embedding: np.ndarray,
 ) -> tuple[str, list[SourceRepo], str | None] | None:
+    # KAN-586 / reporium#433: do NOT re-serve an answer that a user (or admin
+    # via PATCH /admin/asks) marked with sentiment='negative'. A thumbs-down
+    # answer was wrong/unhelpful for that question; serving it again from the
+    # semantic cache on the next near-identical query would propagate the bad
+    # answer indefinitely. Excluding negative rows here lets the next identical
+    # query fall through to a fresh generation instead. Rows with NULL/positive
+    # sentiment are still cache-eligible, so this is a no-op for the common case.
     question_embedding = _validate_query_embedding(question_embedding)
     result = await db.execute(
         text("""
@@ -1848,6 +1855,7 @@ async def _find_semantic_cache_hit(
             FROM query_log
             WHERE question_embedding_vec IS NOT NULL
               AND answer_full IS NOT NULL
+              AND (sentiment IS NULL OR sentiment <> 'negative')
               AND (question_embedding_vec <=> CAST(:vec AS vector)) < :distance_threshold
             ORDER BY question_embedding_vec <=> CAST(:vec AS vector)
             LIMIT 1
