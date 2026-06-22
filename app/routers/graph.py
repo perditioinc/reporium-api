@@ -146,6 +146,26 @@ def _rows_to_nodes(rows) -> list[dict]:
     return list(node_map.values())
 
 
+def _filter_edges_by_type(payload: dict, edge_type: str | None) -> dict:
+    """Scope a graph payload's edges to a single ``edge_type``.
+
+    When *edge_type* is falsy the payload is returned unchanged. Otherwise the
+    ``edges`` list is filtered (case-insensitively) to that type and the
+    derived ``edgeTypes`` summary and ``total`` count are recomputed so they
+    stay consistent. The ``nodes`` array and every other key are left intact so
+    the response shape is preserved.
+    """
+    if not edge_type:
+        return payload
+    wanted = edge_type.strip().upper()
+    filtered = [e for e in payload.get("edges", [])
+                if str(e.get("edgeType", "")).upper() == wanted]
+    payload["edges"] = filtered
+    payload["total"] = len(filtered)
+    payload["edgeTypes"] = sorted({e["edgeType"] for e in filtered})
+    return payload
+
+
 def _json_graph_response(payload: dict) -> JSONResponse:
     response = JSONResponse(content=payload)
     response.headers["Cache-Control"] = "public, max-age=3600"
@@ -410,6 +430,13 @@ async def get_graph_edges(
                             description="Max neighbours per repo"),
     since: str | None = Query(default=None,
                               description="Temporal filter, e.g. '7d', '24h', '30m'"),
+    edge_type: str | None = Query(
+        default=None,
+        description=(
+            "Restrict results to a single edge type, e.g. 'SIMILAR_TO', "
+            "'DEPENDS_ON', 'ALTERNATIVE_TO'. Case-insensitive. Omit for all types."
+        ),
+    ),
     db: AsyncSession = Depends(get_db),
 ):
     """
@@ -422,11 +449,21 @@ async def get_graph_edges(
 
     Optional ``since`` param filters to edges where at least one node was
     added/updated within the given time window (e.g. ``?since=7d``).
+
+    Optional ``edge_type`` param restricts the returned edges to a single type
+    (e.g. ``?edge_type=DEPENDS_ON``); ``edgeTypes`` and ``total`` are scoped to
+    match. Omit it to receive every edge type.
     """
     interval = _parse_since(since)
+    edge_type_norm = edge_type.strip().upper() if edge_type else None
 
     # --- Redis cache check ---
-    cache_key = f"graph_edges:{limit}:{min_similarity}:{neighbours}:{since or 'all'}"
+    # edge_type is part of the key so filtered and unfiltered responses do not
+    # collide in the cache.
+    cache_key = (
+        f"graph_edges:{limit}:{min_similarity}:{neighbours}:"
+        f"{since or 'all'}:{edge_type_norm or 'all'}"
+    )
     cached = await redis_cache.get(cache_key)
     if cached is not None:
         return _json_graph_response(cached)
@@ -446,6 +483,7 @@ async def get_graph_edges(
         else:
             # build_graph_payload_from_snapshot already merges typed_edges from the
             # snapshot (DEPENDS_ON etc.). No extra DB call needed here.
+            snapshot_payload = _filter_edges_by_type(snapshot_payload, edge_type_norm)
             await redis_cache.set(cache_key, snapshot_payload, ttl=CACHE_TTL_GRAPH_EDGES)
             return _json_graph_response(snapshot_payload)
 
@@ -694,6 +732,8 @@ async def get_graph_edges(
         "nodes": nodes,
         "edges": edges,
     }
+
+    result_payload = _filter_edges_by_type(result_payload, edge_type_norm)
 
     # Store in Redis cache
     await redis_cache.set(cache_key, result_payload, ttl=CACHE_TTL_GRAPH_EDGES)

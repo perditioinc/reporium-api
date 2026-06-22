@@ -1848,6 +1848,10 @@ async def _find_semantic_cache_hit(
             FROM query_log
             WHERE question_embedding_vec IS NOT NULL
               AND answer_full IS NOT NULL
+              -- Never re-serve an answer the user rated thumbs-down: a
+              -- 'negative' sentiment row is excluded so the feedback loop
+              -- actually suppresses bad cached answers.
+              AND (sentiment IS NULL OR lower(trim(sentiment)) <> 'negative')
               AND (question_embedding_vec <=> CAST(:vec AS vector)) < :distance_threshold
             ORDER BY question_embedding_vec <=> CAST(:vec AS vector)
             LIMIT 1
